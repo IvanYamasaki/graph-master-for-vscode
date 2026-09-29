@@ -1,0 +1,637 @@
+{
+  "name": "agent-graph-master",
+  "displayName": "Agent Graph Master",
+  "description": "Contas do Claude Code e do Codex, chat próprio por conta e mapa de agentes com roteamento de relatórios.",
+  "version": "1.0.0",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onWebviewPanel:agentGraphMaster.chat",
+    "onWebviewPanel:agentGraphMaster.companion"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentGraphMaster.openChat",
+        "title": "Abrir chat",
+        "category": "Agent Graph Master",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentGraphMaster.openChatWith",
+        "title": "Abrir chat com outra conta",
+        "category": "Agent Graph Master",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentGraphMaster.switch",
+        "title": "Trocar conta",
+        "category": "Agent Graph Master",
+        "icon": "$(arrow-swap)"
+      },
+      {
+        "command": "agentGraphMaster.add",
+        "title": "Adicionar conta",
+        "category": "Agent Graph Master",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentGraphMaster.login",
+        "title": "Fazer login nesta conta",
+        "category": "Agent Graph Master",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "agentGraphMaster.rename",
+        "title": "Renomear conta",
+        "category": "Agent Graph Master",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "agentGraphMaster.remove",
+        "title": "Remover conta",
+        "category": "Agent Graph Master",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentGraphMaster.openTerminal",
+        "title": "Abrir no terminal com esta conta",
+        "category": "Agent Graph Master",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "agentGraphMaster.activate",
+        "title": "Usar esta conta",
+        "category": "Agent Graph Master",
+        "icon": "$(check)"
+      },
+      {
+        "command": "agentGraphMaster.refresh",
+        "title": "Atualizar status",
+        "category": "Agent Graph Master",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agentGraphMaster.setGeminiKey",
+        "title": "Configurar chave do Gemini",
+        "category": "Agent Graph Master",
+        "icon": "$(key)"
+      },
+      {
+        "command": "agentGraphMaster.setOpenAIKey",
+        "title": "Configurar chave da OpenAI",
+        "category": "Agent Graph Master",
+        "icon": "$(key)"
+      },
+      {
+        "command": "agentGraphMaster.clearGeminiKey",
+        "title": "Remover chave do Gemini",
+        "category": "Agent Graph Master",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentGraphMaster.clearOpenAIKey",
+        "title": "Remover chave da OpenAI",
+        "category": "Agent Graph Master",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentGraphMaster.configureResearchPack",
+        "title": "Configurar pacote de pesquisa",
+        "category": "Agent Graph Master",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "agentGraphMaster.experimentReport",
+        "title": "Gerar relatório de experimento",
+        "category": "Agent Graph Master",
+        "icon": "$(output)"
+      }
+    ],
+    "views": {
+      "agentGraphMaster": [
+        {
+          "id": "agentGraphMaster.chatLauncher",
+          "name": "Chat"
+        },
+        {
+          "id": "agentGraphMaster.view",
+          "name": "Contas"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentGraphMaster.openChat",
+          "when": "view == agentGraphMaster.view",
+          "group": "navigation@0"
+        },
+        {
+          "command": "agentGraphMaster.add",
+          "when": "view == agentGraphMaster.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agentGraphMaster.refresh",
+          "when": "view == agentGraphMaster.view",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agentGraphMaster.openChat",
+          "when": "view == agentGraphMaster.view && viewItem =~ /profile/",
+          "group": "inline@0"
+        },
+        {
+          "command": "agentGraphMaster.activate",
+          "when": "view == agentGraphMaster.view && viewItem =~ /inactive/",
+          "group": "inline@1"
+        },
+        {
+          "command": "agentGraphMaster.openTerminal",
+          "when": "view == agentGraphMaster.view && viewItem =~ /profile/",
+          "group": "inline@2"
+        },
+        {
+          "command": "agentGraphMaster.login",
+          "when": "view == agentGraphMaster.view && viewItem =~ /profile/",
+          "group": "1_manage@1"
+        },
+        {
+          "command": "agentGraphMaster.rename",
+          "when": "view == agentGraphMaster.view && viewItem =~ /custom/",
+          "group": "1_manage@2"
+        },
+        {
+          "command": "agentGraphMaster.remove",
+          "when": "view == agentGraphMaster.view && viewItem =~ /custom/",
+          "group": "1_manage@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "agentGraphMaster.activate",
+          "when": "false"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "agentGraphMaster.openChat",
+          "group": "navigation@100"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Graph Master",
+      "properties": {
+        "agentGraphMaster.profilesRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Pasta onde ficam as contas novas. Vazio usa ~/.claude-profiles."
+        },
+        "agentGraphMaster.claudeCommand": {
+          "type": "string",
+          "default": "claude",
+          "description": "Comando usado para chamar o CLI do Claude Code."
+        },
+        "agentGraphMaster.afterSwitch": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "reload",
+            "nothing"
+          ],
+          "enumDescriptions": [
+            "Perguntar se deve recarregar a janela",
+            "Recarregar a janela na hora",
+            "Não fazer nada (novas sessões já usam a conta nova)"
+          ],
+          "default": "ask",
+          "description": "O que fazer depois de trocar de conta. A extensão oficial só pega a conta nova em sessões abertas depois da troca."
+        },
+        "agentGraphMaster.codexPath": {
+          "type": "string",
+          "default": "",
+          "description": "Caminho do executável nativo do Codex CLI (codex.exe). Vazio procura sozinho: PATH, instalação do npm, winget e a extensão da OpenAI, preferindo a versão estável mais nova."
+        },
+        "agentGraphMaster.codexProfilesRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Pasta onde ficam as contas do Codex criadas aqui, uma subpasta por conta (usada como CODEX_HOME). Vazio usa ~/.codex-profiles."
+        },
+        "agentGraphMaster.codexDefaultModel": {
+          "type": "string",
+          "default": "",
+          "description": "Modelo dos chats com conta do Codex (ex.: gpt-5.6-terra). Vazio usa o model do config.toml da conta."
+        },
+        "agentGraphMaster.codexDefaultEffort": {
+          "type": "string",
+          "default": "",
+          "description": "Raciocínio dos chats com conta do Codex (low, medium, high, xhigh, max; alguns modelos têm ultra). Vazio usa o do config.toml da conta."
+        },
+        "agentGraphMaster.claudePath": {
+          "type": "string",
+          "default": "",
+          "description": "Caminho do executável nativo do Claude Code (claude.exe). Vazio procura sozinho: PATH, instalação do npm, ~/.local/bin e a extensão oficial. Preenchido, tem prioridade sobre agentGraphMaster.claudePathStrategy."
+        },
+        "agentGraphMaster.claudePathStrategy": {
+          "type": "string",
+          "enum": [
+            "newest",
+            "path"
+          ],
+          "enumDescriptions": [
+            "Escolhe a instalação mais nova entre todas as encontradas, que é a que traz os modelos mais recentes",
+            "Usa a primeira instalação do PATH, mesmo que seja antiga"
+          ],
+          "default": "newest",
+          "description": "Como escolher o executável quando agentGraphMaster.claudePath está vazio. A lista de modelos do chat vem do CLI, então uma instalação antiga esconde os modelos novos."
+        },
+        "agentGraphMaster.defaultModel": {
+          "type": "string",
+          "default": "opus",
+          "description": "Modelo inicial dos chats (ex.: opus, sonnet, haiku, claude-fable-5-1). O padrão opus é o Opus 5.5. Vazio usa o padrão da conta."
+        },
+        "agentGraphMaster.defaultEffort": {
+          "type": "string",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium",
+          "description": "Nível de raciocínio inicial dos chats. O padrão é medium. Vazio usa o padrão do modelo."
+        },
+        "agentGraphMaster.companion.model": {
+          "type": "string",
+          "default": "sonnet",
+          "description": "Modelo do chat lateral de consulta (tirar dúvidas, depurar, perguntar o que um agente está fazendo). Padrão: sonnet, barato e bom para perguntas."
+        },
+        "agentGraphMaster.companion.effort": {
+          "type": "string",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium",
+          "description": "Nível de raciocínio do chat lateral de consulta. Vazio usa o padrão do modelo."
+        },
+        "agentGraphMaster.defaultPermissionMode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "bypassPermissions"
+          ],
+          "enumDescriptions": [
+            "Pergunta antes de cada ação que mexe no sistema",
+            "Aceita edições de arquivo sozinho e pergunta o resto",
+            "Só planeja: nada é alterado até você aprovar o plano",
+            "Não pergunta nada, nem para rodar comando ou apagar arquivo"
+          ],
+          "default": "bypassPermissions",
+          "description": "Modo de permissão com que os chats começam. Em bypassPermissions o Claude executa tudo sem perguntar, inclusive comandos de terminal e remoção de arquivos: use só em pasta confiável, de preferência com o código versionado. Dá para trocar o modo a qualquer momento dentro do chat.",
+          "markdownDescription": "Modo de permissão com que os chats começam. Em `bypassPermissions` o Claude executa tudo sem perguntar, inclusive comandos de terminal e remoção de arquivos: use só em pasta confiável, de preferência com o código versionado. Dá para trocar o modo a qualquer momento dentro do chat."
+        },
+        "agentGraphMaster.routedAgents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Dá ao Claude as ferramentas spawn_agent, send_to_agent, list_agents e stop_agent, com relatório final entregue direto ao destino escolhido."
+        },
+        "agentGraphMaster.brain.notify": {
+          "type": "string",
+          "enum": [
+            "all",
+            "box",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Todos os agentes da conversa e o chat principal recebem o resumo (as novidades da caixa de cada um vêm primeiro).",
+            "Só os agentes da mesma caixa da nota ou do autor; o chat principal recebe tudo.",
+            "Sem avisos: o cérebro continua sendo mantido, e os agentes consultam quando quiserem."
+          ],
+          "default": "all",
+          "description": "Quem é avisado das novidades do cérebro compartilhado (.agm/brain/). O aviso é um resumo curto por janela, entregue no turno em andamento sem interromper, ou na frente da próxima mensagem de quem está parado."
+        },
+        "agentGraphMaster.brain.notifyWindowSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 5,
+          "description": "Janela, em segundos, em que as escritas no cérebro compartilhado se juntam num resumo só por destinatário."
+        },
+        "agentGraphMaster.brain.graphStaleDays": {
+          "type": "number",
+          "default": 14,
+          "minimum": 1,
+          "description": "Se o projeto tiver um mapa estático do código gerado pelo graphify (graphify-out/GRAPH_REPORT.md ou graph.json), o índice do cérebro aponta para ele e avisa quando tiver mais que estes dias. A extensão nunca roda o graphify."
+        },
+        "agentGraphMaster.maxRoutedAgents": {
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "description": "Quantos agentes roteados podem rodar ao mesmo tempo em um chat."
+        },
+        "agentGraphMaster.defaultAgentBudget": {
+          "type": "object",
+          "default": {},
+          "properties": {
+            "max_tokens": {
+              "type": "number",
+              "minimum": 1,
+              "description": "Tokens processados (entrada com cache mais saída, somados em todas as chamadas)."
+            },
+            "max_minutes": {
+              "type": "number",
+              "minimum": 0.1,
+              "description": "Minutos de trabalho (tempo com turno em andamento)."
+            },
+            "max_usd": {
+              "type": "number",
+              "minimum": 0.01,
+              "description": "Custo estimado em dólares (só agentes Claude)."
+            }
+          },
+          "additionalProperties": false,
+          "markdownDescription": "Orçamento de cada agente roteado criado sem `budget` no spawn_agent. Aos 80% o mapa avisa; em 100% o agente é interrompido e o chat pergunta se você dá mais ou para. Padrão vazio (sem limite): num plano de assinatura o custo é uma estimativa, e um limite fixo interromperia tarefas longas legítimas. O orquestrador é orientado a definir orçamento em experimentos. Exemplo: `{ \"max_minutes\": 30, \"max_usd\": 3 }`."
+        },
+        "agentGraphMaster.protectedPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "resource",
+          "markdownDescription": "Globs relativos ao projeto que nenhum agente Claude lê nem grava (avaliador congelado), por exemplo `eval/**`, `data/test/**`, `evaluate.py`. Somam-se aos de `.agm/protected.json`. O bloqueio vale até em bypassPermissions, mas é defesa em profundidade: um comando de shell pode chegar ao arquivo por indireção. Não vale para agentes Codex."
+        },
+        "agentGraphMaster.evaluationCommand": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "markdownDescription": "Comando da avaliação oficial que só o orquestrador roda, com a ferramenta `run_evaluation` (você aprova na primeira vez de cada conversa). `evaluationCommand` em `.agm/protected.json` tem prioridade."
+        },
+        "agentGraphMaster.evaluationTimeoutMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "Tempo máximo da avaliação oficial (run_evaluation). Passando disso, o processo é encerrado."
+        },
+        "agentGraphMaster.seedParallelism": {
+          "type": "number",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Quantas execuções o run_seeds roda ao mesmo tempo. Em GPU única, deixe 1."
+        },
+        "agentGraphMaster.autoVerify": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Quando `declare_result` dá \"suportada\", cria sozinho um agente verificador independente (só leitura, worktree próprio) que reexecuta cada braço com seed nova, procura vazamento e dá o parecer. O selo \"verificado\" ou \"divergente\" aparece no cartão da hipótese."
+        },
+        "agentGraphMaster.verifierModel": {
+          "type": "string",
+          "default": "sonnet",
+          "description": "Modelo do agente verificador independente (haiku, sonnet, opus ou um id claude-*)."
+        },
+        "agentGraphMaster.verifierEffort": {
+          "type": "string",
+          "default": "medium",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "description": "Nível de raciocínio do agente verificador independente."
+        },
+        "agentGraphMaster.stuckRepeatCount": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "description": "Um agente que repete a mesma chamada de ferramenta (mesmo nome e mesma entrada) tantas vezes seguidas é marcado como possivelmente preso. 0 desliga."
+        },
+        "agentGraphMaster.stuckMinutes": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "description": "Minutos trabalhando sem progresso (nenhuma ferramenta, arquivo ou texto novo) até o agente ser marcado como possivelmente preso. 0 desliga. Esperar aprovação não conta."
+        },
+        "agentGraphMaster.maxAutoReports": {
+          "type": "number",
+          "default": 10,
+          "minimum": 1,
+          "description": "Quantas entregas automáticas (relatórios e respostas) cada agente pode fazer. Trava laços entre agentes."
+        },
+        "agentGraphMaster.claudeInChrome": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Conversas novas começam com o interruptor **Usar o navegador (Claude in Chrome)** ligado. O Claude passa a controlar o Chrome em que a extensão Claude in Chrome está conectada, com as contas já logadas nele. Só um dono do navegador por vez: se um agente estiver com ele, a conversa começa desligada. Dá para ligar e desligar em cada conversa pelo menu do \"+\"."
+        },
+        "agentGraphMaster.browserActionsNeedApproval": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Ações do Claude in Chrome que mudam algo (clicar, digitar, preencher formulário, abrir endereço, rodar JavaScript, enviar arquivo) pedem sua aprovação no chat, **mesmo no modo sem perguntas (bypass)**. Ler a página, listar abas e capturar a tela não pedem. **Risco ao desligar:** páginas da web são conteúdo de terceiros e podem trazer instruções escondidas para o Claude (injeção de prompt); sem aprovação, ele age nas suas contas logadas sem você ver antes."
+        },
+        "agentGraphMaster.externalTasksNeedApproval": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Tarefas que um agente vigia encontra fora daqui (Slack, e-mail, arquivo) chegam como cartão de aprovação no chat, e só vão para o agente principal quando você clica em Executar. **Risco ao desligar:** o texto da tarefa foi escrito por outra pessoa e vai direto para o agente principal, que costuma rodar sem pedir permissão. Qualquer um que consiga mandar mensagem para você pode tentar fazer a sua máquina rodar comandos (injeção de prompt). Desligado, a tarefa chega marcada como conteúdo de terceiros, com a ordem de não fazer nada destrutivo, não mexer em credenciais e não mandar dados para fora sem perguntar."
+        },
+        "agentGraphMaster.usageRefreshMinutes": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "De quantos em quantos minutos o rodapé do chat relê os limites do plano. 0 desliga a atualização automática (o clique no rodapé continua funcionando)."
+        },
+        "agentGraphMaster.external.researchProvider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "gemini"
+          ],
+          "enumDescriptions": [
+            "GPT: Codex CLI logado (assinatura do ChatGPT), ou chave da API da OpenAI",
+            "Gemini: Antigravity (agy) logado com a conta Google, ou chave da API do Gemini"
+          ],
+          "default": "gemini",
+          "description": "Provedor padrão da ferramenta web_research. \"gemini\" usa o Antigravity com a sua assinatura Google AI Pro (ou a chave da API do Gemini); \"openai\" usa o Codex, que gasta a cota do Codex do plano ChatGPT. Para pesquisas comuns o próprio Claude já usa WebSearch/WebFetch sem gastar nenhuma das duas."
+        },
+        "agentGraphMaster.external.imageProvider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "gemini"
+          ],
+          "enumDescriptions": [
+            "GPT: Codex CLI logado (assinatura do ChatGPT), ou chave da API da OpenAI",
+            "Gemini: Antigravity (agy) logado com a conta Google, ou chave da API do Gemini"
+          ],
+          "default": "openai",
+          "description": "Provedor padrão da ferramenta generate_image quando o pedido não diz qual usar. O Gemini só gera imagem com chave de API (a geração de imagem do Antigravity não funciona pela extensão)."
+        },
+        "agentGraphMaster.external.imageFolder": {
+          "type": "string",
+          "default": "assets/generated",
+          "description": "Pasta, relativa ao projeto, onde as imagens geradas ficam quando o pedido não diz onde salvar."
+        },
+        "agentGraphMaster.external.openaiImageModel": {
+          "type": "string",
+          "default": "",
+          "description": "Modelo de imagem da API da OpenAI (ex.: gpt-image-1). Vazio escolhe o gpt-image-* mais novo que a chave lista. Não vale para o Codex CLI, que usa o modelo da assinatura."
+        },
+        "agentGraphMaster.external.geminiImageModel": {
+          "type": "string",
+          "default": "",
+          "description": "Modelo de imagem da API do Gemini. Vazio escolhe o gemini-*-image mais novo que a chave lista."
+        },
+        "agentGraphMaster.external.openaiModel": {
+          "type": "string",
+          "default": "",
+          "description": "Modelo de texto da pesquisa pela API da OpenAI. Vazio escolhe o gpt-* mini mais novo que a chave lista."
+        },
+        "agentGraphMaster.external.geminiModel": {
+          "type": "string",
+          "default": "",
+          "description": "Modelo de texto da pesquisa pela API do Gemini. Vazio escolhe o gemini-*-flash mais novo que a chave lista."
+        },
+        "agentGraphMaster.external.codexAccount": {
+          "type": "string",
+          "default": "",
+          "description": "Conta Codex (nome ou id) usada pela pesquisa e pela imagem do GPT via Codex CLI. Vazio usa a primeira conta Codex cadastrada, ou o login de ~/.codex."
+        },
+        "agentGraphMaster.external.agyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Caminho do Antigravity CLI (agy.exe), usado pela pesquisa do Gemini. Vazio procura em %LOCALAPPDATA%\\agy\\bin e no PATH."
+        },
+        "agentGraphMaster.external.agyModel": {
+          "type": "string",
+          "default": "",
+          "description": "Modelo do Antigravity na pesquisa do Gemini (ex.: gemini-3.8-flash-low; a lista sai de \"agy models\"). Vazio usa o padrão do agy."
+        },
+        "agentGraphMaster.mlflow.trackingUri": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "markdownDescription": "Servidor MLflow do projeto (ex.: `http://127.0.0.1:5000`). Usado pelo espelho dos runs do laboratório, pelo `watch_training` com `mlflow_run` e como padrão do servidor MCP do MLflow. Vazio usa a variável `MLFLOW_TRACKING_URI`."
+        },
+        "agentGraphMaster.mlflow.mirrorRuns": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "markdownDescription": "Espelha cada `log_run` do laboratório (e cada run criado por um job) no MLflow, pela API REST: métricas, o comando como parâmetro e as tags `node_id`, `hypothesis_id`, `arm`, `seed` e `git_sha`. Precisa de `agentGraphMaster.mlflow.trackingUri`. Autenticação pelas variáveis do próprio MLflow (`MLFLOW_TRACKING_TOKEN` ou `MLFLOW_TRACKING_USERNAME`/`MLFLOW_TRACKING_PASSWORD`)."
+        },
+        "agentGraphMaster.mlflow.experimentName": {
+          "type": "string",
+          "default": "agent-graph-master",
+          "scope": "resource",
+          "description": "Experimento do MLflow onde os runs espelhados entram. Criado se não existir."
+        },
+        "agentGraphMaster.jobs.gpuPricesUsdPerHour": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "number",
+            "minimum": 0
+          },
+          "markdownDescription": "Preço por hora de **uma** GPU, em dólares, por tipo, usado no custo estimado do cartão de aprovação do `submit_job`. A chave é o `gpu_type` do job; `slurm:A100` vale só para um backend, `cpu` para job sem GPU, `local` para a máquina local (padrão 0). Exemplo: `{ \"A100\": 1.9, \"H100\": 3.2, \"runpod:NVIDIA GeForce RTX 4090\": 0.7 }`. Tipo fora da tabela aparece como custo desconhecido."
+        },
+        "agentGraphMaster.jobs.maxTotalUsd": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "markdownDescription": "Teto de gasto somado dos jobs do projeto (custo acumulado dos que terminaram mais a estimativa dos que rodam). Job que passaria do teto é recusado antes do cartão de aprovação. 0 desliga o teto. Jobs com custo desconhecido não entram na conta."
+        },
+        "agentGraphMaster.jobs.pollSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "description": "Intervalo, em segundos, entre as consultas de estado dos jobs remotos (squeue/sacct, modal, runpodctl). Jobs locais são acompanhados pelo processo."
+        },
+        "agentGraphMaster.jobs.runpodImage": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Imagem Docker dos pods do RunPod criados pelo `submit_job`. O comando do job vai na variável `AGM_COMMAND`, que a imagem precisa executar. Vazio deixa o RunPod indisponível."
+        },
+        "agentGraphMaster.trainingWatch.summarizeWithModel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Quando o vigia de treino detecta um problema, um modelo pequeno resume as últimas linhas do log no cartão. A detecção em si nunca usa modelo."
+        },
+        "agentGraphMaster.trainingWatch.summaryModel": {
+          "type": "string",
+          "default": "haiku",
+          "description": "Modelo do resumo dos alertas do vigia de treino."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "agentGraphMaster.openChat",
+        "key": "ctrl+shift+alt+k",
+        "mac": "cmd+shift+alt+k"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentGraphMaster",
+          "title": "Agent Graph Master",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "agentGraphMaster.chatLauncher",
+        "contents": "[$(comment-discussion) Abrir chat](command:agentGraphMaster.openChat)\n[Abrir chat com outra conta](command:agentGraphMaster.openChatWith)\nAtalho: Ctrl+Shift+Alt+K"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p . --noEmit && tsc -p src/webview && node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "package": "npm run compile && vsce package --no-dependencies --out agent-graph-master.vsix",
+    "install-local": "npm run package && code --install-extension agent-graph-master.vsix --force"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.19",
+    "@types/vscode": "1.90.0",
+    "@vscode/codicons": "^0.0.46-24",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "marked": "^18.0.14",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.284",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "zod": "^4.6.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/IvanYamasaki/graph-master-for-vscode.git"
+  },
+  "homepage": "https://github.com/IvanYamasaki/graph-master-for-vscode#readme",
+  "bugs": {
+    "url": "https://github.com/IvanYamasaki/graph-master-for-vscode/issues"
+  }
+}

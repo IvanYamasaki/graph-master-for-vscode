@@ -1,0 +1,14 @@
+node_modules
+out
+*.vsix
+
+# Gerado no build a partir de @vscode/codicons
+media/codicons/
+
+# Artefatos locais do Claude Code gravados por engano durante testes (não versionar: podem conter conversas)
+projects/
+mcp-needs-auth-cache.json
+
+# Estado local da própria extensão quando usada neste repositório
+.agm/
+*.tmp

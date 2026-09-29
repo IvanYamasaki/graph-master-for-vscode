@@ -1,0 +1,9 @@
+src/**
+node_modules/**
+**/*.map
+tsconfig.json
+esbuild.mjs
+*.vsix
+.vscode/**
+.gitignore
+media/codicons/codicon.csv
