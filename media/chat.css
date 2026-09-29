@@ -1,0 +1,2895 @@
+:root {
+  --accent: #d97757;
+  --bg: var(--vscode-editor-background);
+  --fg: var(--vscode-foreground);
+  --muted: var(--vscode-descriptionForeground);
+  --border: var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  --card: var(--vscode-editorWidget-background, rgba(128, 128, 128, 0.08));
+  --input-bg: var(--vscode-input-background);
+  --input-fg: var(--vscode-input-foreground);
+  --input-border: var(--vscode-input-border, var(--border));
+  --code-bg: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12));
+  --ok: var(--vscode-testing-iconPassed, #3fb950);
+  --err: var(--vscode-errorForeground, #f85149);
+  --warn: var(--vscode-editorWarning-foreground, #d29922);
+  /* Verde do Claude trabalhando (STATUS_RING.running). */
+  --working: #3fb950;
+  /* Uma sombra e um raio para tudo que flutua (menus, popups) e para os cartões. */
+  --float-shadow: 0 8px 28px rgba(0, 0, 0, 0.42), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --radius: 8px;
+}
+
+body.vscode-light {
+  --working: #2da44e;
+  --float-shadow: 0 6px 22px rgba(0, 0, 0, 0.16), 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  position: relative;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.spacer {
+  flex: 1;
+}
+
+button {
+  font: inherit;
+  color: var(--vscode-button-secondaryForeground, var(--fg));
+  background: var(--vscode-button-secondaryBackground, transparent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+/* Foco de teclado visível em tudo que é clicável, no mesmo azul do VS Code. */
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[role='button']:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+button:hover:not(:disabled) {
+  background: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+button.primary,
+button.send {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+  border-color: transparent;
+}
+
+button.primary:hover,
+button.send:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+button.stop {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.icon-btn {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+  padding: 2px 8px;
+}
+
+.icon-btn:hover {
+  color: var(--fg);
+}
+
+/* Botão só de ícone, no tamanho da barra de ferramentas do VS Code. */
+button.square {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  flex: none;
+}
+
+.icon-btn.square:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.codicon {
+  font-size: 16px;
+  line-height: 16px;
+}
+
+button.stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+select,
+input,
+textarea {
+  font: inherit;
+  color: var(--input-fg);
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: 4px;
+}
+
+select {
+  padding: 2px 4px;
+  max-width: 180px;
+}
+
+input.feedback,
+textarea.feedback {
+  width: 100%;
+  padding: 5px 8px;
+  margin-top: 8px;
+}
+
+/* ---------- Topo ---------- */
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.acct {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* Nome da sessão em destaque; conta, e-mail e modelo em cinza ao lado. */
+.acct-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 6em;
+  flex-shrink: 1;
+}
+
+/* No painel estreito a conta e o modelo encolhem antes do nome da sessão. */
+.acct-name,
+.acct-model {
+  flex-shrink: 4;
+  min-width: 0;
+}
+
+.acct-mail {
+  flex-shrink: 8;
+  min-width: 0;
+}
+
+.acct-name,
+.acct-mail,
+.acct-model,
+.ctx {
+  color: var(--muted);
+  font-size: 0.92em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fork-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+
+/* ---------- Chat lateral de consulta ---------- */
+
+.companion-hidden {
+  display: none !important;
+}
+
+.companion-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  font-size: 0.88em;
+  color: var(--muted);
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.companion-banner .codicon {
+  font-size: 12px;
+}
+
+.companion-send-row {
+  display: flex;
+  margin-top: -4px;
+}
+
+.companion-send {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 0.86em;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.companion-send .codicon {
+  font-size: 12px;
+}
+
+.companion-send:hover,
+.companion-send:focus-visible {
+  opacity: 1;
+  color: var(--vscode-foreground);
+  border-color: var(--border);
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+
+.companion-send.sent {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.msg.user .msg-origin {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 3px;
+  font-size: 0.84em;
+  color: var(--muted);
+}
+
+.msg.user .msg-origin .codicon {
+  font-size: 12px;
+}
+
+/* ---------- Conversa ---------- */
+
+.log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.empty {
+  margin: auto;
+  text-align: center;
+  color: var(--muted);
+}
+
+.empty .logo {
+  font-size: 34px;
+  color: var(--accent);
+}
+
+.msg {
+  line-height: 1.55;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.msg.user {
+  align-self: flex-end;
+  max-width: 85%;
+  background: var(--vscode-input-background);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 7px 11px;
+}
+
+.msg.user .plain {
+  white-space: pre-wrap;
+}
+
+/* Relatório que chegou de um agente: uma linha, que abre quando o usuário quiser ler. */
+details.msg.report {
+  border-left: 2px solid var(--accent);
+  background: var(--card);
+  border-radius: 4px;
+  padding: 5px 12px;
+}
+
+details.msg.report > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+details.msg.report > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.msg.report .codicon {
+  font-size: 14px;
+  color: var(--accent);
+}
+
+.msg.report .from {
+  font-size: 0.9em;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+details.msg.report > .md {
+  margin-top: 8px;
+}
+
+details.msg.report[open] .fold-more {
+  display: none;
+}
+
+details.msg.report[open] .fold-less {
+  display: inline;
+}
+
+.md p {
+  margin: 0.45em 0;
+}
+
+.md > :first-child {
+  margin-top: 0;
+}
+
+.md > :last-child {
+  margin-bottom: 0;
+}
+
+.md pre {
+  background: var(--code-bg);
+  padding: 8px 10px;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.md code {
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.95em;
+}
+
+.md :not(pre) > code {
+  background: var(--code-bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+.md table {
+  border-collapse: collapse;
+}
+
+.md th,
+.md td {
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+}
+
+.md a {
+  color: var(--vscode-textLink-foreground);
+}
+
+.md blockquote {
+  margin: 0.4em 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
+/* ---------- Ferramentas ---------- */
+
+.tool {
+  border-radius: 4px;
+}
+
+.tool > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  padding: 2px 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.tool > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool > summary:hover {
+  color: var(--fg);
+}
+
+.tname {
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.tsum {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.92em;
+  margin-left: 6px;
+  color: var(--muted);
+}
+
+/* Ferramenta do próprio orquestrador no log principal: uma linha discreta, menor que o texto. */
+.tool.slim:not([open]) {
+  margin: -3px 0;
+}
+
+.tool.slim > summary {
+  font-size: 0.88em;
+  opacity: 0.75;
+}
+
+.tool.slim > summary .tname {
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.tool.slim > summary .dot {
+  width: 6px;
+  height: 6px;
+}
+
+.tool.slim > summary:hover,
+.tool.slim[open] > summary {
+  opacity: 1;
+}
+
+.tool.slim > summary:hover .tname,
+.tool.slim[open] > summary .tname {
+  color: var(--fg);
+}
+
+.tbody {
+  margin: 4px 0 4px 14px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+
+.tlabel {
+  font-size: 0.85em;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+pre.code {
+  margin: 4px 0;
+  background: var(--code-bg);
+  padding: 6px 9px;
+  border-radius: 4px;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.92em;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 340px;
+  overflow: auto;
+}
+
+pre.code.err {
+  color: var(--err);
+}
+
+.diff .del {
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #f85149);
+}
+
+.diff .add,
+pre.code.add {
+  color: var(--vscode-gitDecoration-addedResourceForeground, #3fb950);
+}
+
+.todos {
+  list-style: none;
+  padding-left: 0;
+  margin: 4px 0;
+}
+
+.todo.completed {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.todo.in_progress {
+  font-weight: 600;
+}
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.dot.running {
+  background: var(--working);
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+/* Cinza é concluído; vermelho é falhou ou parado. Mesma regra do anel dos nós. */
+.dot.completed {
+  background: var(--muted);
+}
+
+.dot.failed,
+.dot.stopped {
+  background: var(--err);
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.notice {
+  font-size: 0.92em;
+  color: var(--muted);
+  padding: 3px 10px;
+  border-left: 2px solid var(--border);
+}
+
+/* Avisos do sistema em sequência: uma linha com o mais recente e o contador; o clique abre a lista. */
+details.sys-group > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+details.sys-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.sys-group > summary:hover {
+  color: var(--fg);
+}
+
+details.sys-group > summary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+details.sys-group .codicon {
+  font-size: 13px;
+  flex: none;
+}
+
+.sys-last {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sys-count {
+  flex: none;
+  font-size: 0.85em;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+details.sys-group[open] .sys-last {
+  display: none;
+}
+
+.sys-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 5px 0 2px 19px;
+}
+
+.notice.error {
+  color: var(--err);
+  border-color: var(--err);
+}
+
+.result {
+  font-size: 0.85em;
+  color: var(--muted);
+  text-align: right;
+  opacity: 0.8;
+}
+
+.result.error {
+  color: var(--err);
+}
+
+/* ---------- Permissões ---------- */
+
+/*
+ * Cartão de decisão: permissão, pergunta, plano, tarefa externa e alertas do guarda. Um só formato para tudo que
+ * espera o usuário: filete âmbar, cabeçalho com ícone, o que é, de quem (ponto na cor do agente) e a hora.
+ * Resolvido, encolhe para uma linha cinza.
+ */
+.decision {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 9px 12px 10px;
+  background: var(--card);
+}
+
+.decision.done {
+  border-left-color: var(--border);
+  background: transparent;
+  padding: 3px 10px;
+  gap: 0;
+}
+
+/* Uma linha sempre: no painel estreito quem encolhe (com reticências) é o nome de quem pediu e o status. */
+.dec-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.dec-head > .codicon {
+  flex: none;
+  font-size: 14px;
+  color: var(--warn);
+}
+
+.dec-title {
+  flex: none;
+  font-weight: 600;
+}
+
+.dec-who {
+  flex: 0 1000 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.9em;
+  overflow: hidden;
+}
+
+.dec-who .agent-dot {
+  flex: none;
+}
+
+.dec-who-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dec-head .spacer {
+  min-width: 4px;
+}
+
+.dec-head .task-status {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dec-meta {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+}
+
+.decision.done .dec-head {
+  color: var(--muted);
+  font-size: 0.92em;
+}
+
+.decision.done .dec-head > .codicon {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.decision.done .dec-title {
+  font-weight: 400;
+}
+
+.decision.done .task-status::before {
+  content: '·';
+  margin-right: 7px;
+}
+
+/* Vindo da lista de decisões do composer: um halo curto mostra qual cartão é. */
+.decision.flash {
+  animation: dec-flash 1.4s ease-out;
+}
+
+@keyframes dec-flash {
+  from {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 65%, transparent);
+  }
+  to {
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner,
+  .working,
+  .dot.running {
+    animation: none;
+  }
+
+  .decision.flash {
+    animation: none;
+    outline: 2px solid var(--warn);
+  }
+}
+
+.perm {
+  transition: opacity 0.3s;
+}
+
+.perm.done {
+  opacity: 0.4;
+}
+
+.perm-title {
+  font-weight: 600;
+}
+
+.perm-reason {
+  color: var(--fg);
+}
+
+.perm-detail {
+  max-height: 300px;
+  overflow: auto;
+}
+
+.perm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.plan {
+  max-height: 420px;
+  overflow: auto;
+  padding: 6px 10px;
+  background: var(--bg);
+  border-radius: 4px;
+}
+
+.q {
+  margin-bottom: 10px;
+}
+
+.q-head {
+  font-size: 0.8em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.q-text {
+  font-weight: 600;
+  margin: 2px 0 6px;
+}
+
+.q-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.q-opt {
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.q-opt span {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.q-opt.on {
+  border-color: var(--accent);
+  background: rgba(217, 119, 87, 0.15);
+}
+
+/* ---------- Composer ---------- */
+
+.activity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 16px 6px;
+  color: var(--muted);
+  font-size: 0.92em;
+}
+
+/* Verde: trabalhando, a mesma cor do anel dos agentes que rodam. */
+.spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--working);
+  border-right-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.composer {
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.composer .input {
+  width: 100%;
+  resize: none;
+  padding: 8px 10px;
+  min-height: 38px;
+  line-height: 1.45;
+  border-radius: 6px;
+}
+
+.composer .input:focus,
+select:focus,
+input:focus,
+textarea:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* A caixa é uma só: o textarea e a barra de controles dividem a mesma moldura. */
+.composer .box {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 5px 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+}
+
+/* Foco sem berrar: a moldura só clareia, em vez de acender o azul inteiro do VS Code. */
+.composer .box:focus-within {
+  border-color: color-mix(in srgb, var(--vscode-focusBorder) 45%, var(--border));
+}
+
+.composer .box .input {
+  background: transparent;
+  border: none;
+  padding: 7px 7px 3px;
+  min-height: 34px;
+  border-radius: 0;
+}
+
+.composer .box .input:focus {
+  outline: none;
+}
+
+.composer .box .input::placeholder {
+  color: var(--muted);
+}
+
+.composer .box .row {
+  gap: 8px;
+  /* Painel estreito: a barra quebra em duas linhas em vez de cortar o botão de enviar. */
+  row-gap: 4px;
+  min-height: 26px;
+  padding: 0 2px;
+}
+
+/* Nada na barra força largura: num painel estreito as pílulas encolhem com reticências. */
+.composer,
+.composer .box {
+  min-width: 0;
+}
+
+.composer .box .row .pill.cap,
+.composer .box .row .pill.agents,
+.composer .box .row .pill.mode {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.pill > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Na quebra, modo e enviar continuam encostados à direita. */
+.composer .box .row .pill.mode {
+  margin-left: auto;
+}
+
+.runbar,
+.run-line {
+  min-width: 0;
+}
+
+/* Glifo sem moldura: o "+" de anexar. */
+button.ghost {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  flex: none;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+button.ghost:hover:not(:disabled) {
+  background: transparent;
+  color: var(--fg);
+}
+
+button.ghost .codicon {
+  font-size: 15px;
+  line-height: 15px;
+}
+
+/* Quadradinho com "/" ao lado do "+", como no Claude Code oficial. */
+button.slash {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+button.slash:hover:not(:disabled) {
+  background: transparent;
+  color: var(--fg);
+  border-color: var(--muted);
+}
+
+/* Anel verde fino: o Claude está trabalhando (mesma cor do anel dos agentes que rodam). */
+.working {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border-radius: 50%;
+  border: 1.5px solid var(--working);
+  border-right-color: transparent;
+  animation: spin 1s linear infinite;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  max-width: 100%;
+  padding: 0 4px;
+  flex: none;
+  border: none;
+  border-radius: 11px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.88em;
+  line-height: normal;
+  white-space: nowrap;
+}
+
+.pill:hover:not(:disabled) {
+  background: transparent;
+  color: var(--fg);
+}
+
+.pill .codicon {
+  font-size: 13px;
+  line-height: 13px;
+}
+
+.pill .dim {
+  color: var(--muted);
+}
+
+/* Cápsula: fundo cinza escuro, texto em cor normal. */
+.pill.cap,
+.pill.agents {
+  padding: 0 9px;
+  background: rgba(128, 128, 128, 0.16);
+  color: var(--fg);
+}
+
+.pill.cap:hover:not(:disabled),
+.pill.agents:hover:not(:disabled) {
+  background: rgba(128, 128, 128, 0.28);
+  color: var(--fg);
+}
+
+.pill.menu-on {
+  background: rgba(128, 128, 128, 0.3);
+  color: var(--fg);
+}
+
+.pill.agents {
+  height: 24px;
+  padding: 0 10px;
+  gap: 6px;
+}
+
+/*
+ * A pílula fica no mesmo cinza das outras em qualquer estado; quem fala é o ponto.
+ * Verde do Claude (STATUS_RING.running) pulsando devagar enquanto algum agente trabalha,
+ * verde parado quando todos terminaram, vermelho quando algum falhou.
+ */
+/* A pílula herda o .dot: verde pulsando trabalhando, cinza concluído, vermelho falhou. */
+
+.pill.off {
+  opacity: 0.55;
+}
+
+.pill.warn .codicon,
+.pill.warn span {
+  color: var(--warn);
+}
+
+.pill.crit .codicon,
+.pill.crit span {
+  color: var(--err);
+}
+
+/* Enviar: quadrado arredondado na cor da marca, com a seta para cima. */
+button.go {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex: none;
+  border: none;
+  border-radius: 7px;
+  background: rgba(217, 119, 87, 0.85);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+button.go:hover:not(:disabled) {
+  background: var(--accent);
+}
+
+button.go:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+button.go .codicon {
+  font-size: 15px;
+  line-height: 15px;
+}
+
+/* ---------- Faixa dos agentes em execução ---------- */
+
+.runbar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 14px 6px;
+  border-top: 1px solid var(--border);
+  background: var(--card);
+  cursor: pointer;
+  font-size: 0.88em;
+}
+
+.run-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.run-line:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.16));
+}
+
+.run-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-time,
+.run-tool,
+.run-more {
+  color: var(--muted);
+  font-size: 0.9em;
+  flex: none;
+}
+
+.run-more {
+  padding: 1px 4px 0 24px;
+}
+
+/* ---------- Menus ancorados ---------- */
+
+.menu-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+
+.menu {
+  position: absolute;
+  min-width: 200px;
+  max-width: 360px;
+  padding: 4px;
+  overflow-y: auto;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
+  color: var(--vscode-menu-foreground, var(--fg));
+  border: 1px solid var(--vscode-menu-border, var(--border));
+  border-radius: var(--radius);
+  box-shadow: var(--float-shadow);
+  outline: none;
+}
+
+.menu-title {
+  padding: 6px 8px 3px;
+  color: var(--muted);
+  font-size: 0.78em;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border);
+}
+
+.menu-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  width: 100%;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.menu-item:hover:not(:disabled),
+.menu-item.cur {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.menu-item:disabled {
+  cursor: default;
+}
+
+.menu-mark {
+  width: 14px;
+  flex: none;
+  color: var(--accent);
+}
+
+.menu-mark .codicon {
+  font-size: 13px;
+  line-height: 17px;
+}
+
+.menu-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.menu-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.menu-detail,
+.menu-hint,
+.menu-note {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.menu-hint {
+  flex: none;
+  padding-top: 2px;
+}
+
+.menu-note {
+  padding: 4px 8px 5px;
+}
+
+/* Menu do "+" (.addm): itens de uma linha com ícone cinza à esquerda, como no Claude Code oficial. */
+
+.menu.addm {
+  width: 280px;
+  min-width: 0;
+  max-width: calc(100vw - 16px);
+  padding: 5px;
+  border-radius: 10px;
+}
+
+.menu.addm .menu-item {
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 6px;
+}
+
+.menu.addm .menu-mark {
+  width: 16px;
+  color: var(--muted);
+}
+
+.menu.addm .menu-mark .codicon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.menu.addm .menu-label {
+  white-space: nowrap;
+}
+
+/* Menu de modelo (.mm): itens em duas linhas, check à direita e slider de raciocínio no rodapé. */
+
+.menu.mm {
+  width: 420px;
+  max-width: calc(100vw - 16px);
+  padding: 6px;
+  border-radius: 10px;
+}
+
+.menu.mm .menu-title {
+  padding: 6px 12px 6px;
+  font-size: 0.85em;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.menu.mm .menu-item {
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+}
+
+.menu.mm .menu-item + .menu-item {
+  margin-top: 1px;
+}
+
+.menu.mm .menu-item.sel {
+  background: var(--vscode-list-inactiveSelectionBackground, rgba(128, 128, 128, 0.22));
+}
+
+.menu.mm .menu-item:hover:not(:disabled),
+.menu.mm .menu-item.cur {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.16));
+}
+
+.menu.mm .menu-mark {
+  order: 2;
+  width: 16px;
+  color: inherit;
+  text-align: right;
+}
+
+.menu.mm .menu-mark .codicon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.menu.mm .menu-text {
+  gap: 2px;
+}
+
+.menu.mm .menu-detail {
+  font-size: 0.85em;
+  line-height: 1.35;
+}
+
+.menu.mm .menu-item.mm-more {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.menu.mm .menu-item.mm-more .menu-mark {
+  display: none;
+}
+
+.mm-effort {
+  position: sticky;
+  bottom: -6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 8px -6px -6px;
+  padding: 10px 18px 12px;
+  background: inherit;
+}
+
+.mm-effort-level {
+  color: var(--muted);
+}
+
+.mm-slider {
+  --i: 1;
+  position: relative;
+  flex: none;
+  width: 116px;
+  height: 18px;
+  border-radius: 9px;
+  background: var(--vscode-input-background, rgba(0, 0, 0, 0.35));
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.25));
+  cursor: pointer;
+  outline: none;
+}
+
+.mm-slider:focus-visible {
+  border-color: var(--vscode-focusBorder, var(--accent));
+}
+
+.mm-dot,
+.mm-knob {
+  position: absolute;
+  top: 50%;
+  /* --steps: intervalos da trilha. O Claude tem cinco níveis (4); o Codex informa os seus por modelo. */
+  left: calc(9px + var(--i) * (100% - 18px) / var(--steps, 4));
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.mm-dot {
+  width: 4px;
+  height: 4px;
+  background: var(--muted);
+  opacity: 0.7;
+}
+
+.mm-dot::after {
+  content: '';
+  position: absolute;
+  inset: -6px;
+}
+
+.mm-dot.mm-max {
+  background: #b692f6;
+  opacity: 1;
+  box-shadow: 0 0 5px rgba(182, 146, 246, 0.7);
+}
+
+.mm-knob {
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  transition: left 0.12s ease;
+}
+
+.mm-slider.mm-unset .mm-knob {
+  background: rgba(255, 255, 255, 0.18);
+  border: 1.5px solid rgba(255, 255, 255, 0.7);
+  box-shadow: none;
+}
+
+.check {
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+/* ---------- Anexos ---------- */
+
+.atts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.atts.sent {
+  margin-bottom: 6px;
+}
+
+.att {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 3px 4px 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+  font-size: 0.9em;
+}
+
+.att.bad {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.att .codicon {
+  font-size: 14px;
+  color: var(--muted);
+  flex: none;
+}
+
+.att.bad .codicon {
+  color: var(--err);
+}
+
+.att-thumb {
+  width: 30px;
+  height: 30px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex: none;
+}
+
+.att-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-size,
+.att-err {
+  color: var(--muted);
+  font-size: 0.88em;
+  flex: none;
+}
+
+.att-err {
+  color: var(--err);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.att-x {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.att-x .codicon {
+  font-size: 12px;
+}
+
+.att-x:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+  color: var(--fg);
+}
+
+.dropzone {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  /* Sem captura de ponteiro: o drop tem que chegar na janela, e a camada não pode disparar dragleave. */
+  pointer-events: none;
+}
+
+.drop-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 26px;
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--fg);
+}
+
+.drop-card .codicon {
+  font-size: 22px;
+  color: var(--accent);
+}
+
+/* ---------- Mapa de agentes ---------- */
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+}
+
+.ov-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.1em;
+}
+
+.map-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Cabeçalho baixo, numa faixa só: contagem à esquerda, alternância grafo/lista à direita. */
+.map-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px 8px;
+}
+
+.map-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.map-total {
+  font-size: 1.15em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.map-sub {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.map-toggle {
+  flex: none;
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+button.map-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border: none;
+  border-radius: 4px;
+  font-size: 0.9em;
+  color: var(--muted);
+  background: transparent;
+}
+
+button.map-mode:hover {
+  color: var(--fg);
+}
+
+button.map-mode[aria-pressed='true'] {
+  color: var(--fg);
+  background: var(--vscode-toolbar-hoverBackground, var(--card));
+}
+
+/* Três vistas não cabem com rótulo num painel estreito: fica só o ícone. */
+@media (max-width: 520px) {
+  .map-mode-label {
+    display: none;
+  }
+
+  button.map-mode {
+    padding: 3px 7px;
+  }
+}
+
+/* Grafo: toda a altura que sobra. O componente traz o resto do estilo dele. */
+.map-graph {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0 12px 12px;
+}
+
+.map-graph > .agm-graph {
+  flex: 1;
+  height: auto;
+}
+
+/* Lista: o container que rola. */
+.map {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 14px 24px;
+}
+
+.map-view.is-graph .map,
+.map-view.is-list .map-graph {
+  display: none;
+}
+
+/* Vista "Hipóteses" (labTree.ts): a árvore e o painel do laboratório tomam o lugar do grafo e da lista. */
+.map-view.is-lab .map,
+.map-view.is-lab .map-graph,
+.map-view:not(.is-lab) > .agm-lt {
+  display: none;
+}
+
+.map-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.map-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 2px;
+  font-size: 0.72em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.group-count {
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--vscode-badge-background);
+  color: var(--vscode-badge-foreground);
+  letter-spacing: 0;
+}
+
+/* Lista agrupada por caixa: cabeçalho recolhível com a cor da caixa; filhas recuadas dentro da mãe. */
+.map-box {
+  border-left: 2px solid color-mix(in srgb, var(--agm-color, var(--muted)) 55%, transparent);
+  padding-left: 8px;
+}
+
+.map-box.is-child {
+  margin: 6px 0 2px 4px;
+}
+
+.box-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  padding: 4px 6px;
+  margin: 0 0 2px -6px;
+  border: none;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--agm-color, var(--muted)) 9%, transparent);
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.box-head:hover {
+  background: color-mix(in srgb, var(--agm-color, var(--muted)) 17%, transparent);
+}
+
+.box-head:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+.box-head .codicon {
+  flex: none;
+  color: var(--muted);
+}
+
+.box-swatch {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  background: var(--agm-color, var(--muted));
+}
+
+.box-name {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.box-count,
+.box-tok {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* "Organizar em caixas" no cabeçalho do mapa: discreto, some o rótulo no painel estreito. */
+button.map-organize {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: center;
+  padding: 2px 8px;
+  border: 1px dashed var(--border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.88em;
+  cursor: pointer;
+}
+
+button.map-organize:hover {
+  color: var(--fg);
+  border-style: solid;
+}
+
+.map-organize-slot {
+  display: contents;
+}
+
+/* "Cérebro": abre o index.md do cérebro compartilhado. Mesmo desenho, borda cheia porque é navegação, não sugestão. */
+button.map-organize.map-brain {
+  border-style: solid;
+}
+
+@media (max-width: 520px) {
+  .map-organize-label,
+  .map-brain-label,
+  .map-sub-boxes {
+    display: none;
+  }
+}
+
+/* ---------- Cartão de agente (mapa e chat principal) ---------- */
+
+/*
+ * Uma linha: ponto de estado, título, destino fora do padrão e, à direita, tempo e tokens. A
+ * segunda linha (atividade ou começo do relatório) só aparece quando existe. O resto mora no popup.
+ */
+.ag-card {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 10px;
+  border-radius: 5px;
+  /* A borda esquerda é a cor da frente de trabalho, escolhida pelo orquestrador. */
+  border-left: 2px solid var(--agm-color, var(--muted));
+  cursor: pointer;
+}
+
+.ag-card:hover {
+  background: var(--vscode-list-hoverBackground, var(--card));
+}
+
+.ag-card:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* No log principal o cartão fica entre mensagens: um fundo bem leve o separa do texto em volta. */
+.ag-card.compact {
+  background: color-mix(in srgb, var(--card) 55%, transparent);
+}
+
+.ag-card.compact:hover {
+  background: var(--vscode-list-hoverBackground, var(--card));
+}
+
+.ag-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 20px;
+}
+
+.ag-title {
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ag-dest {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.85em;
+  white-space: nowrap;
+}
+
+/* Fornecedor quando não é o Claude: etiqueta pequena, cinza, depois do título. */
+.ag-prov {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 0.78em;
+  line-height: 1.4;
+}
+
+.ag-nums {
+  flex: none;
+  display: inline-flex;
+  color: var(--muted);
+  font-size: 0.82em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ag-nums > * + *::before {
+  content: '·';
+  margin: 0 5px;
+}
+
+.ag-time {
+  color: var(--muted);
+  font-size: 0.82em;
+  flex: none;
+}
+
+.ag-nums .ag-time {
+  font-size: inherit;
+}
+
+/* Atalho de parar: só no hover (ou com foco dentro), como as ações de linha das listas do VS Code. */
+button.ag-stop {
+  flex: none;
+  display: none;
+  align-items: center;
+  height: 18px;
+  padding: 0 3px;
+  color: var(--muted);
+}
+
+button.ag-stop .codicon {
+  font-size: 13px;
+  line-height: 13px;
+}
+
+.ag-card:hover button.ag-stop,
+.ag-card:focus-within button.ag-stop {
+  display: inline-flex;
+}
+
+button.ag-stop:hover {
+  color: var(--vscode-errorForeground, #f85149);
+}
+
+.ag-line2 {
+  padding-left: 22px;
+  font-size: 0.88em;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ag-label {
+  margin-top: 6px;
+  padding-left: 16px;
+  font-size: 0.78em;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Relatório recolhido: prévia de três linhas e "ver tudo" que abre ali mesmo. */
+.fold {
+  padding-left: 16px;
+}
+
+.fold > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.fold-peek {
+  white-space: pre-line;
+  line-height: 1.5;
+  color: var(--fg);
+  opacity: 0.85;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.fold-more,
+.fold-less {
+  font-size: 0.85em;
+  color: var(--vscode-textLink-foreground);
+}
+
+.fold-less,
+.fold[open] .fold-peek,
+.fold[open] .fold-more {
+  display: none;
+}
+
+.fold[open] .fold-less {
+  display: inline;
+}
+
+.ag-full {
+  margin-top: 6px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.node-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.node-title.big {
+  font-size: 1.15em;
+}
+
+.node-meta,
+.node-summary {
+  color: var(--muted);
+  font-size: 0.9em;
+  margin-top: 3px;
+  padding-left: 16px;
+}
+
+.node-summary {
+  font-style: italic;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+  padding-left: 16px;
+}
+
+.tag {
+  font-size: 0.78em;
+  padding: 0 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.tag.acc {
+  color: var(--fg);
+}
+
+/* Fornecedor do agente quando não é o Claude: cinza, só o texto diz. */
+.tag.prov {
+  color: var(--fg);
+}
+
+.tag.route {
+  border-color: var(--vscode-textLink-foreground);
+  color: var(--vscode-textLink-foreground);
+}
+
+.none {
+  color: var(--muted);
+}
+
+.detail-head {
+  padding: 12px 16px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Filete da cor do agente no topo do painel de detalhe. */
+.detail-head.tinted {
+  border-top: 3px solid var(--agm-color, var(--muted));
+}
+
+.task {
+  margin-top: 8px;
+  padding-left: 16px;
+}
+
+.task summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.prompt {
+  max-height: 260px;
+  overflow: auto;
+  padding: 6px 10px;
+  background: var(--card);
+  border-radius: 4px;
+  margin-top: 4px;
+}
+
+.detail-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Agente restaurado do disco: cor apagada e a marca "salvo", para não parecer um agente vivo. */
+.ag-card.restored,
+.detail-head.restored {
+  opacity: 0.72;
+}
+
+.ag-saved {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--muted);
+  font-size: 0.75em;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.hint.warn-hint {
+  color: var(--warn);
+}
+
+/* ---------- Ponto de estado do agente: miolo com a cor da frente, anel com o estado ---------- */
+
+.agdot {
+  position: relative;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: none;
+  margin: 0 3px;
+  border-radius: 50%;
+  background: var(--agm-color, var(--muted));
+}
+
+/*
+ * Contorno escuro colado no miolo, mesma ideia do nó do grafo. Sem ele, um agente `rosa` ou
+ * `terracota` parado encosta a própria cor no anel vermelho e as duas viram uma mancha só.
+ */
+.agdot.ring {
+  box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.55);
+}
+
+.agdot.ring::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+  border: 1.5px solid var(--agm-ring, var(--muted));
+  border-radius: 50%;
+}
+
+/* Só o anel pulsa: o miolo tem que continuar legível na cor do agente. */
+.agdot.ring.live::after {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* ---------- Comandos de barra (autocompletar do composer) ---------- */
+
+.sc-anchor {
+  position: relative;
+}
+
+.sc-pop {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(100% - 4px);
+  z-index: 40;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
+  color: var(--vscode-menu-foreground, var(--fg));
+  border: 1px solid var(--vscode-menu-border, var(--border));
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+
+.sc-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.sc-item:hover,
+.sc-item.cur {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.sc-name {
+  flex: none;
+  font-weight: 600;
+}
+
+.sc-arg {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.85em;
+}
+
+.sc-desc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+  font-size: 0.88em;
+}
+
+/* Linha de arquivo do "@": ícone, nome com as letras achadas realçadas e a pasta em cinza. */
+.sc-item > .codicon {
+  flex: none;
+  align-self: center;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.sc-name.sc-file {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 400;
+}
+
+.sc-hit {
+  color: var(--vscode-list-highlightForeground, #2aaaff);
+  font-weight: 600;
+}
+
+.sc-empty {
+  padding: 5px 8px;
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+/* Saída de comando local: é o CLI respondendo, não o modelo. */
+.sc-output {
+  font-size: 0.92em;
+  color: var(--muted);
+  padding: 2px 10px;
+  border-left: 2px solid var(--border);
+}
+
+.sc-output > :first-child {
+  margin-top: 0;
+}
+
+.sc-output > :last-child {
+  margin-bottom: 0;
+}
+
+/* ---------- Rodapé de limites abaixo do composer ---------- */
+
+.usage-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 14px;
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 0.78em;
+  cursor: pointer;
+  user-select: none;
+}
+
+.usage-bar:empty {
+  display: none;
+}
+
+.usage-spacer {
+  flex: 1;
+}
+
+.usage-ctx,
+.usage-off {
+  white-space: nowrap;
+}
+
+.usage-win {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.usage-track {
+  width: 46px;
+  height: 3px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--muted) 25%, transparent);
+  overflow: hidden;
+}
+
+.usage-fill {
+  display: block;
+  height: 100%;
+  background: var(--ok);
+}
+
+.usage-fill.warn {
+  background: var(--warn);
+}
+
+.usage-fill.crit {
+  background: var(--err);
+}
+
+.usage-bar:hover {
+  color: var(--fg);
+}
+
+/* ---------- Tarefa proposta por um vigia: cartão de aprovação ---------- */
+
+.task-summary {
+  font-weight: 600;
+}
+
+/* Texto de terceiros: puro, com quebras preservadas, e rolando se for longo. */
+.task-body {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 180px;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12));
+  font-size: 0.95em;
+}
+
+.task-link {
+  font-size: 0.9em;
+  color: var(--vscode-textLink-foreground, #4daafc);
+}
+
+.task-warn {
+  color: var(--muted);
+  font-size: 0.86em;
+}
+
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.task-status {
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.task-status.approved {
+  color: var(--ok);
+}
+
+/* ---------- Vigias ---------- */
+
+.ag-watch-ico {
+  flex: none;
+  display: inline-flex;
+  color: var(--muted);
+}
+
+.ag-watch-ico .codicon {
+  font-size: 12px;
+  line-height: 12px;
+}
+
+.ag-watch {
+  flex: none;
+  color: var(--muted);
+  font-size: 0.82em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ag-card.compact .ag-watch {
+  font-size: 0.8em;
+}
+
+.tag.watch .codicon {
+  font-size: 11px;
+  vertical-align: -1px;
+}
+
+/* ---------- Relatório de agente e cartão de tarefa na cor do agente ---------- */
+
+details.msg.report.has-agent {
+  border-left-color: var(--agent);
+}
+
+/* O texto fica na cor normal (as cores dos agentes não têm contraste no tema claro); o ponto e o filete identificam. */
+details.msg.report.has-agent .from {
+  color: var(--fg);
+}
+
+.agent-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--agent);
+}
+
+.report-agent {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.report-agent:hover,
+.report-agent:focus-visible {
+  text-decoration-style: solid;
+}
+
+
+/* ---------- Pesquisa e imagem externas (web_research, generate_image) ---------- */
+
+.msg.ext-block {
+  border-left: 2px solid var(--vscode-textLink-foreground, #4d8fd6);
+  background: var(--card);
+  border-radius: 4px;
+  padding: 5px 12px;
+}
+
+details.ext-research > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+details.ext-research > summary::-webkit-details-marker {
+  display: none;
+}
+
+.ext-block .codicon {
+  font-size: 14px;
+  color: var(--vscode-textLink-foreground, #4d8fd6);
+}
+
+.ext-title {
+  font-weight: 600;
+  font-size: 0.9em;
+}
+
+.ext-meta {
+  font-size: 0.85em;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+details.ext-research > .md {
+  margin-top: 8px;
+}
+
+details.ext-research[open] .fold-more {
+  display: none;
+}
+
+details.ext-research[open] .fold-less {
+  display: inline;
+}
+
+.ext-sources {
+  margin: 4px 0 4px;
+  padding-left: 20px;
+  font-size: 0.92em;
+}
+
+.ext-sources li {
+  margin: 2px 0;
+}
+
+.ext-sources a {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: none;
+}
+
+.ext-sources a:hover {
+  text-decoration: underline;
+}
+
+.ext-host {
+  color: var(--muted);
+  font-size: 0.9em;
+  margin-left: 6px;
+}
+
+.ext-images-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.ext-thumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ext-thumb {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 168px;
+  padding: 4px;
+  background: var(--vscode-editor-background, transparent);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.ext-thumb:hover,
+.ext-thumb:focus-visible {
+  border-color: var(--vscode-focusBorder, #4d8fd6);
+}
+
+.ext-thumb img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: contain;
+  border-radius: 4px;
+  background: repeating-conic-gradient(rgba(128, 128, 128, 0.15) 0 25%, transparent 0 50%) 0 0 / 12px 12px;
+}
+
+.ext-path {
+  font-size: 0.82em;
+  font-family: var(--vscode-editor-font-family, monospace);
+  word-break: break-all;
+}
+
+.ext-dim {
+  color: var(--muted);
+}
+
+.notice-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 0.95em;
+  color: var(--vscode-button-foreground, #fff);
+  background: var(--vscode-button-background, #0e639c);
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.notice-action:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+/* ---------- Navegador (Claude in Chrome) ---------- */
+
+.pill.browser {
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.pill.browser .codicon {
+  font-size: 13px;
+}
+
+/* Bolinha de estado: cinza conectando, verde conectado, vermelho desconectado ou falhou. */
+.pill.browser .bstate {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+
+.pill.browser .bstate.pending {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.pill.browser .bstate.connected {
+  background: #3fb950;
+}
+
+.pill.browser .bstate.disconnected,
+.pill.browser .bstate.failed,
+.pill.browser .bstate.needs-auth {
+  background: #f85149;
+}
+
+.pill.browser.warn {
+  color: var(--vscode-errorForeground, #f85149);
+}
+
+.tool > summary .tico {
+  display: inline-flex;
+  flex: none;
+  color: var(--muted);
+}
+
+.tool > summary .tico .codicon {
+  font-size: 12px;
+  line-height: 12px;
+}
+
+/* Miniaturas das capturas logo abaixo da linha da ferramenta. */
+.shots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 6px 18px;
+}
+
+.shot {
+  padding: 0;
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  background: var(--vscode-editor-background, transparent);
+  cursor: zoom-in;
+  line-height: 0;
+  overflow: hidden;
+}
+
+.shot:hover,
+.shot:focus-visible {
+  border-color: var(--vscode-focusBorder, #4d8fd6);
+}
+
+.shot img {
+  width: 180px;
+  max-height: 120px;
+  object-fit: cover;
+  object-position: top left;
+}
+
+.shot-view {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.78);
+  cursor: zoom-out;
+}
+
+.shot-view img {
+  max-width: 100%;
+  max-height: calc(100% - 28px);
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+
+.shot-hint {
+  color: #ddd;
+  font-size: 0.85em;
+}
+
+
+.ag-browser {
+  flex: none;
+  display: inline-flex;
+  color: var(--fg);
+}
+
+.ag-browser .codicon {
+  font-size: 12px;
+  line-height: 12px;
+}
+
+.tag.browser .codicon {
+  font-size: 11px;
+  vertical-align: -1px;
+}
+
+/* Agente isolado num worktree: ramificação no cartão e na etiqueta. */
+.ag-branch {
+  flex: none;
+  display: inline-flex;
+  color: var(--fg);
+}
+
+.ag-branch .codicon {
+  font-size: 12px;
+  line-height: 12px;
+}
+
+.tag.branch .codicon {
+  font-size: 11px;
+  vertical-align: -1px;
+}
+
+/* ---------- Guarda: orçamento esgotado e agente possivelmente preso ---------- */
+
+
+.guard-text {
+  overflow-wrap: anywhere;
+}
+
+.guard-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.guard-msg {
+  display: flex;
+  gap: 6px;
+  align-items: flex-end;
+}
+
+.guard-msg[hidden] {
+  display: none;
+}
+
+.guard-msg-input {
+  flex: 1;
+  min-width: 0;
+  resize: vertical;
+  font: inherit;
+  color: var(--vscode-input-foreground, inherit);
+  background: var(--vscode-input-background, transparent);
+  border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.35));
+  border-radius: 4px;
+  padding: 4px 6px;
+}
+
+/* Vigia de treino: resumo do modelo pequeno dentro do cartão de alerta (src/chat/infra). */
+.guard-card .guard-summary {
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid var(--agent, var(--vscode-textLink-foreground));
+  color: var(--vscode-descriptionForeground);
+}
+
+/* ---------- Decisões pendentes: pílula do composer ---------- */
+
+.composer .box .row .pill.pending-pill {
+  height: 24px;
+  padding: 0 9px;
+  gap: 5px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  font-weight: 600;
+}
+
+.composer .box .row .pill.pending-pill:hover:not(:disabled),
+.composer .box .row .pill.pending-pill.menu-on {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 24%, transparent);
+}
+
+/* ---------- Cartões de agente no log: uma linha, e os vizinhos formam uma lista ---------- */
+
+.log > .ag-card.compact + .ag-card.compact {
+  margin-top: -8px;
+}
+
+/* ---------- Estado vazio: o que dá para pedir ---------- */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 460px;
+  width: 100%;
+  padding: 0 4px;
+}
+
+.empty p {
+  margin: 0;
+}
+
+.empty-title {
+  color: var(--fg);
+  font-size: 1.08em;
+  font-weight: 600;
+}
+
+.empty-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+button.empty-ex {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--fg);
+  line-height: 1.4;
+}
+
+button.empty-ex .codicon {
+  flex: none;
+  margin-top: 2px;
+  color: var(--muted);
+}
+
+button.empty-ex:hover:not(:disabled) {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.16));
+}
+
+button.empty-ex:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.empty-hint {
+  font-size: 0.86em;
+}
+
+.empty-hint kbd {
+  font-family: var(--vscode-editor-font-family);
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
