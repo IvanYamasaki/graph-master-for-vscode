@@ -23,6 +23,7 @@ import { TaskProcsRead, killSnapshot, killSummary, readTaskProcs } from './taskP
 import type { ProcSnap } from './proc';
 import { spawn } from 'child_process';
 import { estimateUsd } from './usdEstimate';
+import { BridgeStateFrame, RemoteControl, isRemoteEcho, remoteControlApi, replayText } from './remoteControl';
 import { BROWSER_SERVER, BROWSER_TOOL_PREFIX, BrowserStatus, browserActionWrites, browserUnreachable, describeBrowserAction, isBrowserTool } from './browser';
 import { Attachment, AgentInfo, AgentStatus, HistoryItem, HostMessage, ModelOption, PermissionDecision, SlashCommandOption, UsageInfo, UsageWindow } from './protocol';
 
@@ -76,6 +77,11 @@ export interface SessionOptions {
    * schema e sobe dezenas de processos.
    */
   strictMcp?: boolean;
+  /**
+   * Sessão que pode ligar o Remote Control (o chat do painel). Sobe o CLI com `--replay-user-messages`, como a
+   * extensão oficial: é pelo eco que a mensagem vinda do claude.ai aparece no painel. Agentes roteados ficam sem.
+   */
+  remoteControl?: boolean;
 }
 
 /** Tarefa em segundo plano da sessão começou ou terminou; `open` é quantas continuam abertas. */
@@ -118,12 +124,17 @@ class PromptQueue implements AsyncIterable<SDKUserMessage> {
   private waiting?: (r: IteratorResult<SDKUserMessage>) => void;
   private closed = false;
 
-  /** priority "next": o CLI dobra a mensagem no turno em andamento, na próxima fronteira de ferramenta, sem interromper. */
-  push(content: UserContent, priority?: SDKUserMessage['priority']): void {
+  /**
+   * priority "next": o CLI dobra a mensagem no turno em andamento, na próxima fronteira de ferramenta, sem interromper.
+   * Devolve o uuid da mensagem: o eco (`--replay-user-messages`) volta com ele, e é assim que o nosso se separa do remoto.
+   */
+  push(content: UserContent, priority?: SDKUserMessage['priority']): string {
+    const uuid = randomUUID();
     const msg: SDKUserMessage = {
       type: 'user',
       message: { role: 'user', content },
       parent_tool_use_id: null,
+      uuid,
       ...(priority ? { priority } : {}),
     };
     if (this.waiting) {
@@ -133,6 +144,7 @@ class PromptQueue implements AsyncIterable<SDKUserMessage> {
     } else {
       this.items.push(msg);
     }
+    return uuid;
   }
 
   close(): void {
@@ -258,6 +270,18 @@ export class ChatSession {
   private readonly inferredDone = new Set<string>();
   private hintLines: string[] = [];
   private hintTimer?: ReturnType<typeof setTimeout>;
+  /** Remote Control desta conversa (só com options.remoteControl). O estado vai ao painel a cada mudança. */
+  readonly remote = new RemoteControl(
+    (state) => this.post({ type: 'remoteControl', state }),
+    (text) => this.post({ type: 'notice', level: 'error', text }),
+  );
+  /**
+   * A ponte precisa de nova confirmação do usuário: o modo virou bypass com ela ligada ('mode'), ou o processo novo
+   * ia religá-la com o modo em bypass sem confirmação ('restart'). Quem responde chama confirmRemoteBypass.
+   */
+  onRemoteConfirm?: (why: 'mode' | 'restart') => void;
+  /** uuids das mensagens que saíram deste painel, para o eco delas não virar "mensagem remota". */
+  private readonly ownUuids = new Set<string>();
 
   constructor(
     readonly profile: Profile,
@@ -289,7 +313,7 @@ export class ChatSession {
     if (!this.prompts || !this.busy || !this.toolsRunning.size) {
       return false;
     }
-    this.prompts.push(text, 'next');
+    this.noteOwn(this.prompts.push(text, 'next'));
     return true;
   }
 
@@ -351,7 +375,7 @@ export class ChatSession {
         settingSources: ['user', 'project', 'local'],
         // Servidor do .mcp.json sem aprovação do usuário para o conteúdo atual não sobe (guard/mcpApproval.ts).
         settings: projectMcpSettings(this.cwd),
-        extraArgs: { [this.chrome ? 'chrome' : 'no-chrome']: null },
+        extraArgs: { [this.chrome ? 'chrome' : 'no-chrome']: null, ...(this.options.remoteControl ? { 'replay-user-messages': null } : {}) },
         hooks: this.sessionHooks(),
         canUseTool: (toolName, input, opts) =>
           toolName.startsWith(OWN_TOOL_PREFIX)
@@ -381,6 +405,9 @@ export class ChatSession {
     this.q = q;
     void this.consume(q);
     void this.readBrowserStatus(q);
+    if (this.options.remoteControl) {
+      this.startRemote(q);
+    }
     q.supportedModels()
       .then((list) => {
         this.models = list.map((m) => ({
@@ -430,7 +457,82 @@ export class ChatSession {
       this.limitHit = undefined;
     }
     this.setBusy(true);
-    this.prompts?.push(buildUserContent(text, attachments));
+    const uuid = this.prompts?.push(buildUserContent(text, attachments));
+    if (uuid) {
+      this.noteOwn(uuid);
+    }
+  }
+
+  private noteOwn(uuid: string): void {
+    this.ownUuids.add(uuid);
+    if (this.ownUuids.size > 500) {
+      this.ownUuids.delete(this.ownUuids.values().next().value!);
+    }
+  }
+
+  // ---------- Remote Control ----------
+
+  /**
+   * Processo novo: lê se o Remote Control é possível aqui (`remote_control_available` do initialize, campo que o
+   * sdk.d.ts não declara) e, se o usuário tinha ligado, liga de novo: a ponte morre com o processo anterior.
+   */
+  private startRemote(q: Query): void {
+    const api = remoteControlApi(q);
+    if (!api) {
+      this.remote.markUnavailable('esta versão do SDK não tem enableRemoteControl');
+      return;
+    }
+    if (this.remote.wanted) {
+      if (this.onRemoteConfirm && this.remote.needsBypassConfirm(this.permissionMode)) {
+        // Fica "conectando" até o usuário responder; recusar desliga.
+        this.onRemoteConfirm('restart');
+      } else {
+        void this.remote.enable(api);
+      }
+    }
+    q.initializationResult()
+      .then((init) => {
+        if (this.q === q && (init as { remote_control_available?: boolean }).remote_control_available === false) {
+          this.remote.markUnavailable();
+        }
+      })
+      .catch(() => undefined);
+  }
+
+  /** Liga ou desliga o Remote Control desta conversa. Sem processo de pé, ligar fica marcado e sai quando ele subir. */
+  async setRemoteControl(on: boolean): Promise<void> {
+    if (!this.options.remoteControl) {
+      return;
+    }
+    if (!on) {
+      await this.remote.disable(remoteControlApi(this.q));
+      return;
+    }
+    if (!this.prompts) {
+      this.start(this.sessionId);
+    }
+    await this.remote.enable(remoteControlApi(this.q));
+  }
+
+  /** Resposta à confirmação pedida por onRemoteConfirm: aceitar vale para este bypass; recusar desliga a ponte. */
+  async confirmRemoteBypass(ok: boolean): Promise<void> {
+    if (!ok) {
+      await this.setRemoteControl(false);
+      return;
+    }
+    this.remote.bypassConfirmed = true;
+    if (this.remote.wanted && this.remote.state.status === 'connecting' && this.q) {
+      await this.remote.enable(remoteControlApi(this.q));
+    }
+  }
+
+  /** Toda troca de modo passa por aqui: entrar em bypass com a ponte ligada pede confirmação de novo. */
+  private changeMode(next: PermissionMode): void {
+    const changed = next !== this.permissionMode;
+    this.permissionMode = next;
+    if (changed && this.options.remoteControl && this.remote.needsBypassConfirm(next)) {
+      this.onRemoteConfirm?.('mode');
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -443,7 +545,7 @@ export class ChatSession {
   }
 
   async setMode(mode: PermissionMode): Promise<void> {
-    this.permissionMode = mode;
+    this.changeMode(mode);
     try {
       await this.q?.setPermissionMode(mode);
     } catch (err) {
@@ -631,7 +733,7 @@ export class ChatSession {
     if (pending.toolName === 'ExitPlanMode') {
       // Aprovar o plano sai do modo de planejamento, como na extensão oficial.
       const next: PermissionMode = answer.decision === 'always' ? 'acceptEdits' : 'default';
-      this.permissionMode = next;
+      this.changeMode(next);
       this.post({ type: 'session', sessionId: this.sessionId ?? '', model: this.model, permissionMode: next });
       pending.resolve({
         behavior: 'allow',
@@ -655,6 +757,9 @@ export class ChatSession {
   }
 
   private stop(): void {
+    if (this.q) {
+      this.remote.processEnded(!this.disposed);
+    }
     this.denyAllPending('Sessão encerrada.');
     this.prompts?.close();
     this.q?.close();
@@ -676,6 +781,11 @@ export class ChatSession {
   ): Promise<PermissionResult> {
     const requestId = randomUUID();
     return new Promise((resolve) => {
+      // Pedido já cancelado (o CLI resolveu por outro caminho, como a resposta vinda do celular): nem vira cartão.
+      if (signal.aborted) {
+        resolve({ behavior: 'deny', message: 'Cancelado.' });
+        return;
+      }
       this.pending.set(requestId, { toolName, input, suggestions, resolve });
       signal.addEventListener('abort', () => {
         if (this.pending.delete(requestId)) {
@@ -971,6 +1081,7 @@ export class ChatSession {
         // Sem isto o agente ficava "rodando" e quem esperava por ele, aguardando para sempre.
         this.dropBackgroundTasks('failed');
         this.loseRunningTasks('o processo do Claude Code parou');
+        this.remote.processEnded(false);
         this.endDeadTurn();
         this.setBusy(false);
         this.post({ type: 'thinking', value: false });
@@ -1144,9 +1255,22 @@ export class ChatSession {
       }
 
       case 'user': {
+        // Antes do eco: com --replay-user-messages o aviso de tarefas órfãs pode chegar só como replay.
         const plain = typeof m.message.content === 'string' ? m.message.content : m.message.content.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
-        if (!m.parent_tool_use_id && isOrphanNotice(plain)) {
+        // Eco do --replay-user-messages: o nosso já está no painel; o que veio do claude.ai entra como mensagem do usuário.
+        // O uuid próprio fica no conjunto (limitado): o CLI pode ecoar a mesma mensagem mais de uma vez.
+        const replay = 'isReplay' in m && m.isReplay;
+        const remote = replay && isRemoteEcho(m, this.ownUuids, this.remote.mayReceive);
+        // Texto digitado por alguém (aqui ou no celular) nunca é o aviso do CLI, mesmo citando a frase.
+        const typed = remote || (replay && this.ownUuids.has(m.uuid));
+        if (!m.parent_tool_use_id && !typed && isOrphanNotice(plain)) {
           this.noteOrphanNotice(plain);
+        }
+        if (replay) {
+          if (remote) {
+            this.onRemoteMessage(m.message.content);
+          }
+          return;
         }
         if (typeof m.message.content === 'string') {
           return;
@@ -1224,7 +1348,26 @@ export class ChatSession {
     }
   }
 
+  /** Mensagem que o usuário mandou pelo Remote Control: aparece como as locais, e o turno que ela abre é dele. */
+  private onRemoteMessage(content: unknown): void {
+    const images = Array.isArray(content) ? content.filter((b: { type?: string }) => b?.type === 'image').length : 0;
+    const text = replayText(content);
+    this.post({ type: 'userEcho', text: text || `(${images} ${images === 1 ? 'imagem' : 'imagens'})`, origin: 'remote' });
+    if (!this.busy) {
+      this.turnTexts = [];
+      this.turnLastText = '';
+      this.limitHit = undefined;
+    }
+    this.autoTurn = false;
+    this.setBusy(true);
+  }
+
   private handleSystem(m: Extract<SDKMessage, { type: 'system' }>): void {
+    // bridge_state não está no sdk.d.ts desta versão (CLI 2.1.284 emite; a extensão oficial lê).
+    if ((m as { subtype: string }).subtype === 'bridge_state') {
+      this.remote.onBridgeState(m as unknown as BridgeStateFrame, remoteControlApi(this.q));
+      return;
+    }
     switch (m.subtype) {
       case 'init':
         // O init vem no começo de cada turno, inclusive nos que o CLI abre sozinho. O primeiro do processo não conta:
@@ -1234,7 +1377,8 @@ export class ChatSession {
         }
         this.initSeen = true;
         this.sessionId = m.session_id;
-        this.permissionMode = m.permissionMode;
+        // O modo pode ter mudado pelo celular (o Remote Control aceita trocar o modo).
+        this.changeMode(m.permissionMode);
         this.post({ type: 'session', sessionId: m.session_id, model: m.model, permissionMode: m.permissionMode, mcpServers: m.mcp_servers?.map((s) => ({ name: s.name, status: s.status })) });
         // O init vem a cada turno; só reenvia a lista quando o conjunto do terminal mudou.
         if (m.terminal_slash_commands && m.terminal_slash_commands.join() !== [...terminalCommands].join()) {

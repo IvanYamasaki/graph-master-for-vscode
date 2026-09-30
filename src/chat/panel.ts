@@ -6,6 +6,7 @@ import type { PermissionMode, SessionMessage } from '@anthropic-ai/claude-agent-
 import { getSessionInfo, getSessionMessages, listSessions } from '@anthropic-ai/claude-agent-sdk';
 import { Profile, ProfileStore, configDirEnv, isCodex } from '../profiles';
 import { AgentRecord, ChatSession, profileEnv, toolResultImages, toolResultText } from './session';
+import { isClaudeUrl } from './remoteControl';
 import { CodexSession, codexModelOptions, knownCodexModels, prefetchCodexModels } from './codexSession';
 import { AgentHub, AnySession, MAIN_ID, browserApproval } from './hub';
 import type { LabReports } from './lab/reportHost';
@@ -61,6 +62,32 @@ export interface ChatOptions {
 interface PanelState {
   profileId: string;
   sessionId?: string;
+}
+
+/**
+ * Confirmação modal do Remote Control com o modo bypass. `toggle`: o usuário ligou. `startup`: a configuração ligou.
+ * `mode`: o modo virou bypass com a ponte ligada. `restart`: o processo novo ia religar a ponte em bypass.
+ */
+async function confirmRemoteBypass(why: 'toggle' | 'startup' | 'mode' | 'restart'): Promise<boolean> {
+  const title = {
+    toggle: 'Ligar o Remote Control com as permissões ignoradas (bypass)?',
+    startup: 'Ligar o Remote Control neste chat (agentGraphMaster.remoteControlAtStartup)?',
+    mode: 'O modo virou bypass com o Remote Control ligado. Manter o Remote Control?',
+    restart: 'Religar o Remote Control com o modo bypass?',
+  }[why];
+  const button = why === 'toggle' || why === 'startup' ? 'Ligar mesmo assim' : 'Manter ligado';
+  const ok = await vscode.window.showWarningMessage(
+    title,
+    {
+      modal: true,
+      detail:
+        'Este chat roda em modo bypass: o Claude executa comandos e edita arquivos sem pedir aprovação.\n\n' +
+        'Com o Remote Control ligado, quem tiver acesso à sua conta claude.ai (navegador ou app do celular) manda mensagens para esta sessão e, por ela, controla esta máquina sem nenhuma confirmação.\n\n' +
+        (why === 'mode' || why === 'restart' ? 'Cancelar desliga o Remote Control.' : 'Se não quiser isso, cancele e troque o modo de permissão antes.'),
+    },
+    button,
+  );
+  return ok === button;
 }
 
 export class ChatPanel {
@@ -122,6 +149,18 @@ export class ChatPanel {
       }
       await pickOrphans(workspaceCwd());
     });
+    // Comando da paleta: liga ou desliga o Remote Control do chat ativo (ou do último aberto).
+    vscode.commands.registerCommand('agentGraphMaster.remoteControl', async () => {
+      const list = [...ChatPanel.all];
+      const target = list.find((p) => p.panel.active) ?? list.at(-1);
+      if (!target) {
+        void vscode.window.showInformationMessage('Abra um chat do Agent Graph Master para ligar o Remote Control.');
+        return;
+      }
+      target.panel.reveal();
+      const s = target.session;
+      await target.setRemoteControl(!(s instanceof ChatSession && (s.remote.mayReceive || s.remote.state.status === 'connected')));
+    });
     CompanionPanel.setup({
       findLink: (mainSessionId) => [...ChatPanel.all].find((p) => p.session.sessionId === mainSessionId)?.link(),
       loadHistory: async (profile, cwd, sessionId) => toHistory(await withConfigDir(profile, () => getSessionMessages(sessionId, { dir: cwd }))),
@@ -181,9 +220,11 @@ export class ChatPanel {
           systemAppend: () => this.hub.systemAppendFor(MAIN_ID),
           chrome: chromeAtStart,
           browserApproval,
+          remoteControl: true,
         });
     if (this.session instanceof ChatSession) {
       this.session.onBrowserChange = () => this.postBrowser();
+      this.session.onRemoteConfirm = (why) => this.askRemoteBypass(why);
       this.session.onOrphanHint = (text) => this.post({ type: 'notice', level: 'info', text, action: { kind: 'orphans', label: 'Processos órfãos' } });
       this.reconcileTimer = setInterval(() => {
         if (this.session instanceof ChatSession && this.session.hasRunningTasks) {
@@ -292,6 +333,12 @@ export class ChatPanel {
         await this.killOrphans(msg.roots);
         return;
       case 'send':
+        // /remote-control (ou /rc) digitado no chat liga e desliga, como na extensão oficial; o CLI não o trata fora do terminal.
+        if (/^\/(remote-control|rc)\s*$/i.test(msg.text.trim()) && this.session instanceof ChatSession && !msg.attachments?.length) {
+          const s = this.session;
+          await this.setRemoteControl(!(s.remote.mayReceive || s.remote.state.status === 'connected'));
+          return;
+        }
         // Novidades do cérebro guardadas para o orquestrador vão na frente da mensagem (sem abrir turno à parte).
         this.session.send(this.hub.brain.withNews(MAIN_ID, msg.text), msg.attachments);
         return;
@@ -398,6 +445,9 @@ export class ChatPanel {
       case 'refreshBrowsers':
         await this.refreshBrowsers();
         return;
+      case 'remoteControl':
+        await this.remoteControlAction(msg.action);
+        return;
       case 'worktreeAction':
         await this.hub.worktreeAction(msg.id, msg.action);
         return;
@@ -451,6 +501,9 @@ export class ChatPanel {
     }
     this.postActiveFile();
     this.postBrowser();
+    if (this.session instanceof ChatSession) {
+      this.post({ type: 'remoteControl', state: this.session.remote.state });
+    }
     this.post({ type: 'brain', exists: this.hub.brain.isActive });
     for (const msg of this.outbox.splice(0)) {
       void this.panel.webview.postMessage(msg);
@@ -472,6 +525,85 @@ export class ChatPanel {
       this.session.send(this.options.seed.prompt);
     }
     this.startUsagePolling();
+    // Remote Control ao abrir o chat só com a configuração ligada; em bypass passa pela mesma confirmação do interruptor.
+    if (this.session instanceof ChatSession && vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('remoteControlAtStartup', false)) {
+      await this.setRemoteControl(true, true);
+    }
+  }
+
+  // ---------- Remote Control ----------
+
+  /**
+   * Liga ou desliga o Remote Control desta conversa. Em bypass, ligar pede confirmação modal: quem entrar na conta
+   * claude.ai controla esta máquina pelo Claude sem aprovação nenhuma.
+   */
+  async setRemoteControl(on: boolean, atStartup = false): Promise<void> {
+    if (!(this.session instanceof ChatSession)) {
+      this.post({ type: 'notice', level: 'error', text: 'O Remote Control só funciona em conversas do Claude (não do Codex).' });
+      return;
+    }
+    const session = this.session;
+    if (!on) {
+      await session.setRemoteControl(false);
+      return;
+    }
+    if (!session.remote.available) {
+      this.post({ type: 'notice', level: 'error', text: `Remote Control indisponível: ${session.remote.state.reason ?? 'o Claude Code não permite nesta conta ou organização'}.` });
+      return;
+    }
+    if (session.permissionMode === 'bypassPermissions') {
+      const ok = await confirmRemoteBypass(atStartup ? 'startup' : 'toggle');
+      if (!ok) {
+        if (atStartup) {
+          this.post({ type: 'notice', level: 'info', text: 'Remote Control não ligado neste chat (confirmação recusada).' });
+        }
+        return;
+      }
+      session.remote.bypassConfirmed = true;
+    }
+    // O painel anuncia conectado, queda e motivo a cada mudança de estado (mensagem remoteControl).
+    await session.setRemoteControl(true);
+  }
+
+  /**
+   * O modo virou bypass com a ponte ligada, ou o processo novo ia religá-la em bypass: pergunta de novo. Recusar
+   * desliga a ponte. Um modal por vez: pedidos que chegam com ele aberto esperam a mesma resposta.
+   */
+  private remoteConfirm?: Promise<void>;
+  private askRemoteBypass(why: 'mode' | 'restart'): void {
+    if (!(this.session instanceof ChatSession) || this.remoteConfirm) {
+      return;
+    }
+    const session = this.session;
+    this.remoteConfirm = (async () => {
+      const ok = await confirmRemoteBypass(why);
+      await session.confirmRemoteBypass(ok);
+      if (!ok) {
+        this.post({ type: 'notice', level: 'info', text: 'Remote Control desligado: o modo bypass não foi confirmado para uso remoto.' });
+      }
+    })().finally(() => (this.remoteConfirm = undefined));
+  }
+
+  private async remoteControlAction(action: 'on' | 'off' | 'open' | 'copy'): Promise<void> {
+    if (action === 'on' || action === 'off') {
+      await this.setRemoteControl(action === 'on');
+      return;
+    }
+    const url = this.session instanceof ChatSession ? this.session.remote.state.sessionUrl : undefined;
+    if (!url) {
+      return;
+    }
+    if (action === 'open') {
+      // Só abre https no claude.ai: o link vem do CLI, mas o navegador não abre nada que ele não devia mandar.
+      if (!isClaudeUrl(url)) {
+        this.post({ type: 'notice', level: 'error', text: `Link do Remote Control fora do claude.ai, não abri: ${url}` });
+        return;
+      }
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+    } else {
+      await vscode.env.clipboard.writeText(url);
+      this.post({ type: 'notice', level: 'info', text: 'Link da sessão copiado.' });
+    }
   }
 
   // ---------- Processos das tarefas de shell ----------

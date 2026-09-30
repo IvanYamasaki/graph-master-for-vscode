@@ -558,7 +558,10 @@ export type HostMessage =
   | { type: 'brain'; exists: boolean }
   /** `fromId`: agente que entregou o relatório, para a linha usar a cor e o título dele. */
   /** `origin: 'companion'`: o usuário mandou pelo botão "Enviar ao principal" do chat lateral. */
-  | { type: 'userEcho'; text: string; from?: string; fromId?: string; origin?: 'companion' }
+  /** `origin: 'remote'`: a mensagem chegou pelo Remote Control (claude.ai/code ou app do celular). */
+  | { type: 'userEcho'; text: string; from?: string; fromId?: string; origin?: 'companion' | 'remote' }
+  /** Remote Control desta conversa mudou de estado (ou é o estado inicial). */
+  | { type: 'remoteControl'; state: RemoteControlState }
   /** Nome da sessão mudou (gerado pelo Claude Code ou /rename): o cabeçalho acompanha. */
   | { type: 'sessionTitle'; title: string }
   /** Chat lateral: troca o texto da caixa (pergunta pré-preenchida, sem enviar). */
@@ -595,6 +598,20 @@ export type HostMessage =
       browsers?: ConnectedBrowser[];
       browsersError?: string;
     };
+
+/**
+ * Remote Control da conversa. `off`: desligado. `connecting`: ligando (ou religando depois de reiniciar o processo).
+ * `connected`: a sessão aceita mensagens de `sessionUrl` (claude.ai/code ou app). `disconnected`: a ponte caiu ou
+ * não subiu, com `reason`. `unavailable`: o Claude Code ou a organização não deixam (disableRemoteControl, conta sem claude.ai).
+ */
+export interface RemoteControlState {
+  status: 'off' | 'connecting' | 'connected' | 'disconnected' | 'unavailable';
+  sessionUrl?: string;
+  connectUrl?: string;
+  reason?: string;
+  /** Com `disconnected`: o usuário desligou, mas o Claude Code não confirmou; a ponte pode continuar de pé. */
+  stuck?: boolean;
+}
 
 /** Um navegador com a extensão Claude in Chrome conectado à conta (resposta de list_connected_browsers). */
 export interface ConnectedBrowser {
@@ -724,6 +741,8 @@ export type WebviewMessage =
   | { type: 'setChrome'; value: boolean }
   /** Relê a lista de navegadores conectados (clique no indicador). */
   | { type: 'refreshBrowsers' }
+  /** Remote Control: ligar ou desligar nesta conversa, abrir o link da sessão no navegador ou copiá-lo. */
+  | { type: 'remoteControl'; action: 'on' | 'off' | 'open' | 'copy' }
   /** Botões do popup de um agente isolado: abrir o diff no editor, mesclar ou descartar (os dois últimos com confirmação modal). */
   /** Botão "Podar"/"Restaurar" do popup de uma hipótese na árvore do laboratório. Só marca; nada é apagado. */
   | { type: 'labAction'; kind: 'prune' | 'unprune'; hypothesis_id: string }

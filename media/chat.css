@@ -287,6 +287,47 @@ textarea.feedback {
   font-size: 12px;
 }
 
+/* Mensagem que chegou pelo Remote Control (claude.ai/code ou app do celular). */
+.msg.user.from-remote .msg-origin {
+  color: var(--vscode-textLink-foreground, #3794ff);
+}
+
+/* ---------- Remote Control ---------- */
+
+.pill.remote {
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.pill.remote .codicon {
+  font-size: 13px;
+}
+
+.pill.remote .bstate {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+
+.pill.remote .bstate.pending {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.pill.remote .bstate.connected {
+  background: #3fb950;
+}
+
+.pill.remote .bstate.failed {
+  background: #f85149;
+}
+
+.pill.remote.warn {
+  color: var(--vscode-errorForeground, #f85149);
+}
+
 /* ---------- Conversa ---------- */
 
 .log {

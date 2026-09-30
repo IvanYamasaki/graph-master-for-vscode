@@ -86,6 +86,12 @@
         "icon": "$(debug-disconnect)"
       },
       {
+        "command": "agentGraphMaster.remoteControl",
+        "title": "Remote Control (ligar/desligar no chat ativo)",
+        "category": "Agent Graph Master",
+        "icon": "$(remote)"
+      },
+      {
         "command": "agentGraphMaster.setGeminiKey",
         "title": "Configurar chave do Gemini",
         "category": "Agent Graph Master",
@@ -473,6 +479,11 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Conversas novas começam com o interruptor **Usar o navegador (Claude in Chrome)** ligado. O Claude passa a controlar o Chrome em que a extensão Claude in Chrome está conectada, com as contas já logadas nele. Só um dono do navegador por vez: se um agente estiver com ele, a conversa começa desligada. Dá para ligar e desligar em cada conversa pelo menu do \"+\"."
+        },
+        "agentGraphMaster.remoteControlAtStartup": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Cada chat novo liga o **Remote Control** ao abrir: a conversa passa a aceitar mensagens do claude.ai/code e do app do Claude no celular, e o painel mostra o link da sessão. Precisa de login com conta claude.ai. **Risco:** no modo sem perguntas (bypass), quem tiver acesso à sua conta controla esta máquina pelo Claude; por isso, em bypass, cada chat pede confirmação antes de ligar. Não vale para agentes roteados. Organização com `disableRemoteControl` nas managed settings deixa o Remote Control indisponível."
         },
         "agentGraphMaster.browserActionsNeedApproval": {
           "type": "boolean",
