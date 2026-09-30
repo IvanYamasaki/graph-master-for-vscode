@@ -1,3 +1,4 @@
+import { UsdTrack, applyUsd, newUsdTrack } from '../usdEstimate';
 import { randomUUID } from 'crypto';
 import * as vscode from 'vscode';
 import { z } from 'zod';
@@ -71,6 +72,10 @@ export interface UsageReport {
   tokens?: number;
   /** Total acumulado do query() do SDK até aqui, não o do turno. */
   costUsdTotal?: number;
+  /** US$ estimados desta mensagem (tokens vezes o preço do modelo); o fim do turno troca pelo valor real. */
+  usdEstimate?: number;
+  /** Processo novo do CLI: o turno que morreu sem result fica com a estimativa dele. */
+  processStart?: boolean;
 }
 
 /** Trecho do prompt do orquestrador sobre orçamento, avaliador congelado e agente preso. */
@@ -108,8 +113,8 @@ const TICK_MS = 5000;
 interface Track {
   /** Tokens já contados por id de mensagem: o SDK repete a mesma mensagem, com o mesmo uso, a cada bloco. */
   seenMessages: Map<string, number>;
-  /** Último custo acumulado lido. Sobrevive a reinícios do processo: o resume continua do total salvo. */
-  lastCostTotal: number;
+  /** Conta de US$: último total do SDK, estimativa do turno em andamento e mensagens já estimadas. */
+  usd: UsdTrack;
   /** Tempo de trabalho já fechado, em ms; o turno aberto soma `now - busySince`. */
   activeMs: number;
   busySince?: number;
@@ -302,7 +307,7 @@ export class AgentGuard {
       t = {
         seenMessages: new Map(),
         // Agente retomado: o resume do SDK costuma continuar do total salvo na sessão, que é o que já foi contado.
-        lastCostTotal: spent?.usd ?? 0,
+        usd: newUsdTrack(spent?.usd),
         activeMs: (spent?.minutes ?? 0) * 60_000,
         haltedTurn: false,
         needsContinue: false,
@@ -338,14 +343,11 @@ export class AgentGuard {
         }
       }
     }
-    if (u.costUsdTotal !== undefined && u.costUsdTotal >= 0) {
-      // Total menor que o último: o processo recomeçou sem trazer o total salvo; o valor novo é todo gasto novo.
-      const delta = u.costUsdTotal >= t.lastCostTotal ? u.costUsdTotal - t.lastCostTotal : u.costUsdTotal;
-      t.lastCostTotal = u.costUsdTotal;
-      if (delta > 0 || spent.usd === undefined) {
-        spent.usd = (spent.usd ?? 0) + delta;
-        changed = true;
-      }
+    // Estimativa a cada mensagem (o teto max_usd vale no meio de um turno longo); o fim do turno troca pelo real.
+    const usd = applyUsd(t.usd, spent.usd, u);
+    if (usd !== undefined) {
+      spent.usd = usd;
+      changed = true;
     }
     if (changed) {
       spent.minutes = this.minutes(t);

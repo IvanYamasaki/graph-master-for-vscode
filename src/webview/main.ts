@@ -6,12 +6,14 @@ import { createLabCards } from './labCards';
 import { createLabView } from './labTree';
 import { createGuardCards } from './guardCards';
 import { STUCK_RING } from './guardUi';
-import { COMPANION_MARK, STATUS_LABEL, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, pendingText, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
+import { COMPANION_MARK, isWorking, STATUS_LABEL, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, pendingText, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
 import { COMPANION_ICON, COMPANION_OPEN_TITLE, createCompanionUi } from './companionUi';
 import type { CompanionInit } from '../chat/companion/types';
 import { describeBrowserAction, isBrowserTool } from '../chat/browser';
 import type { BrowserStatus } from '../chat/browser';
 import type { ConnectedBrowser } from '../chat/protocol';
+import type { TaskProcs } from '../chat/protocol';
+import { createOrphansView } from './orphansUi';
 import type { BoxInfo } from '../chat/protocol';
 import type { AgentInfo, Attachment, ExternalProviderName, HistoryItem, HostMessage, ModelOption, NoticeAction, ProfileOption, FileResult, SessionOption, SlashCommandOption, TaskProposal, UsageInfo, WebviewMessage } from '../chat/protocol';
 
@@ -1647,7 +1649,7 @@ function renderAgents(): void {
 
 function renderAgentsPill(): void {
   const list = [...agents.values()];
-  const running = list.filter((a) => a.status === 'running').length;
+  const running = list.filter(isWorking).length;
   const waiting = list.filter((a) => a.status === 'waiting').length;
   agentsPill.classList.toggle('hidden', !list.length);
   if (!list.length) {
@@ -1669,7 +1671,7 @@ function renderAgentsPill(): void {
 const RUN_LIMIT = 3;
 
 function renderRunBar(): void {
-  const running = [...agents.values()].filter((a) => a.status === 'running');
+  const running = [...agents.values()].filter(isWorking);
   // A faixa aparece e some entre o log e o composer: quem estava no fim da conversa continua no fim.
   const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 160;
   runBar.classList.toggle('hidden', !running.length);
@@ -2368,6 +2370,9 @@ function addNotice(text: string, level: 'info' | 'error', action?: NoticeAction)
   if (action?.kind === 'configureKey') {
     el.append(h('button', { class: 'notice-action', type: 'button', onclick: () => send({ type: 'configureKey', provider: action.provider }) }, icon('key'), action.label));
   }
+  if (action?.kind === 'orphans') {
+    el.append(h('button', { class: 'notice-action', type: 'button', onclick: () => orphansView.open() }, icon('debug-disconnect'), action.label));
+  }
   append(el);
 }
 
@@ -2430,6 +2435,7 @@ function clearLog(): void {
   agents.clear();
   boxes = [];
   agentItems.clear();
+  taskProcs.clear();
   agentCards.clear();
   taskCards.clear();
   pendingDecisions.clear();
@@ -2745,7 +2751,19 @@ function anchorFor(id: string): DOMRect | undefined {
  */
 /** Cartões de veredito do laboratório no log; o popup deles usa as classes do popup de nó. */
 const labCards = createLabCards({ append: (el) => append(el) });
+/** Árvore de processos de cada tarefa de shell, lida pelo host quando o popup dela abre. */
+const taskProcs = new Map<string, TaskProcs>();
+const orphansView = createOrphansView(send);
 const popup = createNodePopup({
+  procs: {
+    getProcs: (id) => taskProcs.get(id),
+    requestProcs: (id) => send({ type: 'taskProcs', id }),
+    killTree: (id) => send({ type: 'killTaskTree', id }),
+    openOrphans: () => {
+      popup.close();
+      orphansView.open();
+    },
+  },
   rootLabel: 'Conversa principal',
   getAgent: (id) => agents.get(id),
   getAgents: () => [...agents.values()],
@@ -3178,7 +3196,7 @@ function subLine(...parts: (string | false | undefined)[]): HTMLElement | null {
 
 function renderMapHead(): void {
   const list = [...agents.values()];
-  const running = list.filter((a) => a.status === 'running').length;
+  const running = list.filter(isWorking).length;
   const tokens = list.reduce((sum, a) => sum + a.totalTokens, 0);
   // Uma linha curta: quantos e quantos trabalham. Tokens, conta e contexto ficam no title e no popup da raiz.
   mapHead.title = [`${fmtTokens(tokens)} tokens somados`, state.forkOf ? `Continuação de ${state.forkOf}` : '', state.profileName, state.contextTokens ? `${fmtTokens(state.contextTokens)} em contexto` : '']
@@ -3195,6 +3213,17 @@ function renderMapHead(): void {
   );
   fill(
     mapBrain,
+    h(
+      'button',
+      {
+        class: 'map-organize map-brain',
+        type: 'button',
+        title: 'Lista processos do projeto que nenhuma tarefa rastreia mais (servidores de dev de sessões anteriores) e permite encerrá-los',
+        onclick: () => orphansView.open(),
+      },
+      icon('debug-disconnect'),
+      h('span', { class: 'map-brain-label' }, 'Processos órfãos'),
+    ),
     brainReady
       ? h(
           'button',
@@ -4013,6 +4042,13 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       break;
     case 'agent':
       onAgent(msg.agent);
+      break;
+    case 'taskProcs':
+      taskProcs.set(msg.procs.agentId, msg.procs);
+      popup.refresh(msg.procs.agentId);
+      break;
+    case 'orphans':
+      orphansView.update(msg);
       break;
     case 'boxes':
       boxes = msg.list;

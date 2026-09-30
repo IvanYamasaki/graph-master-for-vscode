@@ -85,7 +85,15 @@ export interface UsageInfo {
  * `waiting`: o turno acabou mas há trabalho pendente (processo em segundo plano, subagentes que ainda vão
  * reportar, ou uma pergunta feita a outro agente). O relatório final só sai quando nada mais falta.
  */
-export type AgentStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'stopped';
+export type AgentStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'stopped' | 'lost';
+
+/**
+ * Conta como trabalhando: só o que está confirmado vivo. `lost` (tarefa do SDK que o processo anterior do CLI levou
+ * junto) e `waiting` ficam de fora; agente restaurado do disco também, até ser retomado.
+ */
+export function isWorking(a: Pick<AgentInfo, 'status' | 'restored'>): boolean {
+  return a.status === 'running' && !a.restored;
+}
 
 /** Por que um agente está "aguardando". */
 export type PendingReason = 'background' | 'children' | 'question';
@@ -218,6 +226,11 @@ export interface AgentInfo {
   model?: string;
   /** Sessão própria do agente no Claude Code. É o que permite retomar a conversa dele depois de fechar a janela. */
   sessionId?: string;
+  /** Tipo da tarefa do SDK (local_bash, local_agent...). Ausente em agentes roteados e continuações. */
+  taskType?: string;
+  /** Tarefa de shell: o comando e quando começou (ISO), para achar a árvore de processos dela. */
+  command?: string;
+  startedAt?: string;
   /** Veio do disco ao reabrir a conversa: o processo dele não está de pé até você retomar. */
   restored?: boolean;
   /** Agente vigia: o hub o acorda a cada tantos minutos. Continua definido depois de parado, para o mapa saber o que ele é. */
@@ -440,6 +453,7 @@ export const STATUS_LABEL: Record<AgentStatus, string> = {
   completed: 'concluído',
   failed: 'falhou',
   stopped: 'parado',
+  lost: 'encerrada com a sessão anterior',
 };
 
 /** "aguardando processo em segundo plano", "aguardando 2 subagentes (a3, a4)"... a partir do `pending` do agente. */
@@ -487,6 +501,10 @@ export type HostMessage =
     }
   | { type: 'profiles'; list: ProfileOption[] }
   | { type: 'agent'; agent: AgentInfo }
+  /** Resposta a taskProcs: a árvore de processos de uma tarefa de shell. */
+  | { type: 'taskProcs'; procs: TaskProcs }
+  /** Lista de processos órfãos do projeto (resposta a scanOrphans, ou depois de encerrar). `open` abre a lista. */
+  | { type: 'orphans'; groups: OrphanView[]; error?: string; scannedAt: string; open?: boolean }
   /** Lista inteira das caixas da conversa, a cada mudança (vazia ao trocar de conversa). */
   | { type: 'boxes'; list: BoxInfo[] }
   | { type: 'agentItem'; id: string; item: HistoryItem }
@@ -590,7 +608,48 @@ export interface ConnectedBrowser {
 export type ExternalProviderName = 'gemini' | 'openai';
 
 /** Botão dentro de um aviso. Hoje só abre a configuração de chave de um provedor externo. */
-export type NoticeAction = { kind: 'configureKey'; provider: ExternalProviderName; label: string };
+export type NoticeAction =
+  | { kind: 'configureKey'; provider: ExternalProviderName; label: string }
+  /** Abre a lista de processos órfãos do projeto. */
+  | { kind: 'orphans'; label: string };
+
+/** Um processo como o popup e a lista de órfãos mostram. `startedAt` em ISO. */
+export interface ProcView {
+  pid: number;
+  ppid: number;
+  name: string;
+  commandLine: string;
+  cwd?: string;
+  startedAt?: string;
+  ports: number[];
+}
+
+/** Árvore de processos de uma tarefa de shell: raiz e descendentes, raiz primeiro. */
+export interface TaskProcs {
+  agentId: string;
+  /** Ausente: a raiz não está viva, ou nunca foi identificada. */
+  root?: ProcView;
+  members: ProcView[];
+  /**
+   * A raiz foi identificada enquanto a tarefa rodava (foto de PID, nome e início). Falso: tarefa que parou antes de
+   * qualquer leitura; não há busca nova, porque ela acharia o processo de outra tarefa com o mesmo comando.
+   */
+  identified: boolean;
+  /** Portas que o comando cita (--port 3002, :5173), no ar ou não. */
+  expectedPorts: { port: number; up: boolean }[];
+  error?: string;
+  scannedAt: string;
+}
+
+/** Árvore órfã: processos do projeto que nenhum painel rastreia. */
+export interface OrphanView {
+  root: ProcView;
+  members: ProcView[];
+  ports: number[];
+  parentAlive: boolean;
+  /** Pai da raiz: vivo (terminal externo, outro claude) ou já encerrado (sobra de sessão). */
+  parent?: { pid: number; name?: string; alive: boolean };
+}
 
 /** Item do autocompletar de "@". `path` é relativo ao cwd, com "/". */
 export interface FileResult {
@@ -622,6 +681,13 @@ export type WebviewMessage =
   | { type: 'setMode'; value: string }
   | { type: 'setEffort'; value: string }
   | { type: 'stopAgent'; id: string }
+  /** Lê a árvore de processos de uma tarefa de shell (popup do nó). */
+  | { type: 'taskProcs'; id: string }
+  /** Encerra a árvore inteira de uma tarefa de shell; o host confirma num diálogo. */
+  | { type: 'killTaskTree'; id: string }
+  | { type: 'scanOrphans' }
+  /** Encerra as árvores órfãs com estas raízes (PID, nome e início, conferidos antes do kill); o host confirma num diálogo. */
+  | { type: 'killOrphans'; roots: { pid: number; name: string; startedAt?: string }[] }
   | { type: 'forkAgent'; id: string; profileId: string; model: string; effort: string; text: string; stopOriginal: boolean }
   | { type: 'sendToParent' }
   | { type: 'agentSend'; id: string; text: string }

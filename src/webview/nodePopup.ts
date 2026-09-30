@@ -17,13 +17,14 @@
  *
  * Autossuficiente como o graph.ts: injeta o próprio <style> com prefixo `agm-pop`.
  */
-import { agentColor, STATUS_LABEL, STATUS_RING, lastCheckLabel, pendingText, repeatLabel, watchLabel, type AgentInfo, type HistoryItem } from '../chat/protocol';
+import { agentColor, isWorking, STATUS_LABEL, STATUS_RING, lastCheckLabel, pendingText, repeatLabel, watchLabel, type AgentInfo, type HistoryItem } from '../chat/protocol';
 import type { WorktreeAction } from '../chat/protocol';
 import { createWorktreeRow, paintWorktreeRow } from './worktreeUi';
 import { budgetMeter, createGuardRow, paintGuardRow } from './guardUi';
 import { progressLabel, sumSpent } from '../chat/costs';
 import { fmtUsd } from '../chat/guard/format';
 import { createAttemptRow, paintAttemptRow } from './parallelUi';
+import { createProcRow, paintProcRow, type ProcRowDeps } from './procUi';
 
 export interface NodePopupDeps {
   getAgent(id: string): AgentInfo | undefined;
@@ -64,6 +65,8 @@ export interface NodePopupDeps {
   brainReady?(): boolean;
   /** Abre a nota do agente no cérebro (preview de Markdown). */
   openBrainNote?(id: string): void;
+  /** Tarefa de shell: árvore de processos lida pelo host, pedido de leitura, encerrar a árvore e abrir a lista de órfãos. */
+  procs?: ProcRowDeps;
 }
 
 /** O que o popup de uma caixa mostra. */
@@ -477,7 +480,8 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
   const wtRow = createWorktreeRow();
   const guardRow = createGuardRow();
   const attemptRow = createAttemptRow();
-  el.append(caret, h('div', `${P}-head`, dot, h('div', `${P}-titles`, title, kind), closeBtn), route, meta, guardRow, attemptRow, wtRow, body, actions);
+  const procRow = createProcRow();
+  el.append(caret, h('div', `${P}-head`, dot, h('div', `${P}-titles`, title, kind), closeBtn), route, meta, guardRow, attemptRow, wtRow, procRow, body, actions);
   document.body.append(el);
 
   let openId: string | undefined;
@@ -620,6 +624,9 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     if (a.status === 'failed') {
       return a.limit ? `Este agente parou por ${a.summary || 'limite de uso'} antes de entregar um relatório. Retomar pede para ele continuar de onde parou.` : 'Este agente falhou antes de entregar um relatório.';
     }
+    if (a.status === 'lost') {
+      return 'Esta tarefa encerrou com a sessão anterior do Claude Code (processo reiniciado, conversa retomada ou compactada). Ela não roda mais, mas processos que ela lançou podem continuar vivos.';
+    }
     if (a.status === 'stopped') {
       return a.restored ? 'Este agente está parado (veio do disco) e não entregou relatório.' : 'Este agente foi parado antes de entregar um relatório.';
     }
@@ -739,6 +746,9 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     paintWorktreeRow(wtRow, a, deps.worktreeAction);
     paintGuardRow(guardRow, a);
     paintAttemptRow(attemptRow, a, deps.getAgents());
+    if (deps.procs) {
+      paintProcRow(procRow, a, deps.procs);
+    }
     if (m === 'report' && reportEl && reportLabel) {
       setText(
         reportLabel,
@@ -970,7 +980,7 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     }
     meta.hidden = !extra.length;
 
-    const running = list.filter((a) => a.status === 'running');
+    const running = list.filter(isWorking);
     const done = list.filter((a) => a.status === 'completed').length;
     const halted = list.filter((a) => a.status === 'failed' || a.status === 'stopped').length;
     const tokens = list.reduce((s, a) => s + a.totalTokens, 0);
@@ -1060,7 +1070,7 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     watchEl = undefined;
 
     const list = b.agents;
-    const running = list.filter((a) => a.status === 'running');
+    const running = list.filter(isWorking);
     const done = list.filter((a) => a.status === 'completed').length;
     const halted = list.filter((a) => a.status === 'failed' || a.status === 'stopped').length;
     const tokens = list.reduce((s, a) => s + a.totalTokens, 0);

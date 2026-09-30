@@ -2638,8 +2638,10 @@ export class AgentHub {
       this.update(id, { status: 'stopped', totalTokens: turn.contextTokens, durationMs: Date.now() - agent.startedAt });
       return;
     }
-    // O agente de navegador devolve o navegador ao fim do turno: é quando ele entrega o relatório.
-    if (agent.info.browserActive && !turn.queued) {
+    // O agente de navegador devolve o navegador ao fim do turno: é quando ele entrega o relatório. Aguardando processo
+    // em segundo plano, fica com ele: desligar reiniciaria o CLI, e as tarefas abertas morreriam com o processo.
+    const openTasks = agent.session instanceof ChatSession ? agent.session.backgroundTasks.size : 0;
+    if (agent.info.browserActive && !turn.queued && !openTasks) {
       this.dropBrowser(id);
     }
     // O guarda interrompeu este turno por orçamento: nada é entregue, e as causas esperam o usuário decidir.

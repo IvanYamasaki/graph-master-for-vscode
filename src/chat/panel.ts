@@ -16,6 +16,8 @@ import { ExternalProviders } from './external';
 import { probeBrowsers } from './browserProbe';
 import { resolveClaudeExecutable } from '../claudePath';
 import { CompanionLink, CompanionPanel } from './companion/panel';
+import { RECONCILE_EVERY_MS } from './taskLiveness';
+import { StampedKill, killSnapshot, killSummary, orphanDetail, scanOrphans, snapFromView } from './taskProcs';
 import type { CompanionAgent, CompanionSource, MainMessage } from './companion/types';
 
 export const CHAT_VIEW_TYPE = 'agentGraphMaster.chat';
@@ -81,6 +83,8 @@ export class ChatPanel {
   /** Navegadores conectados à conta, lidos da ponte do Claude in Chrome. Relidos ao ligar e no clique do indicador. */
   private browsers?: { list?: ConnectedBrowser[]; error?: string; at: number };
   private probing = false;
+  /** Reconciliação periódica das tarefas "trabalhando" com o que o CLI ainda conhece. */
+  private reconcileTimer?: ReturnType<typeof setInterval>;
 
   static open(env: ChatEnv, profile: Profile, options: ChatOptions = {}): ChatPanel {
     const panel = vscode.window.createWebviewPanel(
@@ -107,6 +111,17 @@ export class ChatPanel {
   }
 
   static {
+    // Comando da paleta: abre a lista de órfãos no chat ativo; sem chat aberto, a lista vem num seletor do VS Code.
+    vscode.commands.registerCommand('agentGraphMaster.orphanProcesses', async () => {
+      const list = [...ChatPanel.all];
+      const target = list.find((p) => p.panel.active) ?? list.at(-1);
+      if (target) {
+        target.panel.reveal();
+        await target.postOrphans(true);
+        return;
+      }
+      await pickOrphans(workspaceCwd());
+    });
     CompanionPanel.setup({
       findLink: (mainSessionId) => [...ChatPanel.all].find((p) => p.session.sessionId === mainSessionId)?.link(),
       loadHistory: async (profile, cwd, sessionId) => toHistory(await withConfigDir(profile, () => getSessionMessages(sessionId, { dir: cwd }))),
@@ -169,6 +184,12 @@ export class ChatPanel {
         });
     if (this.session instanceof ChatSession) {
       this.session.onBrowserChange = () => this.postBrowser();
+      this.session.onOrphanHint = (text) => this.post({ type: 'notice', level: 'info', text, action: { kind: 'orphans', label: 'Processos órfãos' } });
+      this.reconcileTimer = setInterval(() => {
+        if (this.session instanceof ChatSession && this.session.hasRunningTasks) {
+          this.session.reconcileTasks();
+        }
+      }, RECONCILE_EVERY_MS);
     }
     this.files = FileIndex.acquire(cwd);
     // Aba restaurada já volta com o título que tinha; o nome da sessão chega logo depois pela leitura abaixo.
@@ -190,6 +211,7 @@ export class ChatPanel {
     panel.onDidDispose(() => {
       ChatPanel.all.delete(this);
       clearInterval(this.usageTimer);
+      clearInterval(this.reconcileTimer);
       this.files.release();
       editorWatch.forEach((d) => d?.dispose());
       this.hub.dispose();
@@ -248,6 +270,26 @@ export class ChatPanel {
     switch (msg.type) {
       case 'ready':
         await this.onReady();
+        // Painel aberto (ou recarregado): o que diz "trabalhando" tem de estar vivo.
+        if (this.session instanceof ChatSession) {
+          this.session.reconcileTasks();
+        }
+        return;
+      case 'taskProcs': {
+        const read = this.session instanceof ChatSession ? await this.session.taskProcs(msg.id) : undefined;
+        if (read) {
+          this.post({ type: 'taskProcs', procs: read.procs });
+        }
+        return;
+      }
+      case 'killTaskTree':
+        await this.killTaskTree(msg.id);
+        return;
+      case 'scanOrphans':
+        await this.postOrphans(false);
+        return;
+      case 'killOrphans':
+        await this.killOrphans(msg.roots);
         return;
       case 'send':
         // Novidades do cérebro guardadas para o orquestrador vão na frente da mensagem (sem abrir turno à parte).
@@ -430,6 +472,86 @@ export class ChatPanel {
       this.session.send(this.options.seed.prompt);
     }
     this.startUsagePolling();
+  }
+
+  // ---------- Processos das tarefas de shell ----------
+
+  /**
+   * Encerra a árvore de uma tarefa de shell, depois de confirmar num diálogo modal. Só o que a leitura mostrou ao usuário
+   * pode morrer: a foto (PID, nome, início) é conferida de novo depois do modal, e o que não bater fica vivo.
+   */
+  private async killTaskTree(id: string): Promise<void> {
+    if (!(this.session instanceof ChatSession)) {
+      return;
+    }
+    const session = this.session;
+    const record = session.agents.get(id);
+    const read = await session.taskProcs(id);
+    if (!record || !read) {
+      return;
+    }
+    this.post({ type: 'taskProcs', procs: read.procs });
+    if (!read.procs.root) {
+      const why = read.procs.identified ? 'os processos dela já encerraram' : 'o processo dela não foi identificado enquanto ela rodava; veja Processos órfãos';
+      this.post({ type: 'notice', level: 'info', text: `Nada a encerrar na tarefa "${record.info.description}": ${why}.`, action: read.procs.identified ? undefined : { kind: 'orphans', label: 'Processos órfãos' } });
+      return;
+    }
+    const detail = read.procs.members.map((m) => `${m.pid} ${m.name}${m.ports.length ? ` (porta ${m.ports.join(', ')})` : ''}${m.startedAt ? ` · desde ${new Date(m.startedAt).toLocaleTimeString()}` : ''}`).join('\n');
+    const ok = await vscode.window.showWarningMessage(
+      `Encerrar ${read.procs.members.length} ${read.procs.members.length === 1 ? 'processo' : 'processos'} da tarefa "${record.info.description}"?`,
+      { modal: true, detail },
+      'Encerrar',
+    );
+    if (ok !== 'Encerrar') {
+      return;
+    }
+    if (record.info.status === 'running') {
+      // Parar pelo SDK também mata a árvore pela foto; o registro da tarefa sai direito.
+      await session.stopAgent(id);
+    }
+    const r = await killSnapshot(read.snap);
+    if (r.killed.length || r.failed.length || r.refused || r.skipped?.length) {
+      this.post({ type: 'notice', level: r.failed.length || r.refused ? 'error' : 'info', text: `Tarefa "${record.info.description}": ${killSummary(r)}.` });
+    }
+    const after = await session.taskProcs(id);
+    if (after) {
+      this.post({ type: 'taskProcs', procs: after.procs });
+    }
+  }
+
+  /** Lê os órfãos do projeto e manda ao webview; `open` abre a lista. */
+  async postOrphans(open: boolean): Promise<void> {
+    const found = await scanOrphans(this.session.cwd);
+    this.post({ type: 'orphans', groups: found.groups, error: found.error, scannedAt: new Date().toISOString(), open });
+  }
+
+  /**
+   * Encerra as árvores órfãs com estas raízes, depois de confirmar num diálogo modal. A lista é relida: raiz que não
+   * bate mais (PID reaproveitado, processo já encerrado) não entra, e o que mudou na árvore depois da leitura fica vivo.
+   */
+  private async killOrphans(roots: { pid: number; name: string; startedAt?: string }[]): Promise<void> {
+    const found = await scanOrphans(this.session.cwd);
+    const wanted = roots.map(snapFromView);
+    const groups = found.groups.filter((g) => wanted.some((w) => w.pid === g.root.pid && w.name.toLowerCase() === g.root.name.toLowerCase() && sameStart(w.startedAt, g.root.startedAt)));
+    const missing = roots.filter((r) => !groups.some((g) => g.root.pid === r.pid));
+    if (!groups.length) {
+      this.post({ type: 'notice', level: 'info', text: 'As árvores escolhidas já não estão na lista de órfãos (encerraram ou o PID mudou de dono). Nada foi encerrado.' });
+      this.post({ type: 'orphans', groups: found.groups, error: found.error, scannedAt: new Date().toISOString() });
+      return;
+    }
+    const total = groups.reduce((n, g) => n + g.members.length, 0);
+    const alive = groups.filter((g) => g.parentAlive).length;
+    const ok = await vscode.window.showWarningMessage(
+      `Encerrar ${groups.length === 1 ? 'a árvore órfã' : `${groups.length} árvores órfãs`} (${total} ${total === 1 ? 'processo' : 'processos'})?${alive ? ` ${alive === 1 ? 'Uma delas foi aberta' : `${alive} delas foram abertas`} por um processo que ainda está aberto (terminal externo, outro claude).` : ''}`,
+      { modal: true, detail: orphanDetail(groups) + (missing.length ? `\n\nFora da lista agora (não serão tocados): ${missing.map((m) => m.pid).join(', ')}` : '') },
+      'Encerrar',
+    );
+    if (ok !== 'Encerrar') {
+      return;
+    }
+    const r = await killGroups(groups.map((g) => found.snaps.get(g.root.pid) ?? []));
+    this.post({ type: 'notice', level: r.failed.length || r.refused ? 'error' : 'info', text: `Processos órfãos: ${killSummary(r)}${missing.length ? `; ${missing.length} já não estavam na lista` : ''}.` });
+    await this.postOrphans(false);
   }
 
   // ---------- Navegador (Claude in Chrome) ----------
@@ -1060,4 +1182,73 @@ function buildSeed(record: AgentRecord, userText: string): string {
   ]
     .filter((l, i, arr) => !(l === '' && arr[i - 1] === ''))
     .join('\n');
+}
+
+/** Mesma hora de início, com folga de 1 s; sem hora de um dos lados, não dá para desmentir. */
+function sameStart(a: Date | undefined, b: string | undefined): boolean {
+  return !a || !b || Math.abs(a.getTime() - Date.parse(b)) <= 1000;
+}
+
+/** Encerra cada árvore pela foto dela, somando os resultados. */
+async function killGroups(snaps: import('./proc').ProcSnap[][]): Promise<StampedKill> {
+  const total: StampedKill = { killed: [], failed: [] };
+  const skipped: number[] = [];
+  const refused: string[] = [];
+  for (const snap of snaps) {
+    const r = await killSnapshot(snap);
+    total.killed.push(...r.killed);
+    total.failed.push(...r.failed);
+    skipped.push(...(r.skipped ?? []));
+    if (r.refused) {
+      refused.push(r.refused);
+    }
+  }
+  if (skipped.length) {
+    total.skipped = skipped;
+  }
+  if (refused.length) {
+    total.refused = refused.join('; ');
+  }
+  return total;
+}
+
+function shortCommand(command: string): string {
+  const one = command.replace(/\s+/g, ' ').trim();
+  return one.length > 90 ? `${one.slice(0, 89)}…` : one;
+}
+
+/** Órfãos sem chat aberto: seletor múltiplo do VS Code e confirmação modal. Árvores de pai vivo vêm desmarcadas e sinalizadas. */
+async function pickOrphans(cwd: string): Promise<void> {
+  const found = await scanOrphans(cwd);
+  if (!found.groups.length) {
+    void vscode.window.showInformationMessage(found.error ? `Não consegui listar os processos: ${found.error}` : 'Nenhum processo órfão do projeto.');
+    return;
+  }
+  const items = found.groups.map((g) => ({
+    label: `${g.parentAlive ? '$(warning) ' : ''}${g.root.pid} ${g.root.name}`,
+    description: [
+      g.ports.length ? `porta ${g.ports.join(', ')}` : '',
+      `${g.members.length} ${g.members.length === 1 ? 'processo' : 'processos'}`,
+      g.root.startedAt ? `desde ${new Date(g.root.startedAt).toLocaleString()}` : '',
+      g.parentAlive ? `pai ${g.parent?.name ?? '?'} ${g.parent?.pid ?? ''} ainda aberto` : 'pai encerrado',
+    ]
+      .filter(Boolean)
+      .join(' · '),
+    detail: shortCommand(g.root.commandLine),
+    group: g,
+  }));
+  const picked = await vscode.window.showQuickPick(items, { canPickMany: true, title: 'Processos órfãos do projeto: marque as árvores para encerrar' });
+  if (!picked?.length) {
+    return;
+  }
+  const ok = await vscode.window.showWarningMessage(
+    `Encerrar ${picked.length === 1 ? 'a árvore marcada' : `${picked.length} árvores marcadas`}?`,
+    { modal: true, detail: orphanDetail(picked.map((p) => p.group)) },
+    'Encerrar',
+  );
+  if (ok === 'Encerrar') {
+    // killSnapshot relê a lista e só mata o que ainda bate com a foto tirada antes do seletor.
+    const r = await killGroups(picked.map((p) => found.snaps.get(p.group.root.pid) ?? []));
+    void vscode.window.showInformationMessage(`Processos órfãos: ${killSummary(r)}.`);
+  }
 }

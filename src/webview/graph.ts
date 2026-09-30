@@ -10,7 +10,7 @@
  * O componente é autossuficiente: cria o próprio SVG por script, injeta o próprio <style>
  * com prefixo `agm-graph-` e não depende de nada do main.ts nem do chat.css.
  */
-import { agentColor, STATUS_LABEL, STATUS_RING, pendingText, watchLabel, repeatLabel, onOtherAccount, shortAccountName, type AgentInfo, type BoxInfo } from '../chat/protocol';
+import { agentColor, isWorking, STATUS_LABEL, STATUS_RING, pendingText, watchLabel, repeatLabel, onOtherAccount, shortAccountName, type AgentInfo, type BoxInfo } from '../chat/protocol';
 import { autoCollapsed, boxCountText, boxSpend, boxStats, spendDetail, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
 import { markGraphNode } from './worktreeUi';
 import { markAttemptNode } from './parallelUi';
@@ -621,7 +621,7 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
   }
 
   const nodes: NodeModel[] = [];
-  const running = agents.filter((a) => a.status === 'running').length;
+  const running = agents.filter(isWorking).length;
   const waiting = agents.filter((a) => a.status === 'waiting').length;
   const waitingText = waiting ? ` · ${waiting} aguardando` : '';
   nodes.push({

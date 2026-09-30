@@ -80,6 +80,12 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "agentGraphMaster.orphanProcesses",
+        "title": "Processos órfãos do projeto",
+        "category": "Agent Graph Master",
+        "icon": "$(debug-disconnect)"
+      },
+      {
         "command": "agentGraphMaster.setGeminiKey",
         "title": "Configurar chave do Gemini",
         "category": "Agent Graph Master",

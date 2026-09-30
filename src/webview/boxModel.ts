@@ -11,7 +11,7 @@
  */
 import { codexNote, spendLines, sumSpent } from '../chat/costs';
 import { budgetFraction, hasBudget } from '../chat/guard/format';
-import { agentColor, type AgentInfo, type BoxInfo } from '../chat/protocol';
+import { agentColor, isWorking, type AgentInfo, type BoxInfo } from '../chat/protocol';
 
 export const LOOSE_BOX = '__avulsos';
 /** A partir de quantos avulsos eles se juntam na caixa "Avulsos". */
@@ -183,7 +183,7 @@ export interface BoxStats {
 export function boxStats(all: AgentInfo[]): BoxStats {
   return {
     n: all.length,
-    running: all.filter((a) => a.status === 'running').length,
+    running: all.filter(isWorking).length,
     waiting: all.filter((a) => a.status === 'waiting').length,
     done: all.filter((a) => a.status === 'completed').length,
     halted: all.filter((a) => a.status === 'failed' || a.status === 'stopped').length,

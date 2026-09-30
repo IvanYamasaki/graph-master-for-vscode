@@ -199,6 +199,7 @@ const STATUS: Record<AgentInfo['status'], string> = {
   completed: 'concluído',
   failed: 'falhou',
   stopped: 'parado',
+  lost: 'encerrada com a sessão anterior',
 };
 
 function statusText(a: CompanionAgent, now: number): string {
