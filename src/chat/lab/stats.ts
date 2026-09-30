@@ -217,6 +217,72 @@ export function pairedT(diffs: readonly number[]): TestResult {
   return { t, df, p: tTwoSided(t, df) };
 }
 
+/** Quantil da t de Student: o t com P(T <= t) = q, por bisseção sobre tTwoSided. */
+export function tInv(q: number, df: number): number {
+  if (q === 0.5) {
+    return 0;
+  }
+  const upper = q > 0.5;
+  const tail = 2 * (upper ? 1 - q : q);
+  let lo = 0;
+  let hi = 1;
+  while (tTwoSided(hi, df) > tail && hi < 1e6) {
+    hi *= 2;
+  }
+  for (let i = 0; i < 100; i++) {
+    const mid = (lo + hi) / 2;
+    if (tTwoSided(mid, df) > tail) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  const t = (lo + hi) / 2;
+  return upper ? t : -t;
+}
+
+const SIGN_FLIP_EXACT_MAX = 20;
+const SIGN_FLIP_DRAWS = 20000;
+
+/**
+ * Teste de troca de sinais (permutação pareada), bilateral, para média das diferenças = 0. Exato até 20 diferenças
+ * (2^n sinais), Monte Carlo com semente acima. Não supõe normalidade e com n pequeno não passa de 2/2^n: com 5
+ * diferenças do mesmo sinal o p é 0,0625, e só com 6 ou mais dá para ficar abaixo de 0,05.
+ */
+export function signFlipP(diffs: readonly number[], opts: { seed?: number } = {}): number {
+  const n = diffs.length;
+  const total = diffs.reduce((s, x) => s + x, 0);
+  if (!n || total === 0) {
+    return 1;
+  }
+  const target = Math.abs(total) * (1 - 1e-12);
+  let extreme = 0;
+  if (n <= SIGN_FLIP_EXACT_MAX) {
+    // Soma de cada subconjunto de sinais trocados, pelo bit mais baixo: a soma do padrão é total - 2 * subconjunto.
+    const size = 1 << n;
+    const sub = new Float64Array(size);
+    for (let mask = 1; mask < size; mask++) {
+      const low = mask & -mask;
+      sub[mask] = sub[mask ^ low] + diffs[31 - Math.clz32(low)];
+      if (Math.abs(total - 2 * sub[mask]) >= target) {
+        extreme++;
+      }
+    }
+    return (extreme + 1) / size;
+  }
+  const rand = rng(opts.seed ?? 0x5eed);
+  for (let b = 0; b < SIGN_FLIP_DRAWS; b++) {
+    let s = 0;
+    for (const d of diffs) {
+      s += rand() < 0.5 ? -d : d;
+    }
+    if (Math.abs(s) >= target) {
+      extreme++;
+    }
+  }
+  return (extreme + 1) / (SIGN_FLIP_DRAWS + 1);
+}
+
 /** d de Cohen com desvio combinado. Sem variância, 0 (ou infinito com sinal se as médias diferem). */
 export function cohenD(a: readonly number[], b: readonly number[]): number {
   const na = a.length;
@@ -363,5 +429,221 @@ export function compareArms(base: ArmData, variant: ArmData, direction: Directio
     p: test.p,
     units: Math.min(na, nb),
     spread: pooled,
+  };
+}
+
+// ---------- Modelo congelado: bootstrap pareado por unidade ----------
+
+/**
+ * Como a métrica sai das linhas: `auc` usa rótulo 0/1 e score; `mean` é a média do score (o score já é a métrica
+ * da linha, como acerto ou perda); `accuracy` compara score >= 0.5 com o rótulo; `brier` e `logloss` usam o score
+ * como probabilidade da classe 1.
+ */
+export type RowMetric = 'auc' | 'mean' | 'accuracy' | 'brier' | 'logloss';
+export const ROW_METRICS: readonly RowMetric[] = ['auc', 'mean', 'accuracy', 'brier', 'logloss'];
+
+/** Direção natural de cada métrica por linha; `mean` depende do que o score mede. */
+export const ROW_METRIC_DIRECTION: Record<RowMetric, Direction | undefined> = { auc: 'higher', accuracy: 'higher', brier: 'lower', logloss: 'lower', mean: undefined };
+
+/** Valor da linha nas métricas que são média; `auc` não é média de linhas e fica de fora. */
+export function rowValue(metric: Exclude<RowMetric, 'auc'>, score: number, label: number): number {
+  switch (metric) {
+    case 'accuracy':
+      return (score >= 0.5 ? 1 : 0) === label ? 1 : 0;
+    case 'brier':
+      return (score - label) ** 2;
+    case 'logloss': {
+      const p = Math.min(1 - 1e-15, Math.max(1e-15, score));
+      return -(label * Math.log(p) + (1 - label) * Math.log(1 - p));
+    }
+    default:
+      return score;
+  }
+}
+
+/**
+ * AUC com peso por linha, a partir da ordem já calculada (índices em ordem crescente de score, com os limites
+ * dos grupos de empate). Empate conta meio par. O(n): o bootstrap só troca os pesos, nunca reordena.
+ */
+function weightedAuc(sorted: SortedScores, labels: readonly number[], w: ArrayLike<number>): number {
+  let negBelow = 0;
+  let pos = 0;
+  let neg = 0;
+  let acc = 0;
+  for (let g = 0; g < sorted.groups.length - 1; g++) {
+    let gp = 0;
+    let gn = 0;
+    for (let k = sorted.groups[g]; k < sorted.groups[g + 1]; k++) {
+      const i = sorted.order[k];
+      if (labels[i] === 1) {
+        gp += w[i];
+      } else {
+        gn += w[i];
+      }
+    }
+    acc += gp * (negBelow + gn / 2);
+    negBelow += gn;
+    pos += gp;
+    neg += gn;
+  }
+  return pos > 0 && neg > 0 ? acc / (pos * neg) : NaN;
+}
+
+interface SortedScores {
+  order: Int32Array;
+  /** Início de cada grupo de score igual em `order`, mais o fim (n). */
+  groups: number[];
+}
+
+function sortScores(scores: readonly number[]): SortedScores {
+  const order = Int32Array.from(scores.keys()).sort((a, b) => scores[a] - scores[b]);
+  const groups = [0];
+  for (let k = 1; k < order.length; k++) {
+    if (scores[order[k]] !== scores[order[k - 1]]) {
+      groups.push(k);
+    }
+  }
+  groups.push(order.length);
+  return { order, groups };
+}
+
+/** AUC sem peso (todas as linhas valem 1). */
+export function auc(labels: readonly number[], scores: readonly number[]): number {
+  return weightedAuc(sortScores(scores), labels, new Float64Array(labels.length).fill(1));
+}
+
+export interface PairedRows {
+  /** Unidade (cluster) de cada linha: paciente, cliente, dia. Linhas da mesma unidade saem juntas na reamostragem. */
+  unit: readonly string[];
+  /** Rótulo 0/1; obrigatório para auc, accuracy, brier e logloss. */
+  label?: readonly number[];
+  base: readonly number[];
+  variant: readonly number[];
+}
+
+export interface PairedBootstrap {
+  /** Variante menos baseline, com o sinal da direção. */
+  diff: number;
+  ci: [number, number];
+  /** p bilateral do bootstrap deslocado: fração das réplicas com |d* - d| >= |d|, com correção +1. */
+  p: number;
+  baseValue: number;
+  variantValue: number;
+  /** Erro padrão da diferença entre as réplicas (sem sinal). */
+  se: number;
+  /** d_z por unidade (média das diferenças por unidade sobre o desvio delas); NaN na AUC, que não é média de linhas. */
+  effect: number;
+  units: number;
+  rows: number;
+  iters: number;
+  /** Réplicas descartadas porque a AUC não existia nelas (sem positivo ou sem negativo). */
+  skipped: number;
+}
+
+/** Réplicas: 10000 em conjunto pequeno, menos quando as linhas são muitas (custo O(linhas) por réplica), nunca abaixo de 1000. */
+export function pairedIters(rows: number): number {
+  return Math.max(1000, Math.min(10000, Math.floor(2e7 / Math.max(1, rows))));
+}
+
+/**
+ * Compara dois modelos congelados avaliados nas mesmas linhas. Reamostra unidades inteiras com reposição (bootstrap
+ * por cluster) e recalcula a métrica dos dois braços com os mesmos pesos em cada réplica, então a diferença é pareada.
+ * Determinístico pela semente.
+ */
+export function pairedBootstrap(rows: PairedRows, metric: RowMetric, direction: Direction, opts: { seed: number; alpha?: number; iters?: number }): PairedBootstrap {
+  const n = rows.base.length;
+  const sign = direction === 'higher' ? 1 : -1;
+  const alpha = opts.alpha ?? 0.05;
+  const iters = opts.iters ?? pairedIters(n);
+  const unitIndex = new Map<string, number>();
+  const unitOf = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    let u = unitIndex.get(rows.unit[i]);
+    if (u === undefined) {
+      u = unitIndex.size;
+      unitIndex.set(rows.unit[i], u);
+    }
+    unitOf[i] = u;
+  }
+  const K = unitIndex.size;
+  const labels = rows.label ?? [];
+
+  let stat: (w: ArrayLike<number>) => [number, number];
+  if (metric === 'auc') {
+    const sb = sortScores(rows.base);
+    const sv = sortScores(rows.variant);
+    stat = (w) => [weightedAuc(sb, labels, w), weightedAuc(sv, labels, w)];
+  } else {
+    const vb = rows.base.map((s, i) => rowValue(metric, s, labels[i]));
+    const vv = rows.variant.map((s, i) => rowValue(metric, s, labels[i]));
+    stat = (w) => {
+      let sw = 0;
+      let b = 0;
+      let v = 0;
+      for (let i = 0; i < n; i++) {
+        sw += w[i];
+        b += w[i] * vb[i];
+        v += w[i] * vv[i];
+      }
+      return sw > 0 ? [b / sw, v / sw] : [NaN, NaN];
+    };
+  }
+
+  const ones = new Float64Array(n).fill(1);
+  const [baseValue, variantValue] = stat(ones);
+  const raw = variantValue - baseValue;
+
+  const rand = rng(opts.seed);
+  const counts = new Float64Array(K);
+  const w = new Float64Array(n);
+  const reps: number[] = [];
+  let skipped = 0;
+  for (let b = 0; b < iters; b++) {
+    counts.fill(0);
+    for (let k = 0; k < K; k++) {
+      counts[Math.floor(rand() * K)]++;
+    }
+    for (let i = 0; i < n; i++) {
+      w[i] = counts[unitOf[i]];
+    }
+    const [x, y] = stat(w);
+    if (Number.isFinite(x) && Number.isFinite(y)) {
+      reps.push(y - x);
+    } else {
+      skipped++;
+    }
+  }
+  reps.sort((x, y) => x - y);
+  const lo = quantile(reps, alpha / 2);
+  const hi = quantile(reps, 1 - alpha / 2);
+  const extreme = reps.filter((d) => Math.abs(d - raw) >= Math.abs(raw) - 1e-15).length;
+
+  let effect = NaN;
+  if (metric !== 'auc') {
+    // d_z por unidade: diferença média de cada unidade, e a média e o desvio delas.
+    const sum = new Float64Array(K);
+    const cnt = new Float64Array(K);
+    for (let i = 0; i < n; i++) {
+      sum[unitOf[i]] += rowValue(metric, rows.variant[i], labels[i]) - rowValue(metric, rows.base[i], labels[i]);
+      cnt[unitOf[i]]++;
+    }
+    const perUnit = Array.from(sum, (s, k) => s / cnt[k]);
+    const m = mean(perUnit);
+    const s = sd(perUnit);
+    effect = s === 0 ? (m === 0 ? 0 : sign * Math.sign(m) * Infinity) : (sign * m) / s;
+  }
+
+  return {
+    diff: sign * raw,
+    ci: sign > 0 ? [lo, hi] : [-hi, -lo],
+    p: raw === 0 || !reps.length ? 1 : Math.min(1, (1 + extreme) / (reps.length + 1)),
+    baseValue,
+    variantValue,
+    se: sd(reps),
+    effect,
+    units: K,
+    rows: n,
+    iters,
+    skipped,
   };
 }

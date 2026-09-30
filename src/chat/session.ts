@@ -16,9 +16,10 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { Profile, configDirEnv } from '../profiles';
 import { resolveClaudeExecutable } from '../claudePath';
 import { researchEnv } from './infra/researchPack';
-import { projectMcpSettings } from './guard/mcpApproval';
+import { decisionFor, projectMcpSettings, readProjectMcp } from './guard/mcpApproval';
+import { limitFromText } from './turnRules';
 import { BROWSER_SERVER, BROWSER_TOOL_PREFIX, BrowserStatus, browserActionWrites, browserUnreachable, describeBrowserAction, isBrowserTool } from './browser';
-import { Attachment, AgentInfo, AgentStatus, HistoryItem, HostMessage, PermissionDecision, SlashCommandOption, UsageInfo, UsageWindow } from './protocol';
+import { Attachment, AgentInfo, AgentStatus, HistoryItem, HostMessage, ModelOption, PermissionDecision, SlashCommandOption, UsageInfo, UsageWindow } from './protocol';
 
 const AGENT_TOOLS = new Set(['Agent', 'Task']);
 type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -62,6 +63,45 @@ export interface SessionOptions {
   browserApproval?: () => boolean;
   /** Hooks extras do SDK (caminhos protegidos dos agentes), somados ao do navegador a cada início de processo. */
   hooks?: () => Partial<Record<HookEvent, HookCallbackMatcher[]>> | undefined;
+  /** Variáveis somadas ao ambiente do processo, calculadas a cada início (limite de threads quando há agentes em paralelo). */
+  env?: () => Record<string, string>;
+  /**
+   * Só os servidores MCP passados aqui e os do `.mcp.json` do projeto já aprovados; nada dos servidores de
+   * usuário nem dos conectores do claude.ai. Um agente roteado com tudo carregado gasta milhares de tokens em
+   * schema e sobe dezenas de processos.
+   */
+  strictMcp?: boolean;
+}
+
+/** Tarefa em segundo plano da sessão começou ou terminou; `open` é quantas continuam abertas. */
+export interface BackgroundTaskEvent {
+  kind: 'started' | 'ended';
+  taskId: string;
+  description: string;
+  /** Só no fim: como terminou e onde está a saída. */
+  status?: 'completed' | 'failed' | 'stopped';
+  summary?: string;
+  outputFile?: string;
+  open: number;
+}
+
+/** O que o fim do turno conta ao dono da sessão. */
+export interface TurnEndInfo {
+  contextTokens: number;
+  isError: boolean;
+  queued: number;
+  durationMs: number;
+  /** O turno morreu por limite de uso do fornecedor (429 ou janela da assinatura). `until` em ISO quando o CLI informou. */
+  limit?: { until?: string; text: string };
+  /** O CLI abriu este turno sozinho (aviso de tarefa em segundo plano que terminou), sem mensagem nossa. */
+  auto?: boolean;
+}
+
+/** Última lista de modelos que um processo do Claude Code informou (supportedModels). Vale para qualquer sessão da janela. */
+let lastKnownModels: ModelOption[] = [];
+
+export function knownClaudeModels(): ModelOption[] {
+  return lastKnownModels;
 }
 
 /** Ferramentas da própria extensão; não pedem permissão. */
@@ -147,8 +187,16 @@ export class ChatSession {
   readonly agents = new Map<string, AgentRecord>();
   /** Texto que o Claude escreveu no último turno terminado; é o que "Enviar ao chat principal" repassa. */
   lastTurnText = '';
-  onTurnEnd?: (info: { contextTokens: number; isError: boolean; queued: number; durationMs: number }) => void;
+  onTurnEnd?: (info: TurnEndInfo) => void;
   onBusyChange?: (busy: boolean) => void;
+  /**
+   * Tarefas em segundo plano abertas neste processo (Bash run_in_background, subagente em background), por task_id.
+   * Zera a cada processo novo: o CLI não reenvia o conjunto ao subir.
+   */
+  readonly backgroundTasks = new Map<string, { description: string; type?: string }>();
+  onBackgroundTask?: (ev: BackgroundTaskEvent) => void;
+  /** Modelos que este processo aceita (supportedModels), para o seletor e para o list_models dos agentes. */
+  models: ModelOption[] = [];
   /** Consumo para o orçamento: tokens de cada mensagem do modelo (repetida por bloco, daí o id) e custo acumulado no fim do turno. */
   onUsage?: (u: { messageId?: string; tokens?: number; costUsdTotal?: number }) => void;
   /** Navegador desta sessão; muda ao subir o processo e quando uma chamada mostra que o Chrome sumiu. */
@@ -169,6 +217,14 @@ export class ChatSession {
   private shownLocalOutputs = new Set<string>();
   /** Chamadas de navegador em andamento, para reconhecer no resultado que o Chrome não respondeu. */
   private browserCalls = new Set<string>();
+  /** Limite de uso visto neste turno (rate_limit_event rejeitado ou erro da API); vai no fim do turno. */
+  private limitHit?: { until?: string; text: string };
+  /** O turno em andamento foi aberto pelo CLI sozinho (aviso de tarefa em segundo plano), não por send(). */
+  private autoTurn = false;
+  /** Já veio um init neste processo. O primeiro acompanha a primeira mensagem; os seguintes abrem turno. */
+  private initSeen = false;
+  /** Último bloco de texto não vazio do turno, mesmo antes de uma ferramenta: vale quando o relatório foi seguido de brain_fact ou report_progress. */
+  private turnLastText = '';
 
   constructor(
     readonly profile: Profile,
@@ -209,6 +265,9 @@ export class ChatSession {
     this.stop();
     this.restartWhenIdle = false;
     this.toolsRunning.clear();
+    // Processo novo: o CLI não reenvia o conjunto de tarefas em segundo plano, e as antigas morreram com ele.
+    this.backgroundTasks.clear();
+    this.initSeen = false;
     this.sessionId = resumeId;
     // A fila nasce já aqui: achar o executável virou assíncrono, e o que o usuário digitar nesse meio-tempo
     // fica guardado até o processo subir.
@@ -237,7 +296,7 @@ export class ChatSession {
       options: {
         pathToClaudeCodeExecutable: executable,
         cwd: this.cwd,
-        env: profileEnv(this.profile),
+        env: { ...profileEnv(this.profile), ...(this.options.env?.() ?? {}) },
         resume: resumeId,
         model: this.model || undefined,
         effort: (this.effort || undefined) as Effort | undefined,
@@ -247,7 +306,8 @@ export class ChatSession {
         forwardSubagentText: true,
         agentProgressSummaries: true,
         systemPrompt: { type: 'preset', preset: 'claude_code', append: this.options.systemAppend?.() },
-        mcpServers: this.options.mcpServers?.(),
+        mcpServers: this.options.strictMcp ? { ...approvedProjectMcp(this.cwd), ...this.options.mcpServers?.() } : this.options.mcpServers?.(),
+        strictMcpConfig: this.options.strictMcp || undefined,
         tools: { type: 'preset', preset: 'claude_code' },
         disallowedTools: this.options.disallowedTools,
         settingSources: ['user', 'project', 'local'],
@@ -266,17 +326,18 @@ export class ChatSession {
     void this.consume(q);
     void this.readBrowserStatus(q);
     q.supportedModels()
-      .then((list) =>
-        this.post({
-          type: 'models',
-          list: list.map((m) => ({
-            value: m.value,
-            resolvedModel: m.resolvedModel,
-            displayName: m.displayName,
-            description: m.description,
-          })),
-        }),
-      )
+      .then((list) => {
+        this.models = list.map((m) => ({
+          value: m.value,
+          resolvedModel: m.resolvedModel,
+          displayName: m.displayName,
+          description: m.description,
+        }));
+        if (this.models.length) {
+          lastKnownModels = this.models;
+        }
+        this.post({ type: 'models', list: this.models });
+      })
       .catch(() => undefined);
     q.supportedCommands()
       .then((list) => {
@@ -305,8 +366,14 @@ export class ChatSession {
       // O processo morreu (erro, rede, etc.). Sobe de novo continuando a mesma conversa.
       this.start(this.sessionId);
     }
+    // Mensagem que chega com o turno em andamento vira turno enfileirado no CLI: o estado do atual fica como está.
+    if (!this.busy) {
+      this.turnTexts = [];
+      this.turnLastText = '';
+      this.autoTurn = false;
+      this.limitHit = undefined;
+    }
     this.setBusy(true);
-    this.turnTexts = [];
     this.prompts?.push(buildUserContent(text, attachments));
   }
 
@@ -480,6 +547,9 @@ export class ChatSession {
     this.q?.close();
     this.q = undefined;
     this.prompts = undefined;
+    // Reinício com turno aberto (raro) ou com tarefas no fundo: nada fica pendurado esperando um result que não vem.
+    this.dropBackgroundTasks('stopped');
+    this.endDeadTurn();
     this.setBusy(false);
   }
 
@@ -690,10 +760,61 @@ export class ChatSession {
       if (q === this.q) {
         this.q = undefined;
         this.prompts = undefined;
+        // O processo morreu: as tarefas em segundo plano morreram com ele, e o turno em andamento acabou em erro.
+        // Sem isto o agente ficava "rodando" e quem esperava por ele, aguardando para sempre.
+        this.dropBackgroundTasks('failed');
+        this.endDeadTurn();
         this.setBusy(false);
         this.post({ type: 'thinking', value: false });
       }
     }
+  }
+
+  /** Turno que estava em andamento quando o processo caiu ou foi trocado: conta como terminado em erro. */
+  private endDeadTurn(): void {
+    if (!this.busy || this.disposed) {
+      return;
+    }
+    this.lastTurnText = this.turnTexts.join('\n\n') || this.turnLastText;
+    this.turnTexts = [];
+    this.turnLastText = '';
+    this.autoTurn = false;
+    this.limitHit = undefined;
+    this.onTurnEnd?.({ contextTokens: this.contextTokens, isError: true, queued: 0, durationMs: 0 });
+  }
+
+  /** Encerra o registro de todas as tarefas em segundo plano (processo morto ou trocado), avisando o dono da sessão. */
+  private dropBackgroundTasks(status: 'failed' | 'stopped'): void {
+    for (const id of [...this.backgroundTasks.keys()]) {
+      this.untrackBackground(id, { status, summary: status === 'failed' ? 'o processo do Claude caiu' : 'sessão reiniciada' });
+    }
+  }
+
+  /** Pede ao CLI para matar as tarefas em segundo plano desta sessão (Parar num agente que aguarda processo). */
+  async stopBackgroundTasks(): Promise<void> {
+    for (const id of [...this.backgroundTasks.keys()]) {
+      try {
+        await this.q?.stopTask(id);
+      } catch {
+        // Tarefa já encerrada ou CLI antigo: o registro sai do mesmo jeito.
+      }
+      this.untrackBackground(id, { status: 'stopped', summary: 'parada pelo usuário' });
+    }
+  }
+
+  /**
+   * O CLI abre um turno sozinho quando uma tarefa em segundo plano termina (o modelo recebe o aviso e responde).
+   * Sem send() ninguém marcou a sessão como ocupada: marca aqui, senão o fim desse turno passa despercebido.
+   */
+  private noteAutoTurn(): void {
+    if (this.busy || !this.q) {
+      return;
+    }
+    this.autoTurn = true;
+    this.limitHit = undefined;
+    this.turnTexts = [];
+    this.turnLastText = '';
+    this.setBusy(true);
   }
 
   private handle(m: SDKMessage, stream: { msgId: string; blockTypes: Map<number, string> }): void {
@@ -702,12 +823,22 @@ export class ChatSession {
         this.handleSystem(m);
         return;
 
+      case 'rate_limit_event':
+        // Limite da assinatura: o CLI avisa antes de o turno morrer. Guardado para o fim do turno explicar a falha.
+        if (m.rate_limit_info?.status === 'rejected') {
+          const at = m.rate_limit_info.resetsAt;
+          const until = typeof at === 'number' ? new Date(at < 1e12 ? at * 1000 : at).toISOString() : undefined;
+          this.limitHit = { until, text: `limite de uso da assinatura${m.rate_limit_info.rateLimitType ? ` (${m.rate_limit_info.rateLimitType})` : ''}` };
+        }
+        return;
+
       case 'stream_event': {
         if (m.parent_tool_use_id) {
           return;
         }
         const ev = m.event;
         if (ev.type === 'message_start') {
+          this.noteAutoTurn();
           stream.msgId = ev.message.id;
           stream.blockTypes.clear();
         } else if (ev.type === 'content_block_start') {
@@ -767,11 +898,17 @@ export class ChatSession {
           }
           return;
         }
+        this.noteAutoTurn();
         for (const block of content) {
           if (block.type === 'text') {
             this.turnTexts.push(block.text);
+            if (block.text.trim()) {
+              this.turnLastText = block.text;
+            }
             this.post({ type: 'assistantText', msgId: m.message.id, text: block.text });
           } else if (block.type === 'tool_use') {
+            // Texto antes de uma ferramenta é narração ("Vou ler o arquivo"): o relatório é só o que vem depois da última.
+            this.turnTexts = [];
             this.post({ type: 'toolUse', id: block.id, name: block.name, input: block.input });
             this.toolsRunning.add(block.id);
             this.onToolStart?.();
@@ -784,6 +921,9 @@ export class ChatSession {
           this.post({ type: 'contextTokens', value: context });
         }
         if (m.error) {
+          if (m.error === 'rate_limit') {
+            this.limitHit ??= { text: 'a API respondeu 429 (limite de requisições ou de uso)' };
+          }
           this.post({ type: 'notice', level: 'error', text: `Erro da API: ${m.error}` });
         }
         return;
@@ -835,13 +975,26 @@ export class ChatSession {
           inputTokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0),
           outputTokens: usage.output_tokens ?? 0,
         });
-        this.lastTurnText = this.turnTexts.join('\n\n');
+        // Relatório seguido de uma ferramenta (brain_fact, report_progress) não pode virar texto vazio: vale o último bloco.
+        this.lastTurnText = this.turnTexts.join('\n\n') || this.turnLastText;
+        // Zera aqui também: mensagem que chegou no meio do turno abre o próximo sem passar pelo send().
+        this.turnTexts = [];
+        this.turnLastText = '';
+        // Limite só por sinal da API (rate_limit_event, erro rate_limit) ou pelo texto de erro do próprio result;
+        // nunca pelo que o modelo escreveu, senão quem depura um 429 vira "limite de uso".
+        const errorText = m.subtype === 'success' ? '' : (m.errors ?? []).join(' ');
+        const limit = m.is_error ? (this.limitHit ?? limitFromText(errorText)) : undefined;
+        const auto = this.autoTurn;
+        this.autoTurn = false;
+        this.limitHit = undefined;
         this.onUsage?.({ costUsdTotal: m.total_cost_usd });
         this.onTurnEnd?.({
           contextTokens: this.contextTokens,
           isError: m.is_error,
           queued: m.queued_turn_count ?? 0,
           durationMs: m.duration_ms,
+          limit,
+          auto,
         });
         if (!m.queued_turn_count) {
           this.setBusy(false);
@@ -857,6 +1010,12 @@ export class ChatSession {
   private handleSystem(m: Extract<SDKMessage, { type: 'system' }>): void {
     switch (m.subtype) {
       case 'init':
+        // O init vem no começo de cada turno, inclusive nos que o CLI abre sozinho. O primeiro do processo não conta:
+        // um CLI que o emita ao subir deixaria a sessão "ocupada" sem turno nenhum.
+        if (this.initSeen) {
+          this.noteAutoTurn();
+        }
+        this.initSeen = true;
         this.sessionId = m.session_id;
         this.permissionMode = m.permissionMode;
         this.post({ type: 'session', sessionId: m.session_id, model: m.model, permissionMode: m.permissionMode, mcpServers: m.mcp_servers?.map((s) => ({ name: s.name, status: s.status })) });
@@ -882,6 +1041,9 @@ export class ChatSession {
         this.post({ type: 'notice', level: 'info', text: 'A API falhou, tentando de novo...' });
         return;
       case 'task_started':
+        if (m.is_backgrounded && !m.ambient && !m.skip_transcript) {
+          this.trackBackground(m.task_id, m.description, m.task_type);
+        }
         if (m.tool_use_id) {
           this.updateAgent(m.tool_use_id, {
             taskId: m.task_id,
@@ -892,6 +1054,21 @@ export class ChatSession {
           });
         }
         return;
+      case 'background_tasks_changed': {
+        // Sinal de nível: substitui o conjunto. Cobre bookend perdido (task_started sem task_notification).
+        const live = new Set(m.tasks.filter((t) => !t.ambient).map((t) => t.task_id));
+        for (const id of [...this.backgroundTasks.keys()]) {
+          if (!live.has(id)) {
+            this.untrackBackground(id, { status: 'completed' });
+          }
+        }
+        for (const t of m.tasks) {
+          if (!t.ambient) {
+            this.trackBackground(t.task_id, t.description, t.task_type);
+          }
+        }
+        return;
+      }
       case 'task_progress':
         if (m.tool_use_id) {
           this.updateAgent(m.tool_use_id, {
@@ -905,6 +1082,13 @@ export class ChatSession {
         }
         return;
       case 'task_updated': {
+        // Tarefa que estava em primeiro plano e foi para o fundo (Ctrl+B do CLI) passa a contar.
+        if (m.patch.is_backgrounded) {
+          this.trackBackground(m.task_id, m.patch.description ?? this.backgroundTasks.get(m.task_id)?.description ?? 'tarefa em segundo plano');
+        }
+        if (m.patch.status === 'completed' || m.patch.status === 'failed' || m.patch.status === 'killed') {
+          this.untrackBackground(m.task_id, { status: m.patch.status === 'killed' ? 'stopped' : m.patch.status, summary: m.patch.error });
+        }
         const id = this.agentIdByTask(m.task_id);
         if (id && m.patch.status) {
           this.updateAgent(id, { status: mapTaskStatus(m.patch.status), summary: m.patch.error });
@@ -912,6 +1096,7 @@ export class ChatSession {
         return;
       }
       case 'task_notification': {
+        this.untrackBackground(m.task_id, { status: m.status, summary: m.summary, outputFile: m.output_file });
         const id = m.tool_use_id ?? this.agentIdByTask(m.task_id);
         if (id) {
           this.updateAgent(id, {
@@ -924,6 +1109,34 @@ export class ChatSession {
       }
     }
   }
+
+  private trackBackground(taskId: string, description: string, type?: string): void {
+    if (this.backgroundTasks.has(taskId)) {
+      return;
+    }
+    this.backgroundTasks.set(taskId, { description, type });
+    this.onBackgroundTask?.({ kind: 'started', taskId, description, open: this.backgroundTasks.size });
+  }
+
+  private untrackBackground(taskId: string, end: { status: 'completed' | 'failed' | 'stopped'; summary?: string; outputFile?: string }): void {
+    const task = this.backgroundTasks.get(taskId);
+    if (!task) {
+      return;
+    }
+    this.backgroundTasks.delete(taskId);
+    this.onBackgroundTask?.({ kind: 'ended', taskId, description: task.description, ...end, open: this.backgroundTasks.size });
+  }
+}
+
+/** Servidores do `.mcp.json` do projeto que o usuário aprovou, no formato do SDK, para uma sessão com strictMcp. */
+function approvedProjectMcp(cwd: string): Record<string, McpServerConfig> {
+  const out: Record<string, McpServerConfig> = {};
+  for (const s of readProjectMcp(cwd).servers) {
+    if (decisionFor(s) === 'allow' && s.entry && typeof s.entry === 'object') {
+      out[s.name] = s.entry as McpServerConfig;
+    }
+  }
+  return out;
 }
 
 /** Lê o modo de permissão inicial da configuração; valor estranho cai no padrão da extensão. */

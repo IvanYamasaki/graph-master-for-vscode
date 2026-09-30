@@ -13,6 +13,8 @@ import { AGENT_COLOR_NAMES, EFFORT_LEVELS } from '../protocol';
 import { Attempts, MAX_ATTEMPTS, RESULT_FILE } from './attempts';
 import { MAX_SEEDS, runSeeds } from './seeds';
 import { VERIFIER_BLOCKED_TOOLS, Verifier } from './verify';
+import { protectedPatternsFor } from '../guard/agentGuard';
+import { commandBlocked } from '../guard/protect';
 import type { ParallelHost } from './host';
 
 export type { ParallelHost, SpawnRequest } from './host';
@@ -29,6 +31,8 @@ export const PARALLEL_GUIDE: readonly string[] = [
   '- Use Best-of-N quando a tarefa tem variância alta entre execuções (o agente pode acertar ou errar o caminho: ajuste de hiperparâmetro à mão, engenharia de atributos, depuração de desempenho, uma solução de competição) e existe uma métrica numérica clara que um script mede. No MLE-bench, 8 tentativas por tarefa subiram as medalhas de 16,9% para 34,1%. Não use para tarefa determinística, sem métrica ou quando o custo de n agentes não compensa; comece com n de 3 a 5, model "haiku" ou "sonnet". O budget do grupo é dividido entre as tentativas (tokens e custo); max_minutes vale para cada uma.',
   '- A vencedora de um Best-of-N é um ponto, não uma conclusão. Para afirmar que uma configuração é melhor, use o laboratório com seeds.',
   `- run_seeds({ hypothesis_id, arm, command_template, seeds, metrics_file_template }) roda o MESMO comando com várias seeds, sem LLM, com paralelismo limitado (agentGraphMaster.seedParallelism), e registra cada execução como run do braço, lendo o número do arquivo. O template leva {seed} (e pode levar {arm}). Sem metrics_file_template, o host lê a última linha JSON da saída. Até ${MAX_SEEDS} seeds por chamada; o usuário aprova cada modelo de comando na primeira vez da conversa. Prefira run_seeds a um agente que roda seeds em laço: é mais barato e determinístico.`,
+  '- Subagentes também têm run_seeds (com a mesma aprovação do usuário, e o comando não pode citar caminho protegido deles) e start_sweep. Limite: o hub confere só o texto do comando, não os arquivos que o script abre; por isso subagente com caminho protegido pede aprovação a cada chamada e não vê a saída dos processos (docs/lockbox.md). O resultado volta a quem chamou. Todas as execuções que o hub lança, de qualquer agente, dividem as vagas de agentGraphMaster.maxHeavyProcesses; cinco agentes rodando Optuna ou treino por conta própria na mesma máquina disputam a CPU e travam.',
+  '- Onda 0 antes de paralelizar um experimento: UM agente (ou você) monta a bancada e o ambiente únicos (script de treino que aceita --seed e grava um JSON de métricas, dados já baixados, o Python com as dependências; setup_optuna diz qual é o Python com optuna, em .agm/venv), testa com uma seed e devolve os caminhos. Só então crie os agentes da onda 1, com esses caminhos no prompt e a ordem de não criar venv, não instalar pacote e não reescrever a bancada. Cada agente de busca chama start_sweep ou run_seeds com o comando da bancada, em vez de montar a sua e pilotar o Optuna à mão.',
   '- Fluxo de um experimento comparativo: 1) register_hypothesis; 2) run_seeds para o baseline e para a variante (mesmas seeds nos dois braços, pelo menos min_seeds); 3) declare_result; 4) se der "suportada", o hub cria sozinho um verificador independente (agentGraphMaster.autoVerify), só leitura, que reexecuta cada braço com seed nova, procura vazamento e dá o parecer. O selo ("verificado", "divergente" ou "inconclusivo") sai no cartão da hipótese e o relatório do verificador chega a você. Só comunique o resultado como firme depois do selo "verificado"; "divergente" se conta ao usuário com o motivo.',
   '- request_verification({ hypothesis_id }) pede a verificação quando o usuário quiser, ou de um veredito que não foi "suportada".',
 ];
@@ -39,6 +43,8 @@ export class Parallel {
   /** Modelos de comando do run_seeds já aprovados nesta conversa (pasta + template). */
   private readonly approved = new Set<string>();
   private readonly requests = new Map<string, (ok: boolean) => void>();
+  /** run_seeds em andamento por agente: stopWorkOf e stopAllWork tiram da fila e matam os processos. */
+  private readonly controllers = new Map<string, Set<AbortController>>();
 
   constructor(private readonly host: ParallelHost) {
     this.attempts = new Attempts(host);
@@ -53,7 +59,7 @@ export class Parallel {
     };
   }
 
-  /** Ferramentas por quem chama: spawn_attempts para quem cria agentes, run_seeds e request_verification só no orquestrador, submit_verification só no verificador. */
+  /** Ferramentas por quem chama: spawn_attempts e run_seeds para quem não é vigia, request_verification só no orquestrador, submit_verification só no verificador. */
   tools(callerId: string, role: { isMain: boolean; canSpawn: boolean }): SdkMcpToolDefinition<any>[] {
     const info = this.host.info(callerId);
     const list: SdkMcpToolDefinition<any>[] = [];
@@ -67,9 +73,17 @@ export class Parallel {
             verdict: z.enum(['confirmado', 'divergente', 'inconclusivo']),
             notes: z.string().describe('O que você viu, curto: reexecuções, vazamento, números'),
             reruns: z
-              .array(z.object({ arm: z.string(), seed: z.number().int(), command: z.string(), metrics_file: z.string().describe('JSON gravado pela reexecução, relativo ao seu diretório') }))
+              .array(
+                z.object({
+                  arm: z.string(),
+                  seed: z.number().int().describe('Seed nova; no modo pareado, 0'),
+                  command: z.string(),
+                  metrics_file: z.string().optional().describe('JSON gravado pela reexecução, relativo ao seu diretório (modo por seeds)'),
+                  predictions_file: z.string().optional().describe('Predições regeradas do braço, relativo ao seu diretório (modo pareado)'),
+                }),
+              )
               .optional()
-              .describe('Reexecuções com seed nova, pelo menos uma por braço'),
+              .describe('Reexecuções, pelo menos uma por braço: com seed nova no modo por seeds; com predições regeradas no modo pareado'),
             leakage: z.enum(['nenhum', 'suspeito', 'encontrado']).optional().describe('Vazamento entre treino e teste'),
           },
           async (args) => out(this.verifier.submit(callerId, args)),
@@ -118,31 +132,54 @@ export class Parallel {
         ),
       );
     }
-    if (role.isMain) {
+    if (role.isMain || role.canSpawn) {
       list.push(
         tool(
           'run_seeds',
-          'Roda o mesmo comando com K seeds pelo próprio host (sem LLM, paralelismo limitado) e registra cada execução no laboratório como run do braço, com o número lido de arquivo. O usuário aprova o modelo de comando na primeira vez da conversa.',
+          'Roda o mesmo comando com K seeds pelo próprio host (sem LLM, paralelismo limitado, na fila de processos pesados compartilhada por todos os agentes) e registra cada execução no laboratório como run do braço, com o número lido de arquivo. O usuário aprova o modelo de comando na primeira vez da conversa. Use em vez de rodar seeds em laço por Bash; o resultado volta para você.',
           {
             hypothesis_id: z.string(),
             arm: z.string().describe('Um dos dois braços da hipótese'),
             command_template: z.string().describe('Comando com {seed} (e opcionalmente {arm}), ex.: "python train.py --lr 0.01 --seed {seed} --out results/{arm}_{seed}.json"'),
             seeds: z.array(z.number().int()).min(1).max(MAX_SEEDS).describe('Seeds a rodar, ex.: [1, 2, 3, 4, 5]. Use as mesmas nos dois braços'),
             metrics_file_template: z.string().optional().describe('JSON de métricas que cada execução grava, com {seed}, relativo a workdir (ex.: "results/{arm}_{seed}.json"). Omitido: a última linha JSON da saída'),
-            workdir: z.string().optional().describe('Pasta onde rodar, relativa ao projeto (um worktree, por exemplo). Omitido: o projeto'),
+            workdir: z.string().optional().describe('Pasta onde rodar, relativa ao seu diretório ou absoluta. Omitido: o seu diretório (o worktree, se você tiver um; senão o projeto)'),
             parallel: z.number().int().min(1).max(8).optional().describe('Execuções ao mesmo tempo. Omitido: agentGraphMaster.seedParallelism'),
             timeout_minutes: z.number().positive().optional().describe('Tempo máximo de cada execução. Omitido: agentGraphMaster.evaluationTimeoutMinutes'),
           },
-          async (args) =>
-            out(
-              await runSeeds(this.host, callerId, args, {
-                approved: (key) => this.approved.has(key),
-                remember: (key) => this.approved.add(key),
-                ask: (input, reason) => this.ask(input, reason),
-              }),
-            ),
+          async (args) => {
+            const blocked = this.blockedFor(callerId, `${args.command_template} ${args.metrics_file_template ?? ''}`);
+            if (blocked) {
+              return fail(blocked);
+            }
+            const controller = new AbortController();
+            const mine = this.controllers.get(callerId) ?? new Set<AbortController>();
+            mine.add(controller);
+            this.controllers.set(callerId, mine);
+            try {
+              return out(
+                await runSeeds(
+                  this.host,
+                  callerId,
+                  args,
+                  {
+                    approved: (key) => this.approved.has(key),
+                    remember: (key) => this.approved.add(key),
+                    ask: (input, reason) => this.ask(input, reason),
+                  },
+                  { protectedPatterns: callerId === 'main' ? [] : protectedPatternsFor(this.host.cwd, this.host.info(callerId)), signal: controller.signal },
+                ),
+              );
+            } finally {
+              mine.delete(controller);
+            }
+          },
           { alwaysLoad: true },
         ),
+      );
+    }
+    if (role.isMain) {
+      list.push(
         tool(
           'request_verification',
           'Cria o verificador independente do último veredito de uma hipótese: agente só leitura, num worktree próprio, que reexecuta cada braço com seed nova, procura vazamento e dá o parecer. O selo sai no cartão da hipótese.',
@@ -157,6 +194,30 @@ export class Parallel {
       );
     }
     return list;
+  }
+
+  /** Comando de subagente que cita caminho protegido dele: o hub, que roda fora dos hooks, recusa. */
+  private blockedFor(callerId: string, command: string): string | undefined {
+    const info = this.host.info(callerId);
+    if (!info) {
+      return undefined;
+    }
+    return commandBlocked(protectedPatternsFor(this.host.cwd, info), [info.worktree?.cwd ?? this.host.cwd, this.host.cwd], command);
+  }
+
+  /** Agente parado (stop, stopForGood): os run_seeds dele saem da fila do semáforo e os processos em andamento morrem. */
+  stopWorkOf(agentId: string): void {
+    for (const c of this.controllers.get(agentId) ?? []) {
+      c.abort();
+    }
+    this.controllers.delete(agentId);
+  }
+
+  /** Conversa trocada ou fechada: para todos os run_seeds. */
+  stopAllWork(): void {
+    for (const id of [...this.controllers.keys()]) {
+      this.stopWorkOf(id);
+    }
   }
 
   /** Ferramentas negadas no processo do agente (verificador); undefined para os demais. */
@@ -200,6 +261,7 @@ export class Parallel {
     }
     this.requests.clear();
     this.approved.clear();
+    this.stopAllWork();
     this.attempts.reset();
     this.verifier.reset();
   }

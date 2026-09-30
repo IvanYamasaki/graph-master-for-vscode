@@ -11,6 +11,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { LabHypothesisStatus, LabVerdictInfo } from '../protocol';
+import type { RowMetric } from './stats';
 
 export interface Hypothesis {
   id: string;
@@ -31,6 +32,30 @@ export interface Hypothesis {
   createdAt: string;
   /** Hipótese exploratória criada por uma varredura (src/chat/search): guarda os trials, não passa por declare_result. */
   sweepId?: string;
+  /**
+   * `seeds` (padrão, ausente nas hipóteses antigas): um valor por seed em cada braço. `paired_bootstrap`: um modelo
+   * congelado por braço, avaliado nas mesmas linhas; a incerteza vem de reamostrar unidades (lab/stats.ts).
+   * `paired_seeds`: a seed é a instância (solver determinístico, mesmo conjunto de casos nos dois braços); um valor
+   * escalar por seed em cada braço, pareado pela seed, bootstrap sobre as seeds em comum. `single`: avaliação única
+   * (o cofre), sem braços a comparar nem declare_result; o run gravado é o resultado.
+   */
+  comparison?: 'seeds' | 'paired_bootstrap' | 'paired_seeds' | 'single';
+  /** Modo pareado: como a métrica sai das linhas. */
+  rowMetric?: RowMetric;
+  /** Modo pareado: o que é uma unidade (paciente, cliente, dia), só para leitura. */
+  unit?: string;
+  /** Modo pareado: unidades mínimas em comum entre os braços antes de concluir. */
+  minUnits?: number;
+}
+
+/** Predições por linha de um run no modo pareado, alinhadas por `id` entre os braços. */
+export interface RunRows {
+  id: string[];
+  unit: string[];
+  label?: number[];
+  score: number[];
+  /** O arquivo não tinha coluna unit: cada linha virou a própria unidade. */
+  unitFromRow?: true;
 }
 
 export interface Run {
@@ -43,7 +68,10 @@ export interface Run {
   samples?: Record<string, number[]>;
   command?: string;
   commit?: string;
+  /** Havia mudança não commitada (ou arquivo citado no comando fora do git) quando o run foi gravado. */
   dirty?: boolean;
+  /** Arquivos citados no comando com mudança não commitada ou sem estar no git. */
+  dirtyFiles?: string[];
   artifact?: string;
   /** sha256 (16 primeiros hex) do arquivo de métricas lido pelo host. */
   metricsFileHash?: string;
@@ -53,6 +81,10 @@ export interface Run {
   /** Trial de varredura: número no estudo e os parâmetros sorteados. O hub mediu, nenhum modelo declarou. */
   trial?: number;
   params?: Record<string, number | string>;
+  /** Modo pareado: predições por linha, lidas pelo host do predictions_file (ou dos samples). */
+  rows?: RunRows;
+  /** Resultado de uma avaliação do cofre (lockbox_evaluate), gravado pelo host. */
+  lockbox?: { id: string; evalId: string };
 }
 
 export interface Finding {
@@ -67,6 +99,33 @@ export interface Finding {
 export interface Verdict extends LabVerdictInfo {
   id: string;
   hypothesisId: string;
+  /** Veredito do modo pareado por unidade (`mode` fica "paired-samples"): como a comparação foi feita. */
+  paired?: {
+    metric: RowMetric;
+    unit?: string;
+    units: number;
+    rows: number;
+    iters: number;
+    runs: [string, string];
+    /** Linhas de cada braço (baseline, variante) sem par no outro, que ficaram de fora. */
+    unpaired?: [number, number];
+  };
+  /** Veredito pareado por seed (`comparison: "paired_seeds"`, `mode` "paired-samples"): IC pela t, p da troca de sinais. */
+  pairedSeeds?: { seeds: number; unit?: string; /** p do teste de troca de sinais exato (até 20 seeds) ou por Monte Carlo. */ exact: boolean; unpaired: [number, number] };
+}
+
+/** Hipótese de avaliação única (cofre): sem braços a comparar, sem declare_result. */
+export function isSingleEval(h: Hypothesis): boolean {
+  return h.comparison === 'single';
+}
+
+/**
+ * Resultado de uma hipótese de avaliação única: o run da primeira avaliação do cofre. As seguintes (repetição aprovada
+ * pelo usuário) ficam como extras e não trocam o resultado. Run sem `lockbox` não conta.
+ */
+export function singleResult(runs: readonly Run[]): { result?: Run; extras: Run[] } {
+  const fromLockbox = runs.filter((r) => r.lockbox);
+  return { result: fromLockbox[0], extras: fromLockbox.slice(1) };
 }
 
 /**
@@ -122,7 +181,12 @@ export class LabStore {
     if (v) {
       return v.verdict === 'suportada' ? 'concluída' : v.verdict;
     }
-    return this.runs(h.id).length ? 'rodando' : 'registrada';
+    const runs = this.runs(h.id);
+    // Avaliação única não tem veredito: fica concluída quando o cofre grava o resultado, e só então.
+    if (isSingleEval(h)) {
+      return singleResult(runs).result ? 'concluída' : 'registrada';
+    }
+    return runs.length ? 'rodando' : 'registrada';
   }
 
   addHypothesis(h: Omit<Hypothesis, 'id' | 'createdAt'>): Hypothesis {

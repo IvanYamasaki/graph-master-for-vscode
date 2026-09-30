@@ -11,6 +11,11 @@
  * "verificado" exige parecer "confirmado", reexecução dentro do intervalo nos dois braços e nenhuma checagem dura
  * falhando. Qualquer falha dura ou reexecução fora do intervalo vira "divergente".
  *
+ * Modo pareado por unidade (veredito com `paired`): não há seed nova. O verificador regera o predictions_file de
+ * cada braço, o host recalcula a métrica com rowsMetric e exige que bata com o run original (tolerância relativa
+ * 1e-9, pairedCheck.ts). Como a reexecução é determinística, o peso passa à procura de vazamento: "verificado"
+ * exige leakage "nenhum" declarado.
+ *
  * Os pareceres ficam em .agm/lab/verifications.jsonl, só de acréscimo, como o resto do quadro.
  */
 import { execFileSync } from 'node:child_process';
@@ -25,6 +30,7 @@ import type { Hypothesis, Run, Verdict } from '../lab/store';
 import { readProjectGuard } from '../guard/protect';
 import { createWorktree } from '../worktree';
 import { readResult } from './attempts';
+import { PAIRED_REL_TOL, checkPairedRerun } from './pairedCheck';
 import type { ParallelHost } from './host';
 
 interface VerificationRecord extends LabVerificationInfo {
@@ -37,7 +43,7 @@ export interface SubmitArgs {
   hypothesis_id: string;
   verdict: VerificationVerdict;
   notes: string;
-  reruns?: { arm: string; seed: number; command: string; metrics_file: string }[];
+  reruns?: { arm: string; seed: number; command: string; metrics_file?: string; predictions_file?: string }[];
   leakage?: 'nenhum' | 'suspeito' | 'encontrado';
 }
 
@@ -53,7 +59,7 @@ export const VERIFIER_BLOCKED_TOOLS = [
   'Edit',
   'MultiEdit',
   'NotebookEdit',
-  ...['spawn_agent', 'spawn_attempts', 'run_seeds', 'send_to_agent', 'register_hypothesis', 'log_run', 'declare_result', 'post_finding', 'request_verification', 'web_research', 'generate_image'].map(
+  ...['spawn_agent', 'spawn_attempts', 'run_seeds', 'start_sweep', 'setup_optuna', 'stop_search', 'send_to_agent', 'register_hypothesis', 'log_run', 'declare_result', 'post_finding', 'request_verification', 'web_research', 'generate_image'].map(
     (t) => `mcp__agents__${t}`,
   ),
 ];
@@ -130,7 +136,7 @@ export class Verifier {
       this.host.post({ type: 'notice', level: 'error', text: `Não consegui criar o verificador de ${h.id}: ${err instanceof Error ? err.message : String(err)}` });
     });
     const hardNote = checks.hard.length ? ` As checagens do host já acharam problema: ${checks.hard.join('; ')}.` : '';
-    return `Verificação independente de ${h.id} (veredito ${v.id}) iniciada: agente ${id}, ${cfg.model}/${cfg.effort}, só leitura, reexecuta cada braço com seed nova. O selo sai no cartão da hipótese e o relatório dele chega a você.${hardNote}`;
+    return `Verificação independente de ${h.id} (veredito ${v.id}) iniciada: agente ${id}, ${cfg.model}/${cfg.effort}, só leitura, ${v.paired ? 'regera as predições de cada braço e procura vazamento' : 'reexecuta cada braço com seed nova'}. O selo sai no cartão da hipótese e o relatório dele chega a você.${hardNote}`;
   }
 
   /** submit_verification: lê as reexecuções dos arquivos, compara com o intervalo de cada braço e grava o selo. */
@@ -152,10 +158,31 @@ export class Verifier {
     const used = new Set(this.host.lab.store.runs(h.id).map((r) => `${r.arm}#${r.seed}`));
     const reruns: NonNullable<LabVerificationInfo['reruns']> = [];
     const lines = [...checks.lines];
+    const paired = v.paired;
     for (const r of args.reruns ?? []) {
       const arm = v.arms.find((a) => a.arm === r.arm);
       if (!arm) {
         lines.push(`reexecução ignorada: braço "${r.arm}" não existe`);
+        continue;
+      }
+      if (paired) {
+        const given = r.predictions_file ?? r.metrics_file;
+        if (!given) {
+          lines.push(`${r.arm}: reexecução sem predictions_file; nada comparado`);
+          reruns.push({ arm: r.arm, seed: r.seed, command: r.command });
+          continue;
+        }
+        const file = path.resolve(base, given);
+        const runsNow = this.host.lab.store.runs(h.id);
+        const original = runsNow.find((x) => paired.runs.includes(x.id) && x.arm === r.arm);
+        const c = checkPairedRerun(r.arm, file, path.relative(base, file) || file, original, paired.metric, h.metric);
+        const tol = c.original !== undefined ? PAIRED_REL_TOL * Math.max(1, Math.abs(c.original)) : 0;
+        reruns.push({ arm: r.arm, seed: r.seed, value: c.value, interval: c.original !== undefined ? [c.original - tol, c.original + tol] : undefined, inside: c.inside, command: r.command });
+        lines.push(c.line);
+        continue;
+      }
+      if (!r.metrics_file) {
+        lines.push(`${r.arm} seed ${r.seed}: reexecução sem metrics_file; nada lido`);
         continue;
       }
       const file = path.resolve(base, r.metrics_file);
@@ -174,10 +201,12 @@ export class Verifier {
     const outside = reruns.some((r) => r.inside === false);
     const leak = args.leakage ? [`vazamento treino/teste segundo o verificador: ${args.leakage}`] : [];
     lines.push(...leak);
+    // Pareado: a reexecução só reproduz um cálculo determinístico, então o vazamento tem de ter sido procurado.
+    const leakOk = paired ? args.leakage === 'nenhum' : args.leakage !== 'suspeito';
     const seal =
       args.verdict === 'divergente' || outside || checks.hard.length || args.leakage === 'encontrado'
         ? 'divergente'
-        : args.verdict === 'confirmado' && armsOk && args.leakage !== 'suspeito'
+        : args.verdict === 'confirmado' && armsOk && leakOk
           ? 'verificado'
           : 'inconclusivo';
     const rec: Omit<VerificationRecord, 'id'> = {
@@ -198,16 +227,27 @@ export class Verifier {
     this.host.lab.notify();
     const why =
       seal === 'verificado'
-        ? 'parecer confirmado, reexecução de cada braço dentro do intervalo e nenhuma checagem do host falhou'
+        ? paired
+          ? 'parecer confirmado, predições regeradas dos dois braços reproduzem a métrica e nenhum vazamento'
+          : 'parecer confirmado, reexecução de cada braço dentro do intervalo e nenhuma checagem do host falhou'
         : seal === 'divergente'
-          ? [args.verdict === 'divergente' ? 'o seu parecer é divergente' : '', outside ? 'reexecução fora do intervalo do braço' : '', ...checks.hard, args.leakage === 'encontrado' ? 'vazamento encontrado' : '']
+          ? [
+              args.verdict === 'divergente' ? 'o seu parecer é divergente' : '',
+              outside ? (paired ? 'predição regerada não reproduz a métrica do run original' : 'reexecução fora do intervalo do braço') : '',
+              ...checks.hard,
+              args.leakage === 'encontrado' ? 'vazamento encontrado' : '',
+            ]
               .filter(Boolean)
               .join('; ')
           : !armsOk
-            ? 'falta reexecução lida de arquivo e dentro do intervalo em algum braço'
+            ? paired
+              ? 'falta predictions_file regerado que reproduza a métrica em algum braço'
+              : 'falta reexecução lida de arquivo e dentro do intervalo em algum braço'
             : args.leakage === 'suspeito'
               ? 'vazamento suspeito'
-              : 'parecer inconclusivo';
+              : paired && args.leakage !== 'nenhum'
+                ? 'no modo pareado o selo exige leakage "nenhum" declarado depois da procura'
+                : 'parecer inconclusivo';
     return [`Parecer gravado para ${h.id} (veredito ${v.id}). Selo: ${seal.toUpperCase()} (${why}).`, ...lines.map((l) => `- ${l}`), 'Escreva agora o relatório final, começando pelo selo.'].join('\n');
   }
 
@@ -394,6 +434,9 @@ function verifierPrompt(host: ParallelHost, h: Hypothesis, v: Verdict, checks: H
   const maxSeed = runs.reduce((m, r) => Math.max(m, r.seed), 0);
   const perArm = (arm: string) => runs.filter((r: Run) => r.arm === arm);
   const example = (arm: string) => perArm(arm).at(-1)?.command ?? '(sem comando registrado)';
+  if (v.paired) {
+    return pairedPrompt(h, v, runs, checks, cwd, noWorktree, why);
+  }
   return [
     `Verificação independente da hipótese ${h.id} ("${h.title}"), veredito ${v.id}: ${v.verdict.toUpperCase()}. Motivo: ${why}.`,
     `Enunciado: ${h.statement}`,
@@ -416,5 +459,36 @@ function verifierPrompt(host: ParallelHost, h: Hypothesis, v: Verdict, checks: H
     '4. Chame submit_verification({ hypothesis_id, verdict, notes, reruns, leakage }) uma vez. verdict: "confirmado" (as reexecuções caem no intervalo e não há vazamento), "divergente" (algo não bate) ou "inconclusivo" (não deu para verificar). reruns: [{ arm, seed, command, metrics_file }] com o caminho do JSON que cada reexecução gravou, relativo ao seu diretório; o host lê o número do arquivo e decide se cai no intervalo. leakage: "nenhum", "suspeito" ou "encontrado". notes: o que você viu, curto.',
     '5. Relatório final em até 8 linhas, começando pelo selo que o submit_verification devolveu.',
     'Você não edita arquivos, não registra runs e não declara resultado: só lê, reexecuta e dá o parecer. Não cite número que não esteja nos runs acima ou nos arquivos das suas reexecuções.',
+  ].join('\n');
+}
+
+/** Prompt do verificador no modo pareado: sem seed nova; regera as predições e procura vazamento. */
+function pairedPrompt(h: Hypothesis, v: Verdict, runs: Run[], checks: HostChecks, cwd: string | undefined, noWorktree: string | undefined, why: string): string {
+  const p = v.paired!;
+  const original = (arm: string) => runs.find((r) => p.runs.includes(r.id) && r.arm === arm);
+  return [
+    `Verificação independente da hipótese ${h.id} ("${h.title}"), veredito ${v.id}: ${v.verdict.toUpperCase()}. Motivo: ${why}.`,
+    `Enunciado: ${h.statement}`,
+    `Modo pareado por unidade: um modelo congelado por braço, avaliado nas mesmas linhas; métrica ${p.metric} calculada pelo host das predições (${p.rows} linhas, ${p.units} unidades${p.unit ? ` por ${p.unit}` : ''}, ${p.iters} reamostragens). Braços ${h.arms[0]} (baseline) x ${h.arms[1]} (variante).`,
+    `Veredito: diferença ${fmtNum(v.diff)}, IC 95% [${fmtNum(v.ci[0])}, ${fmtNum(v.ci[1])}], p ajustado ${fmtNum(v.pAdjusted)}.`,
+    '',
+    'Runs comparados (id, braço, valor, comando, arquivo de predições, commit):',
+    ...h.arms.map((a) => {
+      const r = original(a);
+      return r ? `- ${r.id} ${a}: ${fmtNum(r.metrics[h.metric])} | ${r.command ?? '-'} | ${r.artifact ?? '-'} | ${r.commit?.slice(0, 10) ?? 'sem commit'}${r.dirty ? ' (sujo)' : ''}` : `- ${a}: run não encontrado`;
+    }),
+    '',
+    'Checagens que o host já fez (não precisa refazer):',
+    ...checks.lines.map((l) => `- ${l}`),
+    '',
+    cwd
+      ? `Você trabalha num worktree próprio, em "${cwd}". Rode tudo aqui dentro e grave os arquivos de saída aqui dentro.`
+      : `Não foi possível criar um worktree (${noWorktree ?? 'motivo desconhecido'}): você está no diretório do projeto. Grave as saídas só numa pasta nova .agm/verify-tmp/ e não mexa em mais nada.`,
+    'Sua tarefa, nesta ordem. Aqui não há seed nova: a predição de um modelo congelado é determinística.',
+    `1. Regere o arquivo de predições de cada braço com o mesmo comando do run, mudando só o caminho de saída. O host recalcula ${p.metric} das linhas e exige que bata com o run original (tolerância relativa ${PAIRED_REL_TOL}) e com os mesmos ids de linha; também compara o sha256.`,
+    '2. Esta é a parte principal: procure vazamento. Linhas de avaliação que aparecem no treino ou na escolha de hiperparâmetro e de limiar; a mesma unidade (paciente, usuário, sessão) dos dois lados da divisão; atributo calculado com o conjunto inteiro; rótulo ou informação do futuro entrando nas features; os dois braços com splits diferentes. Leia o código que gera as predições e o que separa os dados. Os caminhos protegidos você não lê.',
+    '3. Chame submit_verification({ hypothesis_id, verdict, notes, reruns, leakage }) uma vez. reruns: [{ arm, seed: 0, command, predictions_file }] com o caminho do arquivo regerado, relativo ao seu diretório. leakage é obrigatório: "nenhum" só depois de procurar de verdade (o selo "verificado" exige isso), "suspeito" ou "encontrado". notes: onde procurou e o que viu, curto.',
+    '4. Relatório final em até 8 linhas, começando pelo selo que o submit_verification devolveu.',
+    'Você não edita arquivos, não registra runs e não declara resultado. Não cite número que não esteja nos runs acima ou nos arquivos que você regerou.',
   ].join('\n');
 }

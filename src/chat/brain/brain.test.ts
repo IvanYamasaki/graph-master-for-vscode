@@ -8,7 +8,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { BrainNews, digest, type NewsDelivery, type NewsMode } from './news';
+import { BrainNews, digest, digestMain, type NewsDelivery, type NewsEvent, type NewsMode } from './news';
 import { BrainStore, BrainError, ENTRY_MAX_CHARS, INDEX_MAX_CHARS, NOTE_WARN_CHARS, findExternalMaps } from './store';
 
 if (process.argv[2] === 'child') {
@@ -419,6 +419,126 @@ async function main(): Promise<void> {
     );
     assert.ok(d.indexOf('da caixa') < d.indexOf('de fora'));
     news.reset();
+  });
+
+  await test('avisos do main: janela própria, um resumo por frente, dedup, urgência e ESTADO.md', async () => {
+    const pushed: { id: string; text: string }[] = [];
+    const news = new BrainNews({
+      recipients: () => [{ id: 'main' }, { id: 'a2', boxId: 'b2' }, { id: 'a3', boxId: 'b1' }],
+      mode: () => 'all',
+      windowMs: () => 200,
+      mainWindowMs: () => 60_000,
+      tryPush: (id, text) => {
+        pushed.push({ id, text });
+        return true;
+      },
+      delivered: () => undefined,
+    });
+    const s3 = new BrainStore(root, 'conv-news2');
+    s3.onChange = (events) => news.add(events);
+    await s3.upsertFront({ boxId: 'b1', name: 'Frente Um', description: 'Primeira frente' });
+    await s3.upsertAgent({ id: 'a1', description: 'Autor da frente', boxId: 'b1', status: 'running' });
+    pushed.length = 0;
+    for (let i = 0; i < 3; i++) {
+      await s3.fact({ title: `Achado comum ${i}`, body: 'detalhe', author: 'a1' });
+    }
+    await s3.write({ note: 'temas/dedup', content: 'primeira escrita', author: 'a1' });
+    await s3.write({ note: 'temas/dedup', content: 'segunda escrita', author: 'a1' });
+    await s3.write({ note: 'temas/dedup', content: 'terceira escrita', author: 'a1' });
+    assert.equal(pushed.length, 0, 'nada antes da janela');
+    await new Promise((r) => setTimeout(r, 350));
+    assert.deepEqual(pushed.map((p) => p.id).sort(), ['a2', 'a3'], 'o main espera a janela dele');
+    const a3 = pushed.find((p) => p.id === 'a3')!.text;
+    assert.equal(a3.split('\n').filter((l) => l.startsWith('- ')).length, 4, '3 fatos + 1 linha para a nota escrita 3 vezes');
+    assert.match(a3, /temas\/dedup\.md \(3 escritas\) · terceira escrita/);
+    assert.ok(!/ESTADO/.test(a3), 'agente não recebe mudança de ESTADO.md');
+    pushed.length = 0;
+    news.flush();
+    const main = pushed.find((p) => p.id === 'main')!.text;
+    assert.match(main, /^Novidades no cérebro compartilhado/);
+    const frente = main.split('\n').filter((l) => l.startsWith('- frente '));
+    assert.equal(frente.length, 1, 'uma linha por frente, não por nota');
+    assert.match(frente[0], /^- frente Frente Um: 3 fatos novos \(Achado comum 0; Achado comum 1; Achado comum 2\), 1 nota atualizada/);
+    assert.ok(!/segunda escrita|detalhe/.test(main), 'só títulos');
+
+    pushed.length = 0;
+    await s3.fact({ title: 'Usar SQLite e não Postgres', body: 'motivo', kind: 'decisao', author: 'a1' });
+    assert.deepEqual(pushed.map((p) => p.id).sort(), ['a2', 'a3', 'main'], 'decisão sai na hora para todos, inclusive o main');
+    assert.ok(pushed.every((p) => /\[decisao\] · Usar SQLite e não Postgres/.test(p.text)));
+    pushed.length = 0;
+    await s3.fact({ title: 'O build quebra sem o nonce', kind: 'armadilha', author: 'a1' });
+    assert.equal(pushed.length, 3, 'armadilha também');
+    const decRel = fs.readdirSync(path.join(dir, 'fatos')).find((f) => f.includes('usar-sqlite'))!;
+    pushed.length = 0;
+    await s3.edit({ note: `fatos/${decRel}`, oldText: 'motivo', newText: 'motivo revisado', author: 'a1' });
+    assert.equal(pushed.length, 0, 'editar uma decisão não é urgente');
+
+    // Agente criado ou com status novo reescreve o ESTADO.md, mas isso não é novidade.
+    pushed.length = 0;
+    news.flush();
+    pushed.length = 0;
+    await s3.upsertAgent({ id: 'a5', description: 'Recém-criado', boxId: 'b1', status: 'running' });
+    await s3.upsertAgent({ id: 'a5', description: 'Recém-criado', boxId: 'b1', status: 'completed' });
+    news.flush();
+    assert.equal(pushed.filter((p) => p.id === 'main').length, 0, 'ESTADO.md de agente criado ou concluído não avisa o main');
+
+    // ESTADO.md sozinho (evento direto na fila) não fecha o lote nem gera aviso.
+    const ste = (): NewsEvent => ({ rel: 'frentes/f/ESTADO.md', author: 'host', line: 'ESTADO.md mudou', boxId: 'b1', boxName: 'Frente Um', state: true, at: new Date().toISOString() });
+    news.add([ste()]);
+    assert.equal(pushed.length, 0);
+    news.flush();
+    assert.equal(pushed.length, 0, 'lote só com ESTADO.md é descartado');
+
+    // Com um evento de conteúdo no lote, o ESTADO.md fecha o lote antes da janela (60 s).
+    await s3.fact({ title: 'Outro achado ainda no lote', author: 'a1' });
+    assert.equal(pushed.filter((p) => p.id === 'main').length, 0);
+    news.add([ste()]);
+    const mainNow = pushed.filter((p) => p.id === 'main');
+    assert.equal(mainNow.length, 1);
+    assert.match(mainNow[0].text, /frente Frente Um: .*Outro achado ainda no lote.*ESTADO\.md mudou/);
+    assert.ok(!pushed.some((p) => p.id !== 'main' && /ESTADO/.test(p.text)));
+    news.reset();
+  });
+
+  await test('relatório entregue ao main não gera aviso; entregue a outro agente gera uma linha', async () => {
+    const got: NewsEvent[][] = [];
+    const s5 = new BrainStore(root, 'conv-news3');
+    await s5.upsertFront({ boxId: 'b9', name: 'Frente Nove' });
+    await s5.upsertAgent({ id: 'r1', description: 'Relator', boxId: 'b9', status: 'running' });
+    s5.onChange = (events) => got.push(events);
+    await s5.recordReport('r1', { to: 'main', text: 'Conclusão: pronto.', status: 'completed' });
+    assert.equal(got.flat().filter((e) => e.rel.startsWith('agentes/')).length, 0, 'main já leu o relatório');
+    assert.match(read('agentes/r1-relator.md'), /Relatório entregue a main/, 'a nota do agente continua com o resumo');
+    await s5.recordReport('r1', { to: 'a2', text: 'Conclusão: pronto para a2.', status: 'completed' });
+    const lines = got.flat().filter((e) => e.rel.startsWith('agentes/'));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0].line, /^relatório entregue a a2: Conclusão: pronto para a2\./);
+  });
+
+  await test('resumo do main tem limite de frentes e de títulos', () => {
+    const ev = (i: number, f: number): NewsEvent => ({ rel: `fatos/f${i}.md`, author: 'a1', line: `Fato ${i}`, boxId: `b${f}`, boxName: `Frente ${f}`, at: `2026-01-01T00:00:${String(i).padStart(2, '0')}Z` });
+    const list = [...Array.from({ length: 6 }, (_, i) => ev(i, 1)), ...Array.from({ length: 9 }, (_, i) => ev(10 + i, i + 2))];
+    const text = digestMain(list);
+    assert.match(text, /frente Frente 1: 6 fatos novos \(Fato 0; Fato 1; Fato 2; Fato 3; e mais 2\)/);
+    assert.equal(text.split('\n').filter((l) => l.startsWith('- frente ')).length, 8);
+    assert.match(text, /- e mais 2 frentes com 2 novidades/);
+  });
+
+  await test('resumo de entrada: frente do agente, fatos vigentes e os que combinam com a tarefa', async () => {
+    const s4 = new BrainStore(root, 'conv-news2');
+    await s4.fact({ title: 'Webview bloqueia scripts sem nonce', body: 'x', kind: 'armadilha', area: ['webview', 'csp'], author: 'a1' });
+    await s4.upsertFront({ boxId: 'b7', name: 'Frente Sete' });
+    await s4.upsertAgent({ id: 'a7', description: 'Ajuste da webview', boxId: 'b7', status: 'running' });
+    const b = s4.briefing({ boxId: 'b7', task: 'Corrigir o webview csp do painel' })!;
+    assert.match(b, /Sua frente: Frente Sete \(b7\)/);
+    assert.match(b, /- a7 · rodando · Ajuste da webview/);
+    assert.match(b, /Decisões e armadilhas vigentes de outras frentes:/);
+    assert.match(b, /Webview bloqueia scripts sem nonce \(armadilha, /);
+    assert.ok(b.length <= 2_200);
+    const own = s4.briefing({ boxId: 'b1' })!;
+    assert.match(own, /Fatos vigentes da frente/);
+    assert.match(own, /Usar SQLite e não Postgres \(decisao/);
+    assert.equal(new BrainStore(fs.mkdtempSync(path.join(os.tmpdir(), 'agm-vazio-')), 'c').briefing({ boxId: 'b1' }), undefined);
   });
 
   await test('graphify e memória manual: o índice aponta, com aviso de idade, sem ler os arquivos', async () => {

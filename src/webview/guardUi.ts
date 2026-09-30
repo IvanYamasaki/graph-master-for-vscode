@@ -22,6 +22,11 @@ function meterColor(frac: number): string {
   return frac >= 1 ? METER_FULL : frac >= BUDGET_WARN ? METER_WARN : METER_OK;
 }
 
+/** Barra de orçamento de um nó (agente ou caixa recolhida), na cor da faixa em que está. */
+export function budgetMeter(frac: number): GraphMeter {
+  return { frac: Math.min(1, frac), color: meterColor(frac) };
+}
+
 /** Ajusta o modelo do nó: anel âmbar quando preso, barra de orçamento, e o consumo no texto de dica. */
 export function markGuardNode(node: { ring?: { color: string; pulse: boolean }; detail: string; aria: string; meter?: GraphMeter }, a: AgentInfo): void {
   if (a.stuck && a.status === 'running') {
@@ -31,7 +36,7 @@ export function markGuardNode(node: { ring?: { color: string; pulse: boolean }; 
   }
   const frac = budgetFraction(a.budget, a.spent);
   if (frac !== undefined) {
-    node.meter = { frac: Math.min(1, frac), color: meterColor(frac) };
+    node.meter = budgetMeter(frac);
     node.detail += `\norçamento: ${Math.round(frac * 100)}% · ${budgetLines(a).join(' · ')}`;
     if (frac >= BUDGET_WARN) {
       node.aria += `. Orçamento em ${Math.round(frac * 100)}%`;

@@ -10,7 +10,7 @@ import type { Profile } from '../../profiles';
 import { INTERPRET_MODEL, interpretReport } from './interpret';
 import { LabIntegrity } from './integrity';
 import { buildReport, reportTool, saveReport, withInterpretation, type ReportScope } from './report';
-import { gitBranch, type Lab } from './tools';
+import { gitBranch, MAIN_CALLER, type Lab } from './tools';
 
 export interface LabReportsHost {
   cwd: string;
@@ -34,6 +34,10 @@ export class LabReports {
       this.warned.add(w.key);
     }
     lab.familyOf = (h) => this.integrity.family(h);
+    // Lembrete de hipótese esquecida e números do cofre só da conversa atual (o quadro é do projeto inteiro).
+    lab.currentConversation = () => host.conversation();
+    lab.conversationOf = (h) => this.integrity.conversationOf(h);
+    lab.conversationSince = new Date().toISOString();
     lab.onHypothesis = (h, by) => {
       this.integrity.tag(h, { conversation: host.conversation(), branch: gitBranch(host.cwd), agent: by });
       return this.fresh();
@@ -60,12 +64,14 @@ export class LabReports {
     return out.length ? out.join('\n') : undefined;
   }
 
-  tools(): SdkMcpToolDefinition<any>[] {
-    return [reportTool((args) => this.generate(args.scope, args.id, !!args.interpret))];
+  /** `callerId` "main": schema carregado de cara; subagente carrega com ToolSearch. */
+  tools(callerId?: string): SdkMcpToolDefinition<any>[] {
+    // Subagente não vê os números do cofre no relatório (só o main pede e recebe a avaliação).
+    return [reportTool((args) => this.generate(args.scope, args.id, !!args.interpret, callerId !== MAIN_CALLER), callerId === MAIN_CALLER)];
   }
 
   /** Monta, grava em .agm/lab/reports/ e abre no editor. Devolve o texto para o modelo ou o erro. */
-  async generate(scope: ReportScope, id: string | undefined, interpret: boolean): Promise<string | Error> {
+  async generate(scope: ReportScope, id: string | undefined, interpret: boolean, hideLockbox = false): Promise<string | Error> {
     let target = id;
     if (scope === 'hypothesis' && !target) {
       return new Error('Com scope "hypothesis", passe o id da hipótese (ex.: "h3").');
@@ -79,7 +85,7 @@ export class LabReports {
     if (!target) {
       return new Error(scope === 'branch' ? 'Não achei o ramo atual nem hipótese registrada; passe o id do ramo.' : 'Esta conversa ainda não tem id; mande uma mensagem antes ou passe o id.');
     }
-    const built = buildReport({ root: this.host.cwd, store: this.lab.store, state: this.lab.state(), integrity: this.integrity, scope, id: target });
+    const built = buildReport({ root: this.host.cwd, store: this.lab.store, state: this.lab.state(), integrity: this.integrity, scope, id: target, hideLockbox });
     if (built instanceof Error) {
       return built;
     }

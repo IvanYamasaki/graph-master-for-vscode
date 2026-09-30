@@ -13,7 +13,8 @@ import type { LabHypothesisInfo, LabState } from '../protocol';
 import { fmtNum } from './evaluate';
 import type { LabIntegrity } from './integrity';
 import { citedNumbers, unregistered } from './provenance';
-import type { Hypothesis, LabStore, Run, Verdict } from './store';
+import { isSingleEval, singleResult, type Hypothesis, type LabStore, type Run, type Verdict } from './store';
+import { ciLabel, comparisonLabel } from './tools';
 
 export type ReportScope = 'hypothesis' | 'branch' | 'conversation';
 
@@ -25,6 +26,8 @@ export interface ReportInput {
   integrity: LabIntegrity;
   scope: ReportScope;
   id: string;
+  /** Pedido por subagente: runs do cofre aparecem sem o número. */
+  hideLockbox?: boolean;
 }
 
 export interface BuiltReport {
@@ -119,7 +122,7 @@ export function buildReport(input: ReportInput): BuiltReport | Error {
 
   // ---------- Hipóteses ----------
   for (const h of picked) {
-    L.push(...hypothesisSection(h, store, verdicts.filter((v) => v.hypothesisId === h.id), runs.filter((r) => r.hypothesisId === h.id), infos.get(h.id), ctx));
+    L.push(...hypothesisSection(h, store, verdicts.filter((v) => v.hypothesisId === h.id), runs.filter((r) => r.hypothesisId === h.id), infos.get(h.id), ctx, !!input.hideLockbox));
   }
 
   // ---------- Descartadas e podadas ----------
@@ -174,6 +177,12 @@ export function buildReport(input: ReportInput): BuiltReport | Error {
   const gaps: string[] = [];
   for (const h of confirm) {
     const hr = runs.filter((r) => r.hypothesisId === h.id);
+    if (isSingleEval(h)) {
+      if (!singleResult(hr).result) {
+        gaps.push(`${h.id}: avaliação única sem resultado; o cofre ainda não foi avaliado.`);
+      }
+      continue;
+    }
     for (const arm of h.arms) {
       const seeds = new Set(hr.filter((r) => r.arm === arm && Number.isFinite(r.metrics[h.metric])).map((r) => r.seed)).size;
       if (seeds < h.minSeeds) {
@@ -210,6 +219,7 @@ function hypothesisSection(
   runs: Run[],
   info: LabHypothesisInfo | undefined,
   ctx: ReturnType<LabIntegrity['contexts']>,
+  hideLockbox = false,
 ): string[] {
   const L: string[] = [];
   const where = ctx.get(h.id);
@@ -217,17 +227,29 @@ function hypothesisSection(
   if (h.sweepId) {
     L.push(`Hipótese exploratória da varredura ${h.sweepId}: guarda os trials, não passa por declare_result.`, '');
   }
+  const single = isSingleEval(h);
+  if (single) {
+    const { result, extras } = singleResult(runs);
+    L.push(
+      `Avaliação única (cofre): sem braços a comparar e sem declare_result. ${result ? `O resultado é o run ${result.id}, da primeira avaliação${extras.length ? `; as avaliações extras (${extras.map((r) => r.id).join(', ')}) não trocam o resultado` : ''}.` : 'O cofre ainda não foi avaliado.'}`,
+      '',
+    );
+  }
   L.push(`**Enunciado pré-registrado** (${h.createdAt}, por ${h.createdBy}${where?.conversation ? `, conversa ${where.conversation.slice(0, 8)}` : ''}${where?.branch ? `, ramo ${where.branch}` : ''}):`, '');
   L.push(...h.statement.split('\n').map((l) => `> ${l}`), '');
   L.push(
-    `**Critério pré-registrado.** Métrica primária "${h.metric}" (${dirLabel(h)}); melhora mínima ${fmtNum(h.minImprovement)} ${h.improvementKind === 'relative' ? 'relativa ao baseline' : 'absoluta'}; braços "${h.arms[0]}" (baseline) x "${h.arms[1]}" (variante); mínimo de ${h.minSeeds} seeds por braço; alpha ${fmtNum(h.alpha)}; família "${h.family}".${h.derivedFrom ? ` Derivada de ${h.derivedFrom}.` : ''}${h.budget?.maxRuns ? ` Orçamento: ${h.budget.maxRuns} runs.` : ''}${h.budget?.note ? ` Orçamento: ${cell(h.budget.note)}.` : ''}${info?.pruned ? ` Podada por ${info.pruned.by} em ${info.pruned.at}.` : ''}`,
+    single
+      ? `**Critério pré-registrado.** Métrica primária "${h.metric}" (${dirLabel(h)}); ${comparisonLabel(h)}; família "${h.family}".`
+      : `**Critério pré-registrado.** Métrica primária "${h.metric}" (${dirLabel(h)}); melhora mínima ${fmtNum(h.minImprovement)} ${h.improvementKind === 'relative' ? 'relativa ao baseline' : 'absoluta'}; braços "${h.arms[0]}" (baseline) x "${h.arms[1]}" (variante); ${comparisonLabel(h)}; alpha ${fmtNum(h.alpha)}; família "${h.family}".${h.derivedFrom ? ` Derivada de ${h.derivedFrom}.` : ''}${h.budget?.maxRuns ? ` Orçamento: ${h.budget.maxRuns} runs.` : ''}${h.budget?.note ? ` Orçamento: ${cell(h.budget.note)}.` : ''}${info?.pruned ? ` Podada por ${info.pruned.by} em ${info.pruned.at}.` : ''}`,
     '',
   );
   const seedsLine = h.arms.map((a) => {
     const seeds = [...new Set(runs.filter((r) => r.arm === a).map((r) => r.seed))].sort((x, y) => x - y);
     return `"${a}": ${seeds.length ? seeds.join(', ') : 'nenhuma'}`;
   });
-  L.push(`**Seeds registradas.** ${seedsLine.join('; ')}.`, '');
+  if (!single) {
+    L.push(`**Seeds registradas.** ${seedsLine.join('; ')}.`, '');
+  }
 
   const v = vs.at(-1);
   if (v) {
@@ -240,8 +262,8 @@ function hypothesisSection(
     }
     L.push('');
     L.push(
-      `- Diferença (${va?.arm ?? h.arms[1]} menos ${b?.arm ?? h.arms[0]}, positivo é melhora): ${fmtNum(v.diff)}${typeof v.relDiff === 'number' ? ` (${fmtNum(v.relDiff * 100)}% do baseline)` : ''}; IC ${fmtNum(v.ciLevel * 100)}% [${fmtNum(v.ci[0])}, ${fmtNum(v.ci[1])}], bootstrap ${v.mode === 'paired-samples' ? 'pareado por amostra' : 'por seed'}.`,
-      `- Efeito ${v.mode === 'seeds' ? 'd de Cohen' : 'd_z'}: ${fmtNum(v.effect)}. p bruto ${fmtNum(v.p)}; p ajustado por Benjamini-Hochberg ${fmtNum(v.pAdjusted)}, família "${v.family}" com ${v.familySize} hipótese(s).`,
+      `- Diferença (${va?.arm ?? h.arms[1]} menos ${b?.arm ?? h.arms[0]}, positivo é melhora): ${fmtNum(v.diff)}${typeof v.relDiff === 'number' ? ` (${fmtNum(v.relDiff * 100)}% do baseline)` : ''}; IC ${fmtNum(v.ciLevel * 100)}% [${fmtNum(v.ci[0])}, ${fmtNum(v.ci[1])}], bootstrap ${ciLabel(v)}.`,
+      `- Efeito ${v.mode === 'seeds' ? 'd de Cohen' : v.paired ? 'd_z por unidade' : 'd_z'}: ${fmtNum(v.effect)}. p ${v.paired ? 'do bootstrap' : 'bruto'} ${fmtNum(v.p)}; p ajustado por Benjamini-Hochberg ${fmtNum(v.pAdjusted)}, família "${v.family}" com ${v.familySize} hipótese(s).`,
       `- Melhora mínima exigida na unidade da métrica: ${fmtNum(v.threshold)}.${v.verdict === 'inconclusiva' && v.seedsMissing !== undefined ? ` Seeds que faltam por braço (estimativa do veredito): ${v.seedsMissing}.` : ''}`,
       ...v.reasons.map((r) => `- ${r}`),
       ...v.warnings.map((w) => `- Atenção: ${w}`),
@@ -251,7 +273,7 @@ function hypothesisSection(
       L.push(`- Tentativas anteriores: ${older.map((o) => `${o.id} ${o.verdict} (p ajustado ${fmtNum(o.pAdjusted)}, n ${o.arms.map((a) => a.n).join('/')})`).join('; ')}.`);
     }
     L.push('');
-  } else if (!h.sweepId) {
+  } else if (!h.sweepId && !single) {
     L.push('Sem veredito: declare_result ainda não rodou nesta hipótese, então não há média, IC nem p a relatar.', '');
   }
 
@@ -261,8 +283,9 @@ function hypothesisSection(
     const shown = runs.length > 80 ? runs.slice(-80) : runs;
     for (const r of shown) {
       const val = r.metrics[h.metric];
+      const shown = r.lockbox && hideLockbox ? `avaliado no cofre em ${r.at} (valor só para o main)` : Number.isFinite(val) ? String(val) : '-';
       L.push(
-        `| ${r.id} | ${cell(r.arm)} | ${r.seed} | ${Number.isFinite(val) ? String(val) : '-'} | ${code(r.command)} | ${r.commit ? code(r.commit.slice(0, 10)) + (r.dirty ? ' + alterações' : '') : '-'} | ${code(r.metricsFileHash)} | ${r.source} | ${r.agent} |`,
+        `| ${r.id} | ${cell(r.arm)} | ${r.seed} | ${shown} | ${code(r.command)} | ${r.commit ? code(r.commit.slice(0, 10)) + (r.dirty ? ` + alterações${r.dirtyFiles?.length ? ` em ${r.dirtyFiles.map(code).join(', ')}` : ''}` : '') : '-'} | ${code(r.metricsFileHash)} | ${r.source} | ${r.agent} |`,
       );
     }
     if (shown.length < runs.length) {
@@ -344,7 +367,7 @@ function slugify(s: string): string {
 }
 
 /** Ferramenta experiment_report; o hub resolve o escopo, grava, abre no editor e devolve o caminho. */
-export function reportTool(generate: (args: { scope: ReportScope; id?: string; interpret?: boolean }) => Promise<string | Error>): SdkMcpToolDefinition<any> {
+export function reportTool(generate: (args: { scope: ReportScope; id?: string; interpret?: boolean }) => Promise<string | Error>, alwaysLoad = false): SdkMcpToolDefinition<any> {
   return tool(
     'experiment_report',
     'Gera o relatório de experimento em Markdown (.agm/lab/reports/) só com dados registrados: hipóteses e critérios pré-registrados, seeds, média ± desvio, diferença com IC, p ajustado e família BH, veredito e selo de verificação, runs com comando, commit e sha, descartadas/podadas, buscas relacionadas, o que não foi testado e avisos de p-hacking. Abre o arquivo no editor do usuário.',
@@ -357,6 +380,6 @@ export function reportTool(generate: (args: { scope: ReportScope; id?: string; i
       const r = await generate({ scope: args.scope, id: args.id?.trim() || undefined, interpret: args.interpret });
       return r instanceof Error ? { content: [{ type: 'text' as const, text: r.message }], isError: true } : { content: [{ type: 'text' as const, text: r }] };
     },
-    { alwaysLoad: true },
+    { alwaysLoad },
   );
 }

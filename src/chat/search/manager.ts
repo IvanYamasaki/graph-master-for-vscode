@@ -14,6 +14,8 @@ import { gitBranch, gitInfo, readMetricsFile, type Lab } from '../lab/tools';
 import { Tournament, ranking, tournamentMarkdown, tournamentProgress, tournamentReport, type TournamentState } from './tournament';
 import { Sweep, sweepMarkdown, sweepProgress, sweepReport, type SweepState } from './sweep';
 import { detectPython, installOptuna, missingOptunaText, type Detection } from './optuna';
+import { protectedPatternsFor } from '../guard/agentGuard';
+import { commandBlocked } from '../guard/protect';
 import type { ParamSpec } from './sampler';
 
 export interface SearchHost {
@@ -28,6 +30,8 @@ export interface SearchHost {
   resolveTarget(raw: string | undefined, callerId: string): string | Error;
   /** Entrega o relatório final a "main" ou a um agente. `user` não chega aqui. */
   deliver(target: string, text: string, fromId: string): void;
+  /** Agente que chama (caminhos protegidos e worktree dele). Sem isto, vale só a regra do projeto. */
+  info?(id: string): AgentInfo | undefined;
 }
 
 type Text = { content: { type: 'text'; text: string }[]; isError?: boolean };
@@ -51,7 +55,8 @@ export const SEARCH_GUIDE = [
   '- Torneio (start_tournament): quando há muitas ideias e verba para testar poucas. Juízes-modelo comparam as ideias em pares pelos critérios, com Elo; geradores baratos podem propor candidatos a partir da pergunta; evolve cria variantes das duas melhores. O torneio PRIORIZA o que testar; não conclui nada empírico. A ideia escolhida vira hipótese com promote_to_hypothesis e só se prova com runs e declare_result.',
   '- Juiz: "haiku" é barato e serve para triagem; "sonnet" julga melhor quando a decisão pesa. both_orders julga cada par nas duas ordens (o dobro de partidas) e marca empate quando a ordem muda o veredito.',
   '- Varredura (start_sweep): quando o espaço de parâmetros é contínuo ou grande e há uma métrica clara que o script grava num JSON. O hub roda o comando por trial, sem modelo no laço, com Optuna (se houver Python com optuna) ou com o amostrador embutido. Cada trial vira run no laboratório. Na primeira vez de cada comando o usuário aprova.',
-  '- Sem Optuna, diga ao usuário o que start_sweep informou. setup_optuna instala o optuna num venv do projeto (.agm/venv), com aprovação; nunca instale pacote no Python global.',
+  '- Sem Optuna, diga ao usuário o que start_sweep informou. setup_optuna instala o optuna num venv do projeto (.agm/venv), com aprovação; nunca instale pacote no Python global. O venv é um só para a conversa inteira: setup_optuna devolve o caminho do Python com optuna, e é esse caminho que vai no prompt dos agentes.',
+  '- Subagentes também têm start_sweep, setup_optuna (detecção; instalar pede aprovação do usuário), search_status e stop_search (das buscas que eles criaram). O relatório da varredura volta para quem chamou. Em vez de mandar cada agente pilotar o Optuna à mão, peça que chame start_sweep, ou chame você e distribua o resultado. Os trials entram na fila de processos pesados (agentGraphMaster.maxHeavyProcesses) junto com os de todos os outros agentes.',
   '- O melhor trial de uma varredura é otimista. Para afirmar melhora, registre hipótese confirmatória (melhores parâmetros contra o baseline, várias seeds) e use declare_result.',
   '- As duas respeitam orçamento: max_matches e max_usd no torneio; n_trials, timeout_minutes e max_minutes na varredura. stop_search interrompe; search_status mostra o estado. Um agente só entra para analisar o resultado se o usuário pedir.',
 ];
@@ -64,6 +69,8 @@ export class SearchManager {
   /** Buscas de uma conversa reaberta, lidas de .agm/search/: só leitura, sem runner. */
   private readonly restored = new Map<string, AgentInfo>();
   private detection?: Promise<Detection>;
+  /** Instalação do optuna em andamento: quem pedir no meio espera esta em vez de rodar outro pip. */
+  private installing?: Promise<{ ok: boolean; text: string }>;
 
   constructor(private readonly host: SearchHost) {}
 
@@ -88,6 +95,15 @@ export class SearchManager {
     this.permissions.delete(requestId);
     this.host.post({ type: 'permissionClosed', requestId });
     resolve?.(answer.decision === 'allow' || answer.decision === 'always');
+  }
+
+  /** Agente parado: as buscas que ele criou param também (o relatório parcial vai ao destino de cada uma). */
+  stopWorkOf(agentId: string): void {
+    for (const e of this.entries.values()) {
+      if (e.info.creator === agentId) {
+        e.runner.stop();
+      }
+    }
   }
 
   /** Conversa trocada ou fechada: para o que roda e esquece as aprovações. Os arquivos ficam. */
@@ -253,8 +269,24 @@ export class SearchManager {
 
   // ---------- Ferramentas ----------
 
-  tools(callerId: string): SdkMcpToolDefinition<any>[] {
+  /**
+   * Orquestrador: tudo. Subagente: varredura, detecção/instalação do optuna, estado e parada das buscas que ele
+   * criou; torneio e promoção ficam com o orquestrador (gastam modelo e mexem no quadro de hipóteses).
+   */
+  tools(callerId: string, role: { isMain: boolean } = { isMain: true }): SdkMcpToolDefinition<any>[] {
+    if (!role.isMain) {
+      return [this.sweepTool(callerId), this.setupTool(), this.statusTool(), this.stopTool(callerId)];
+    }
     return [this.tournamentTool(callerId), this.promoteTool(callerId), this.sweepTool(callerId), this.setupTool(), this.statusTool(), this.stopTool()];
+  }
+
+  /** Comando de subagente que cita caminho protegido dele: o hub não roda. */
+  private blockedFor(callerId: string, command: string): string | undefined {
+    if (callerId === 'main') {
+      return undefined;
+    }
+    const info = this.host.info?.(callerId);
+    return commandBlocked(protectedPatternsFor(this.host.cwd, info), [info?.worktree?.cwd ?? this.host.cwd, this.host.cwd], command);
   }
 
   private tournamentTool(callerId: string) {
@@ -433,7 +465,7 @@ export class SearchManager {
         pruner: z.enum(['none', 'median', 'hyperband', 'successive_halving']).optional().describe('Poda de trials ruins no meio; exige que o script escreva em {progress}. Omitido: "none"'),
         backend: z.enum(['auto', 'optuna', 'builtin']).optional().describe('"auto" (padrão): Optuna se houver, senão o embutido; "optuna" falha sem ele; "builtin" força o embutido'),
         metrics_file: z.string().optional().describe('Caminho do JSON de métricas, se o script não aceitar {out}; aceita os mesmos placeholders. Sem {out} nem isto, o hub lê a última linha JSON do stdout'),
-        workdir: z.string().optional().describe('Pasta onde o comando roda, relativa ao projeto. Omitido: o projeto'),
+        workdir: z.string().optional().describe('Pasta onde o comando roda, relativa ao seu diretório ou absoluta. Omitido: o seu diretório (o worktree, se você tiver um; senão o projeto)'),
         timeout_minutes: z.number().positive().optional().describe('Tempo máximo por trial. Omitido: 30'),
         max_minutes: z.number().positive().optional().describe('Orçamento de tempo total; nenhum trial novo começa depois dele'),
         seed: z.number().int().optional(),
@@ -449,9 +481,14 @@ export class SearchManager {
         if (bad) {
           return fail(bad);
         }
-        const workdir = path.resolve(this.host.cwd, args.workdir ?? '.');
+        // Agente em worktree varre no worktree dele, onde está o script que ele escreveu.
+        const workdir = path.resolve(this.host.info?.(callerId)?.worktree?.cwd ?? this.host.cwd, args.workdir ?? '.');
         if (!fs.existsSync(workdir)) {
           return fail(`A pasta ${workdir} não existe.`);
+        }
+        const blocked = this.blockedFor(callerId, `${args.command_template} ${args.metrics_file ?? ''}`);
+        if (blocked) {
+          return fail(blocked);
         }
         let detection: Detection | undefined;
         let note = '';
@@ -469,16 +506,25 @@ export class SearchManager {
         }
         const python = detection?.ready;
         const approval = `${args.command_template}\n${workdir}`;
-        if (!this.approved.has(approval)) {
+        // Subagente com caminho protegido: o hub só conferiu o texto do comando, e o processo roda fora dos hooks
+        // dele. Cada varredura pede aprovação (nada fica lembrado) e a saída dos trials não volta ao agente.
+        const patterns = callerId === 'main' ? [] : protectedPatternsFor(this.host.cwd, this.host.info?.(callerId));
+        const guarded = patterns.length > 0;
+        if (guarded || !this.approved.has(approval)) {
+          const who = callerId === 'main' ? '' : `, pedida pelo agente ${callerId}`;
           const ok = await this.ask(
             'start_sweep',
-            { command_template: args.command_template, workdir, n_trials: args.n_trials, parallel: args.parallel ?? 1 },
-            `Varredura "${args.name}": o hub roda este comando ${args.n_trials} vez(es), ${args.parallel ?? 1} por vez, fora das restrições dos agentes. A aprovação vale para este comando até o fim desta conversa.`,
+            { command_template: args.command_template, workdir, n_trials: args.n_trials, parallel: args.parallel ?? 1, pedido_por: callerId },
+            guarded
+              ? `Varredura "${args.name}"${who}, que tem caminhos protegidos (${patterns.join(', ')}): o hub roda este comando ${args.n_trials} vez(es) FORA dos hooks do agente. O hub só conferiu que o texto do comando não cita esses caminhos; se o script os abrir por dentro, nada impede. Aprove só se conhece o script. Vale só para esta varredura, e a saída dos trials não volta ao agente.`
+              : `Varredura "${args.name}"${who}: o hub roda este comando ${args.n_trials} vez(es), até ${args.parallel ?? 1} por vez (e dentro do limite de processos pesados), fora das restrições dos agentes. A aprovação vale para este comando até o fim desta conversa.`,
           );
           if (!ok) {
             return fail('O usuário recusou a varredura.');
           }
-          this.approved.add(approval);
+          if (!guarded) {
+            this.approved.add(approval);
+          }
         }
         const id = this.nextId('sw');
         const objectives = [{ metric: args.metric.trim(), direction: args.direction }, ...(args.extra_objectives ?? []).map((o) => ({ metric: o.metric.trim(), direction: o.direction }))];
@@ -518,6 +564,7 @@ export class SearchManager {
             seed: args.seed ?? Math.floor(Math.random() * 2 ** 31),
             creator: callerId,
             reportTo,
+            hideOutput: guarded || undefined,
           },
           python,
           python
@@ -562,7 +609,8 @@ export class SearchManager {
         void sweep.run().then(() => this.finish(sweep.state, sweepReport(sweep.state, path.relative(this.host.cwd, dir) || dir)));
         return text(
           [
-            `Varredura ${id} iniciada: ${args.n_trials} trials, ${args.parallel ?? 1} por vez, ${python ? `Optuna ${python.optuna} (${python.source}), sampler ${sweep.state.spec.sampler}, estudo em ${path.join(dir, 'study.db')}` : 'amostrador embutido (TPE simples)'}. Trials viram runs da hipótese exploratória ${h.id}. O relatório final vai para ${reportTo === callerId ? 'você' : reportTo}.`,
+            `Varredura ${id} iniciada: ${args.n_trials} trials, ${args.parallel ?? 1} por vez, ${python ? `Optuna ${python.optuna} (${python.source}), sampler ${sweep.state.spec.sampler}, estudo em ${path.join(dir, 'study.db')}` : 'amostrador embutido (TPE simples)'}. Trials viram runs da hipótese exploratória ${h.id}. O relatório final vai para ${reportTo === callerId ? 'você' : reportTo}; siga com outra coisa ou encerre o turno, sem pilotar o Optuna à mão.`,
+            ...(python ? [`Python com optuna (compartilhado pela conversa): ${python.exe}. Use este mesmo caminho em scripts seus; não crie outro venv.`] : []),
             ...(note && !python ? ['', note] : []),
           ].join('\n'),
         );
@@ -579,13 +627,17 @@ export class SearchManager {
   private setupTool() {
     return tool(
       'setup_optuna',
-      'Cria o venv .agm/venv neste projeto e instala o optuna nele (pip), depois de o usuário aprovar. Não mexe no Python global. Sem argumentos: só informa o que achou.',
+      'Diz onde está o Python com optuna deste projeto (o venv .agm/venv é um só para todos os agentes). Com install: true, cria .agm/venv e instala o optuna nele (pip), depois de o usuário aprovar. Não mexe no Python global. Não crie venv próprio: use o caminho devolvido.',
       { install: z.boolean().optional().describe('true: pede aprovação e instala. Omitido: só detecta') },
       async (args) => {
         this.detection = undefined;
         const d = await this.detect();
         if (d.ready) {
-          return text(`Optuna ${d.ready.optuna} pronto em ${d.ready.source} (${d.ready.exe}, Python ${d.ready.version}).`);
+          return text(`Optuna ${d.ready.optuna} pronto em ${d.ready.source}, Python ${d.ready.version}: ${d.ready.exe}\nEste é o Python compartilhado da conversa: use este caminho nos seus comandos (start_sweep já usa) e não crie outro venv.`);
+        }
+        if (this.installing) {
+          const r = await this.installing;
+          return r.ok ? text(`Outro agente acabou de instalar: ${r.text}`) : fail(`A instalação em andamento, pedida por outro agente, falhou.\n${r.text}`);
         }
         if (!args.install || !d.base) {
           return text(missingOptunaText(d));
@@ -598,15 +650,21 @@ export class SearchManager {
         if (!ok) {
           return fail('O usuário recusou a instalação.');
         }
-        this.host.post({ type: 'notice', level: 'info', text: 'Instalando o optuna em .agm/venv...' });
-        const r = await installOptuna(d.base, this.host.cwd, () => undefined);
-        this.detection = undefined;
-        const after = await this.detect();
-        if (!r.ok || !after.ready) {
-          return fail(`A instalação falhou.\n${r.output}`);
-        }
-        this.host.post({ type: 'notice', level: 'info', text: `Optuna ${after.ready.optuna} instalado em .agm/venv.` });
-        return text(`Optuna ${after.ready.optuna} instalado em .agm/venv (Python ${after.ready.version}). As próximas varreduras usam ele.`);
+        // Um pip por vez: dois agentes instalando no mesmo venv corrompem o site-packages.
+        const base = d.base;
+        this.installing ??= (async () => {
+          this.host.post({ type: 'notice', level: 'info', text: 'Instalando o optuna em .agm/venv...' });
+          const r = await installOptuna(base, this.host.cwd, () => undefined);
+          this.detection = undefined;
+          const after = await this.detect();
+          if (!r.ok || !after.ready) {
+            return { ok: false, text: r.output };
+          }
+          this.host.post({ type: 'notice', level: 'info', text: `Optuna ${after.ready.optuna} instalado em .agm/venv.` });
+          return { ok: true, text: `Optuna ${after.ready.optuna} instalado em .agm/venv (Python ${after.ready.version}): ${after.ready.exe}\nAs próximas varreduras usam ele. Use este caminho nos seus comandos e passe-o aos outros agentes; ninguém cria outro venv.` };
+        })().finally(() => (this.installing = undefined));
+        const r = await this.installing;
+        return r.ok ? text(r.text) : fail(`A instalação falhou.\n${r.text}`);
       },
       { alwaysLoad: true },
     );
@@ -636,15 +694,19 @@ export class SearchManager {
     );
   }
 
-  private stopTool() {
+  /** Com `owner`, só para as buscas que esse agente criou. */
+  private stopTool(owner?: string) {
     return tool(
       'stop_search',
-      'Interrompe um torneio ou uma varredura. O que já rodou fica, e o relatório parcial vai para o destino.',
+      owner ? 'Interrompe uma varredura que você criou. O que já rodou fica, e o relatório parcial vai para o destino.' : 'Interrompe um torneio ou uma varredura. O que já rodou fica, e o relatório parcial vai para o destino.',
       { id: z.string() },
       async (args) => {
         const e = this.entries.get(args.id.trim());
         if (!e) {
           return fail(`"${args.id}" não existe.`);
+        }
+        if (owner && e.info.creator !== owner) {
+          return fail(`${args.id} foi criada por ${e.info.creator}; só quem criou (ou o orquestrador) para.`);
         }
         e.runner.stop();
         return text(`${args.id} interrompido. O relatório parcial vai para ${e.info.reportTo}.`);

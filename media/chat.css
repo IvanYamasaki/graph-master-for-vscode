@@ -569,6 +569,11 @@ pre.code.add {
   background: var(--err);
 }
 
+/* Âmbar claro, sem pulso: turno encerrado com processo, subagentes ou resposta pendente. */
+.dot.waiting {
+  background: #e6c86e;
+}
+
 @keyframes pulse {
   50% {
     opacity: 0.35;

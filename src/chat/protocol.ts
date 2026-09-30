@@ -81,7 +81,32 @@ export interface UsageInfo {
   error?: string;
 }
 
-export type AgentStatus = 'running' | 'completed' | 'failed' | 'stopped';
+/**
+ * `waiting`: o turno acabou mas há trabalho pendente (processo em segundo plano, subagentes que ainda vão
+ * reportar, ou uma pergunta feita a outro agente). O relatório final só sai quando nada mais falta.
+ */
+export type AgentStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'stopped';
+
+/** Por que um agente está "aguardando". */
+export type PendingReason = 'background' | 'children' | 'question';
+
+/**
+ * O que falta para o agente poder entregar o relatório final. O hub recalcula a cada fim de turno e a cada
+ * mudança nos filhos; some quando o agente conclui.
+ */
+export interface PendingInfo {
+  reasons: PendingReason[];
+  /** Tarefas em segundo plano abertas na sessão (Bash run_in_background, subagente em background). */
+  background?: { id: string; description: string }[];
+  /** Ids dos agentes que ainda vão reportar a este. */
+  children?: string[];
+  /** A quem este agente perguntou (send_to_agent) e ainda espera resposta. */
+  asked?: string[];
+  /** ISO de quando começou a aguardar. */
+  since: string;
+  /** Texto do turno segurado (o que o agente escreveu ao fechar o turno com pendência), curto. */
+  note?: string;
+}
 
 /**
  * Worktree git de um agente isolado. A extensão cria (git worktree add) e sabe o caminho e a branch,
@@ -138,6 +163,8 @@ export const STATUS_RING = {
   running: '#3fb950',
   /** Parado ou falhou. */
   halted: '#f85149',
+  /** Âmbar claro, sem pulso: o turno acabou e o agente espera processo, filhos ou resposta. Não é o âmbar forte do "preso". */
+  waiting: '#e6c86e',
 } as const;
 
 export function agentColor(name: string | undefined, fallbackSeed: string): string {
@@ -217,8 +244,21 @@ export interface AgentInfo {
   spent?: AgentSpent;
   /** Caminhos que este agente não lê nem grava (além dos do projeto em .agm/protected.json). */
   protectedPaths?: string[];
+  /** Globs relativos ao projeto que o agente reivindica (spawn_agent owns): outro agente que editar recebe aviso. */
+  owns?: string[];
+  /** Sobe com os servidores MCP de usuário e os conectores do claude.ai (spawn_agent com user_mcp). Padrão: só o servidor agents e o .mcp.json aprovado. */
+  userMcp?: boolean;
   /** Marcado pelo detector de agente preso. Some quando o agente volta a progredir ou o turno acaba. */
   stuck?: { reason: string; since: string };
+  /** Status "waiting": o que falta antes do relatório final. Ausente nos outros status. */
+  pending?: PendingInfo;
+  /**
+   * Última nota de progresso (report_progress, ou o texto de um turno segurado). Não é relatório. `stale`: o agente
+   * concluiu, falhou ou parou depois dela, e o mapa e o list_agents a mostram como antiga.
+   */
+  progress?: { text: string; at: string; stale?: boolean };
+  /** Parou por limite de uso do fornecedor (429, janela da assinatura). `until` é a hora de reset quando conhecida. Não vai para o disco. */
+  limit?: { until?: string; text: string };
   /** Tentativa de um grupo Best-of-N (spawn_attempts). Todas do grupo têm a mesma cor e o mesmo `group`. */
   attempt?: AttemptInfo;
   /** Verificador independente de uma hipótese do laboratório: só lê e reexecuta com seed nova. */
@@ -250,6 +290,12 @@ export interface BoxInfo {
   color?: string;
   /** Caixa-mãe (sem mãe ela mesma). */
   parent?: string;
+  /** Orçamento da caixa (create_box com budget): soma do gasto dos agentes dela e das caixas-filhas. */
+  budget?: AgentBudget;
+  /** Quem criou (main ou id de agente). Só ele e o main mudam o orçamento e tiram agentes da caixa. */
+  createdBy?: string;
+  /** Parada pelo usuário quando o orçamento esgotou: nenhum agente novo entra até ele reabrir. Persistida, para valer depois do restore. */
+  closed?: boolean;
   /** ISO. */
   createdAt: string;
 }
@@ -386,6 +432,35 @@ export function lastCheckLabel(a: AgentInfo): string {
 }
 
 export const EFFORT_LEVELS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** Rótulo de cada status como o mapa, o popup e a lista mostram. */
+export const STATUS_LABEL: Record<AgentStatus, string> = {
+  running: 'trabalhando',
+  waiting: 'aguardando',
+  completed: 'concluído',
+  failed: 'falhou',
+  stopped: 'parado',
+};
+
+/** "aguardando processo em segundo plano", "aguardando 2 subagentes (a3, a4)"... a partir do `pending` do agente. */
+export function pendingText(a: Pick<AgentInfo, 'pending'>): string {
+  const p = a.pending;
+  if (!p) {
+    return '';
+  }
+  const parts: string[] = [];
+  const bg = p.background?.length ?? 0;
+  if (bg) {
+    parts.push(bg === 1 ? 'processo em segundo plano' : `${bg} processos em segundo plano`);
+  }
+  if (p.children?.length) {
+    parts.push(`${p.children.length} ${p.children.length === 1 ? 'subagente' : 'subagentes'} (${p.children.join(', ')})`);
+  }
+  if (p.asked?.length) {
+    parts.push(`resposta de ${p.asked.join(', ')}`);
+  }
+  return parts.length ? `aguardando ${parts.join(', ')}` : 'aguardando';
+}
 
 export type HostMessage =
   | {

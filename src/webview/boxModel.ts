@@ -9,6 +9,8 @@
  * - Caixa filha cuja mãe sumiu sobe para o primeiro nível.
  * - Mais de LOOSE_LIMIT avulsos viram uma caixa neutra, "Avulsos" (id LOOSE_BOX), só visual.
  */
+import { codexNote, spendLines, sumSpent } from '../chat/costs';
+import { budgetFraction, hasBudget } from '../chat/guard/format';
 import { agentColor, type AgentInfo, type BoxInfo } from '../chat/protocol';
 
 export const LOOSE_BOX = '__avulsos';
@@ -168,6 +170,8 @@ export function groupAgents(agents: AgentInfo[], boxes: BoxInfo[]): Grouping {
 export interface BoxStats {
   n: number;
   running: number;
+  /** Turno encerrado com trabalho pendente (processo, filhos, resposta). */
+  waiting: number;
   done: number;
   halted: number;
   failed: number;
@@ -180,6 +184,7 @@ export function boxStats(all: AgentInfo[]): BoxStats {
   return {
     n: all.length,
     running: all.filter((a) => a.status === 'running').length,
+    waiting: all.filter((a) => a.status === 'waiting').length,
     done: all.filter((a) => a.status === 'completed').length,
     halted: all.filter((a) => a.status === 'failed' || a.status === 'stopped').length,
     failed: all.filter((a) => a.status === 'failed').length,
@@ -194,6 +199,9 @@ export function boxCountText(s: BoxStats): string {
   if (s.running) {
     parts.push(`${s.running} rodando`);
   }
+  if (s.waiting) {
+    parts.push(`${s.waiting} aguardando`);
+  }
   if (s.failed) {
     parts.push(`${s.failed} ${s.failed === 1 ? 'falhou' : 'falharam'}`);
   }
@@ -201,9 +209,26 @@ export function boxCountText(s: BoxStats): string {
 }
 
 /**
+ * Gasto somado da caixa (agentes dela e das filhas) contra os tetos do create_box. `frac` só existe com teto;
+ * `text` vem sempre, com o teto de cada medida quando ele existe.
+ */
+export function boxSpend(g: Pick<BoxGroup, 'all' | 'box'>): { text: string; frac?: number; usd?: number } {
+  const spent = sumSpent(g.all.map((a) => a.spent));
+  const budget = g.box?.budget;
+  const lines = spendLines(budget, spent);
+  const note = codexNote(g.all.map((a) => a.provider), spent.usd !== undefined);
+  return { text: `${lines.join(' · ')}${note}`, frac: hasBudget(budget) ? budgetFraction(budget, spent) : undefined, usd: spent.usd };
+}
+
+/** "gasto (40% do orçamento): 1,2M tokens processados · ..." para a dica do nó e da moldura. */
+export function spendDetail(spend: { text: string; frac?: number }): string {
+  return `gasto${spend.frac !== undefined ? ` (${Math.round(spend.frac * 100)}% do orçamento)` : ''}: ${spend.text}`;
+}
+
+/**
  * Sem a escolha do usuário, a caixa começa recolhida quando todos terminaram. Fica aberta se alguém roda,
  * falhou, está preso ou tem decisão pendente.
  */
 export function autoCollapsed(all: AgentInfo[], attention: (id: string) => boolean): boolean {
-  return !all.some((a) => a.status === 'running' || a.status === 'failed' || !!a.stuck || attention(a.id));
+  return !all.some((a) => a.status === 'running' || a.status === 'waiting' || a.status === 'failed' || !!a.stuck || attention(a.id));
 }

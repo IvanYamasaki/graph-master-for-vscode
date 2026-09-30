@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
 import type { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 import type { Profile } from '../profiles';
-import type { AgentRecord } from './session';
+import type { AgentRecord, TurnEndInfo } from './session';
 import { codexEnv } from '../codex';
 import { resolveCodexExecutable } from '../codexPath';
 import { CodexRpc, unsupported } from './codexRpc';
@@ -42,6 +42,8 @@ export interface CodexSessionOptions {
   disallowedTools?: string[];
   /** Ignorado: os servidores MCP embutidos do SDK do Claude vivem no processo da extensão e o Codex não os alcança. */
   mcpServers?: unknown;
+  /** Variáveis somadas ao ambiente do app-server, calculadas a cada início (limite de threads quando há agentes em paralelo). */
+  env?: () => Record<string, string>;
 }
 
 type ApprovalPolicy = 'untrusted' | 'on-request' | 'never';
@@ -184,7 +186,7 @@ export class CodexSession {
   /** A ferramenta Agent do Claude não existe no Codex; o mapa fica vazio, mas o painel e o hub o consultam. */
   readonly agents = new Map<string, AgentRecord>();
   lastTurnText = '';
-  onTurnEnd?: (info: { contextTokens: number; isError: boolean; queued: number; durationMs: number }) => void;
+  onTurnEnd?: (info: TurnEndInfo) => void;
   onBusyChange?: (busy: boolean) => void;
   /** Consumo para o orçamento: tokens novos desde o último evento de uso. O Codex não informa custo. */
   onUsage?: (u: { tokens?: number }) => void;
@@ -438,7 +440,7 @@ export class CodexSession {
       });
       return undefined;
     }
-    const rpc: CodexRpc = new CodexRpc(exe, codexEnv(this.profile), this.cwd, {
+    const rpc: CodexRpc = new CodexRpc(exe, { ...codexEnv(this.profile), ...(this.options.env?.() ?? {}) }, this.cwd, {
       notification: (method, params) => {
         if (gen === this.generation) {
           this.onNotification(method, params);

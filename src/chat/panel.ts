@@ -199,11 +199,25 @@ export class ChatPanel {
       }
     });
 
+    // Início e fim de turno da conversa principal: o hub decide se o texto é a resposta a quem perguntou ao main.
+    this.session.onBusyChange = (busy) => {
+      if (busy) {
+        this.hub.noteMainTurnStart();
+      }
+    };
+    this.session.onTurnEnd = (turn) => this.hub.onMainTurnEnd(this.session.lastTurnText, turn.queued);
     if (options.fork) {
       const { parent, forkId } = options.fork;
-      this.session.onBusyChange = (busy) => parent.updateFork(forkId, { status: busy ? 'running' : 'completed' });
-      this.session.onTurnEnd = ({ contextTokens, isError }) =>
-        parent.updateFork(forkId, { totalTokens: contextTokens, status: isError ? 'failed' : 'completed', model: this.session.model || undefined });
+      const ownBusy = this.session.onBusyChange;
+      this.session.onBusyChange = (busy) => {
+        ownBusy?.(busy);
+        parent.updateFork(forkId, { status: busy ? 'running' : 'completed' });
+      };
+      const own = this.session.onTurnEnd;
+      this.session.onTurnEnd = (turn) => {
+        own?.(turn);
+        parent.updateFork(forkId, { totalTokens: turn.contextTokens, status: turn.isError ? 'failed' : 'completed', model: this.session.model || undefined });
+      };
     }
   }
 
@@ -619,13 +633,17 @@ export class ChatPanel {
       fork: { parent: this, forkId, description: record.info.description },
       seed: { display: msg.text, prompt: buildSeed(record, msg.text) },
     });
-    child.session.onTurnEnd = ({ contextTokens, isError }) =>
+    // Encadeia com o que o chat filho já ligou (o hub dele e o fork), em vez de substituir.
+    const own = child.session.onTurnEnd;
+    child.session.onTurnEnd = (turn) => {
+      own?.(turn);
       this.updateFork(forkId, {
-        totalTokens: contextTokens,
+        totalTokens: turn.contextTokens,
         durationMs: Date.now() - started,
-        status: isError ? 'failed' : 'completed',
+        status: turn.isError ? 'failed' : 'completed',
         model: child.session.model || undefined,
       });
+    };
   }
 
   /** Continuar uma continuação: o registro vem do chat filho. */

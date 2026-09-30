@@ -53,6 +53,18 @@ export class BrainKeeper {
     return digest ? `${digest}\n\n---\n\n${text}` : text;
   }
 
+  /**
+   * Aviso para agente que já estava rodando quando o cérebro ligou (o prompt de sistema dele foi congelado sem o guia):
+   * o guia do cérebro mais o resumo de entrada. O hub entrega em `onActivate` (uma vez por agente, sem abrir turno).
+   */
+  lateNotice(info: AgentInfo): string {
+    return [
+      'O cérebro compartilhado do projeto (.agm/brain/) foi ligado agora, depois que você começou. As ferramentas brain_read, brain_search, brain_fact, brain_write e brain_edit já estão disponíveis. Aviso do host, sem tarefa nova: siga no seu trabalho e use o cérebro como abaixo.',
+      '',
+      ...this.brain.guide(false, { boxId: info.box, task: info.prompt ?? info.description }),
+    ].join('\n');
+  }
+
   /** O cérebro existe (ou vai existir assim que a primeira escrita da fila terminar). */
   get isActive(): boolean {
     return this.active || this.brain.store.exists();

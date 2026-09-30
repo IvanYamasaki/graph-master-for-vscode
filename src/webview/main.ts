@@ -1,12 +1,12 @@
 import { Marked } from 'marked';
 import { createAgentGraph } from './graph';
-import { boxStats, boxCountText, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
+import { boxSpend, boxStats, boxCountText, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
 import { createNodePopup } from './nodePopup';
 import { createLabCards } from './labCards';
 import { createLabView } from './labTree';
 import { createGuardCards } from './guardCards';
 import { STUCK_RING } from './guardUi';
-import { COMPANION_MARK, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
+import { COMPANION_MARK, STATUS_LABEL, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, pendingText, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
 import { COMPANION_ICON, COMPANION_OPEN_TITLE, createCompanionUi } from './companionUi';
 import type { CompanionInit } from '../chat/companion/types';
 import { describeBrowserAction, isBrowserTool } from '../chat/browser';
@@ -1648,18 +1648,20 @@ function renderAgents(): void {
 function renderAgentsPill(): void {
   const list = [...agents.values()];
   const running = list.filter((a) => a.status === 'running').length;
+  const waiting = list.filter((a) => a.status === 'waiting').length;
   agentsPill.classList.toggle('hidden', !list.length);
   if (!list.length) {
     return;
   }
-  const tone = running ? 'running' : list.some((a) => a.status === 'failed') ? 'failed' : 'completed';
+  const tone = running ? 'running' : waiting ? 'waiting' : list.some((a) => a.status === 'failed') ? 'failed' : 'completed';
+  const waitText = waiting ? ` · ${waiting} aguardando` : '';
   fill(
     agentsPill,
     h('span', { class: `dot ${tone}` }),
-    h('span', {}, running ? `${running} de ${list.length} trabalhando` : `${list.length} ${list.length === 1 ? 'agente' : 'agentes'}`),
+    h('span', {}, running ? `${running} de ${list.length} trabalhando${waitText}` : waiting ? `${waiting} de ${list.length} aguardando` : `${list.length} ${list.length === 1 ? 'agente' : 'agentes'}`),
   );
-  agentsPill.title = running
-    ? `${running} de ${list.length} ainda trabalhando. Clique para abrir o mapa de agentes.`
+  agentsPill.title = running || waiting
+    ? `${running} de ${list.length} ainda trabalhando${waiting ? `, ${waiting} aguardando processo, subagentes ou resposta` : ''}. Clique para abrir o mapa de agentes.`
     : `${list.length} ${list.length === 1 ? 'agente' : 'agentes'} nesta conversa. Clique para abrir o mapa.`;
 }
 
@@ -1711,8 +1713,8 @@ let ticker: number | undefined;
  * vermelho contínuo quando parou ou falhou, sem anel quando terminou bem.
  */
 function agentDot(a: AgentInfo): HTMLSpanElement {
-  // Âmbar quando o guarda acha que o agente está preso: o mesmo anel do nó no grafo.
-  const ring = a.status === 'running' ? (a.stuck ? STUCK_RING : STATUS_RING.running) : a.status === 'failed' || a.status === 'stopped' ? STATUS_RING.halted : '';
+  // Âmbar forte quando o guarda acha que o agente está preso; âmbar claro quando ele aguarda: os mesmos anéis do nó no grafo.
+  const ring = a.status === 'running' ? (a.stuck ? STUCK_RING : STATUS_RING.running) : a.status === 'waiting' ? STATUS_RING.waiting : a.status === 'failed' || a.status === 'stopped' ? STATUS_RING.halted : '';
   const el = h('span', { class: `agdot${ring ? ' ring' : ''}${a.status === 'running' ? ' live' : ''}`, 'aria-hidden': 'true' });
   el.style.setProperty('--agm-color', agentColor(a.color, a.id));
   if (ring) {
@@ -2782,6 +2784,7 @@ const popup = createNodePopup({
       collapsed: graph.isBoxCollapsed(boxId),
       parentName: g.parent ? grouping.groups.get(g.parent)?.name : undefined,
       childNames: g.children.map((c) => grouping.groups.get(c)?.name ?? c),
+      spend: boxSpend(g),
     };
   },
   toggleBox: (boxId) => graph.toggleBox(boxId),
@@ -2940,6 +2943,10 @@ const NO_SESSION_HINT = 'A conversa deste agente não foi salva em disco, então
 function resumeButton(a: AgentInfo, cls: string): HTMLElement | null {
   // Vigia parado (pelo usuário ou porque a janela fechou) volta a verificar pelo mesmo botão.
   const watcherOff = !!a.repeatEveryMinutes && !watching(a);
+  // Parado por limite de uso do fornecedor: o botão pede para continuar de onde parou.
+  if (a.limit && !a.restored && a.status === 'failed') {
+    return h('button', { class: cls, title: 'Pede ao agente para continuar de onde parou. Faça isso depois que o limite de uso liberar.', onclick: () => send({ type: 'resumeAgent', id: a.id }) }, 'Tentar de novo');
+  }
   if (!a.restored && !watcherOff) {
     return null;
   }
@@ -2954,7 +2961,7 @@ function resumeButton(a: AgentInfo, cls: string): HTMLElement | null {
 }
 
 function statusLabel(s: AgentInfo['status']): string {
-  return { running: 'trabalhando', completed: 'concluído', failed: 'falhou', stopped: 'parado' }[s];
+  return STATUS_LABEL[s];
 }
 
 function agentMeta(a: AgentInfo): string {
@@ -3158,6 +3165,7 @@ function paintCardActivity(id: string): void {
 
 const GROUPS: { title: string; match: AgentInfo['status'][] }[] = [
   { title: 'Trabalhando', match: ['running'] },
+  { title: 'Aguardando', match: ['waiting'] },
   { title: 'Concluídos', match: ['completed'] },
   { title: 'Falhou ou parado', match: ['failed', 'stopped'] },
 ];

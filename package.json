@@ -337,6 +337,12 @@
           "minimum": 5,
           "description": "Janela, em segundos, em que as escritas no cérebro compartilhado se juntam num resumo só por destinatário."
         },
+        "agentGraphMaster.brain.mainNotifyWindowSeconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 5,
+          "description": "Janela, em segundos, do resumo de novidades do cérebro para o chat principal (orquestrador). Ele recebe um resumo por frente; decisões e armadilhas saem na hora."
+        },
         "agentGraphMaster.brain.graphStaleDays": {
           "type": "number",
           "default": 14,
@@ -399,6 +405,23 @@
           "minimum": 1,
           "maximum": 8,
           "description": "Quantas execuções o run_seeds roda ao mesmo tempo. Em GPU única, deixe 1."
+        },
+        "agentGraphMaster.maxHeavyProcesses": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 64,
+          "description": "Quantos processos pesados lançados pelo hub rodam ao mesmo tempo, somando todos os agentes e conversas desta janela: seeds do run_seeds, trials de varredura, avaliação oficial e cofre. 0: metade dos núcleos da máquina. Com mais de um rodando, o hub põe OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, NUMEXPR_NUM_THREADS e VECLIB_MAXIMUM_THREADS = 1 nos processos novos que não definem esses valores."
+        },
+        "agentGraphMaster.subagentUserMcp": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Agentes roteados sobem com os servidores MCP de usuário e os conectores do claude.ai da conta (Slack, Drive, Notion...). Desligado (padrão), cada agente recebe só o servidor `agents` e o `.mcp.json` aprovado do projeto: milhares de tokens de schema e dezenas de processos a menos. Vigias sempre herdam os conectores, e `spawn_agent` com `user_mcp: true` liga para um agente específico."
+        },
+        "agentGraphMaster.limitThreadsWhenParallel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Quando já há outro agente roteado rodando, a sessão de cada agente novo sobe com OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, NUMEXPR_NUM_THREADS e VECLIB_MAXIMUM_THREADS = 1, para dois processos numéricos não disputarem todos os núcleos. Variável que você já definiu no ambiente não é sobrescrita."
         },
         "agentGraphMaster.autoVerify": {
           "type": "boolean",

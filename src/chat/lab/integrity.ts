@@ -28,7 +28,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { Hypothesis, LabStore, Verdict } from './store';
+import { isSingleEval, type Hypothesis, type LabStore, type Verdict } from './store';
 
 export interface HypothesisContext {
   hypothesisId: string;
@@ -109,7 +109,8 @@ export class LabIntegrity {
 
   /** Hipóteses confirmatórias da família de `h` (inclui `h`), na ordem do quadro, e um rótulo para o veredito. */
   family(h: Hypothesis): { members: Hypothesis[]; label: string } {
-    const all = this.store.hypotheses().filter((o) => !o.sweepId);
+    // Avaliação única (cofre) não tem p: entraria no BH com p = 1 e só apertaria as outras.
+    const all = this.store.hypotheses().filter((o) => !o.sweepId && !isSingleEval(o));
     if (!all.some((o) => o.id === h.id)) {
       all.push(h);
     }
@@ -166,7 +167,7 @@ export class LabIntegrity {
 
   /** Todos os avisos do quadro inteiro; `only` filtra os que tocam essas hipóteses. */
   warnings(only?: ReadonlySet<string>): IntegrityWarning[] {
-    const hyps = this.store.hypotheses().filter((h) => !h.sweepId);
+    const hyps = this.store.hypotheses().filter((h) => !h.sweepId && !isSingleEval(h));
     const verdicts = this.store.verdicts();
     const ctx = this.contexts();
     const out = [...this.metricSwitches(hyps, verdicts, ctx), ...this.manyTests(hyps, verdicts, ctx), ...this.optionalStops(hyps, verdicts)];
