@@ -10,11 +10,11 @@
  * O componente é autossuficiente: cria o próprio SVG por script, injeta o próprio <style>
  * com prefixo `agm-graph-` e não depende de nada do main.ts nem do chat.css.
  */
-import { agentColor, STATUS_RING, watchLabel, repeatLabel, onOtherAccount, shortAccountName, type AgentInfo, type BoxInfo } from '../chat/protocol';
-import { autoCollapsed, boxCountText, boxStats, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
+import { agentColor, isWorking, STATUS_LABEL, STATUS_RING, pendingText, watchLabel, repeatLabel, onOtherAccount, shortAccountName, type AgentInfo, type BoxInfo } from '../chat/protocol';
+import { autoCollapsed, boxCountText, boxSpend, boxStats, spendDetail, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
 import { markGraphNode } from './worktreeUi';
 import { markAttemptNode } from './parallelUi';
-import { markGuardNode, type GraphMeter } from './guardUi';
+import { budgetMeter, markGuardNode, type GraphMeter } from './guardUi';
 import { markInfraNode } from './infraUi';
 import { markSynthNode } from './synthUi';
 
@@ -138,6 +138,8 @@ const MAX_DOTS = 14;
 const GLYPH_CHEV_RIGHT = '\ueab6';
 const GLYPH_CHEV_DOWN = '\ueab4';
 const GLYPH_BRANCH = '\uec6f';
+/** Relógio (codicon-clock): agente aguardando processo, filhos ou resposta. */
+const GLYPH_CLOCK = '\uea82';
 /**
  * Espaço entre a borda do nó e o anel de estado. Precisa ser folgado: com `rosa` ou `terracota`
  * na frente do anel vermelho, duas faixas coladas viram uma mancha só.
@@ -390,13 +392,6 @@ function fmtDuration(ms: number): string {
   return m < 60 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-const STATUS_LABEL: Record<AgentInfo['status'], string> = {
-  running: 'trabalhando',
-  completed: 'concluído',
-  failed: 'falhou',
-  stopped: 'parado',
-};
-
 const KIND_LABEL: Record<AgentInfo['kind'], string> = {
   subagent: 'subagente',
   routed: 'agente',
@@ -434,10 +429,16 @@ function prettyModel(id: string): string {
   return `${family.charAt(0).toUpperCase()}${family.slice(1)}${version ? ` ${version}` : ''}${long ? ` (${long[1]}M)` : ''}`;
 }
 
-/** Anel de estado: verde pulsando enquanto trabalha, vermelho parado quando parou ou falhou. */
+/**
+ * Anel de estado: verde pulsando enquanto trabalha, âmbar claro parado enquanto aguarda (processo, filhos ou
+ * resposta; não é o âmbar forte do "possivelmente preso"), vermelho parado quando parou ou falhou.
+ */
 function ringFor(status: AgentInfo['status']): { color: string; pulse: boolean } | undefined {
   if (status === 'running') {
     return { color: STATUS_RING.running, pulse: true };
+  }
+  if (status === 'waiting') {
+    return { color: STATUS_RING.waiting, pulse: false };
   }
   if (status === 'failed' || status === 'stopped') {
     return { color: STATUS_RING.halted, pulse: false };
@@ -620,13 +621,15 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
   }
 
   const nodes: NodeModel[] = [];
-  const running = agents.filter((a) => a.status === 'running').length;
+  const running = agents.filter(isWorking).length;
+  const waiting = agents.filter((a) => a.status === 'waiting').length;
+  const waitingText = waiting ? ` · ${waiting} aguardando` : '';
   nodes.push({
     id: 'main',
     kind: 'root',
     title: wrapTitle(rootLabel, TITLE_CHARS, TITLE_LINES),
-    sub: agents.length ? `${agents.length} ${agents.length === 1 ? 'agente' : 'agentes'} · ${running} rodando` : 'sem agentes',
-    detail: `${rootLabel}\nraiz da árvore de agentes\n${agents.length} agente(s), ${running} rodando`,
+    sub: agents.length ? `${agents.length} ${agents.length === 1 ? 'agente' : 'agentes'} · ${running} rodando${waitingText}` : 'sem agentes',
+    detail: `${rootLabel}\nraiz da árvore de agentes\n${agents.length} agente(s), ${running} rodando${waitingText}`,
     aria: `${rootLabel}, raiz, ${agents.length} agentes`,
     color: NEUTRAL,
     text: NEUTRAL,
@@ -650,7 +653,7 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
       `tipo: ${KIND_LABEL[a.kind]}${a.subagentType ? ` (${a.subagentType})` : ''}`,
       `criado por: ${whoLabel(parent, rootLabel)}`,
       `entrega para: ${whoLabel(a.reportedTo ?? a.reportTo, rootLabel)}`,
-      `status: ${STATUS_LABEL[a.status]}`,
+      `status: ${STATUS_LABEL[a.status]}${a.status === 'waiting' && a.pending ? ` (${pendingText(a).replace(/^aguardando /, '')})` : ''}`,
       `tempo: ${a.durationMs ? fmtDuration(a.durationMs) : '—'}`,
       `tokens: ${fmtTokens(a.totalTokens)}`,
       `modelo: ${a.model ? prettyModel(a.model) : '—'}`,
@@ -671,13 +674,15 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
         ? truncate(a.search.progress, 30)
         : watch
         ? truncate(`${codex ? 'Codex · ' : acct}↻ ${watch.replace(/^a cada /, '')}`, 30)
-        : codex
-          ? truncate(`Codex · ${STATUS_LABEL[a.status]} · ${fmtTokens(a.totalTokens)}`, 30)
-          : acct
-            ? truncate(`${acct}${STATUS_LABEL[a.status]} · ${fmtTokens(a.totalTokens)}`, 30)
-            : truncate(`${STATUS_LABEL[a.status]} · ${fmtTokens(a.totalTokens)} tokens`, 30),
+        : a.status === 'waiting'
+          ? truncate(`${codex ? 'Codex · ' : acct}${pendingText(a) || 'aguardando'}`, 30)
+          : codex
+            ? truncate(`Codex · ${STATUS_LABEL[a.status]} · ${fmtTokens(a.totalTokens)}`, 30)
+            : acct
+              ? truncate(`${acct}${STATUS_LABEL[a.status]} · ${fmtTokens(a.totalTokens)}`, 30)
+              : truncate(`${STATUS_LABEL[a.status]} · ${fmtTokens(a.totalTokens)} tokens`, 30),
       detail: `${a.repeatEveryMinutes ? `${detail}\nvigia: ${repeatLabel(a.repeatEveryMinutes)}${a.checks ? `, ${a.checks} verificações` : ''}` : detail}${a.browserActive ? '\ncom o navegador (Claude in Chrome)' : ''}`,
-      aria: `${name}. ${STATUS_LABEL[a.status]}, ${fmtTokens(a.totalTokens)} tokens, criado por ${whoLabel(parent, rootLabel)}, entrega para ${whoLabel(
+      aria: `${name}. ${a.status === 'waiting' ? pendingText(a) || 'aguardando' : STATUS_LABEL[a.status]}, ${fmtTokens(a.totalTokens)} tokens, criado por ${whoLabel(parent, rootLabel)}, entrega para ${whoLabel(
         a.reportedTo ?? a.reportTo,
         rootLabel,
       )}`,
@@ -707,6 +712,10 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
     const groupDone = a.attempt ? agents.filter((x) => x.attempt?.group === a.attempt!.group && x.status !== 'running').length : undefined;
     const last = nodes[nodes.length - 1];
     markSynthNode(last, a, Date.now(), 30, groupDone);
+    // Aguardando: relógio antes do título, para não confundir com o âmbar forte do "preso" nem com o verde de rodando.
+    if (a.status === 'waiting' && !last.icon) {
+      last.icon = GLYPH_CLOCK;
+    }
     if (last.icon) {
       last.title = wrapTitle(name, TITLE_CHARS - 3, TITLE_LINES);
     }
@@ -765,7 +774,7 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
     // O relatório existe ou foi marcado como entregue: a entrega aconteceu, mesmo que o agente
     // tenha voltado a rodar depois (recebeu outra mensagem).
     const done = !!a.reportedTo || !!a.report?.trim();
-    const state: DeliverState = a.status === 'running' ? 'pending' : done ? 'done' : 'dim';
+    const state: DeliverState = a.status === 'running' || a.status === 'waiting' ? 'pending' : done ? 'done' : 'dim';
     const who = whoLabel(dest, rootLabel);
     edges.push({
       id: `deliver:${a.id}>${dest}`,
@@ -871,20 +880,23 @@ function withBoxes(model: Model, agents: AgentInfo[], grouping: Grouping, collap
       continue;
     }
     const st = boxStats(g.all);
-    const ring = st.running ? { color: STATUS_RING.running, pulse: true } : st.failed ? { color: STATUS_RING.halted, pulse: false } : undefined;
+    const ring = st.running ? { color: STATUS_RING.running, pulse: true } : st.waiting ? { color: STATUS_RING.waiting, pulse: false } : st.failed ? { color: STATUS_RING.halted, pulse: false } : undefined;
     const count = boxCountText(st);
+    const spend = boxSpend(g);
     summaries.push({
       id: BOX_NODE + g.id,
       kind: 'box',
       title: wrapTitle(g.name, TITLE_CHARS, TITLE_LINES),
       sub: truncate(`${count}${st.running ? '' : ` · ${fmtTokens(st.tokens)} tokens`}`, 34),
-      detail: [g.name, g.description ?? '', `caixa recolhida: ${count}`, `${fmtTokens(st.tokens)} tokens somados`, 'clique no título para expandir; no resto, para ver a caixa'].filter(Boolean).join('\n'),
+      detail: [g.name, g.description ?? '', `caixa recolhida: ${count}`, `${fmtTokens(st.tokens)} tokens somados`, spendDetail(spend), 'clique no título para expandir; no resto, para ver a caixa'].filter(Boolean).join('\n'),
+      meter: spend.frac !== undefined ? budgetMeter(spend.frac) : undefined,
       aria: `Caixa ${g.name}, recolhida, ${count}`,
       color: g.color,
       text: NEUTRAL,
       ring,
       running: st.running > 0,
       quiet: false,
+      icon: !st.running && st.waiting ? GLYPH_CLOCK : undefined,
       dots: g.all.slice(0, MAX_DOTS).map((a) => ({ color: agentColor(a.color, a.id), ring: ringFor(a.status)?.color })),
       moreDots: Math.max(0, g.all.length - MAX_DOTS),
       branch: st.worktrees > 0,
@@ -907,7 +919,7 @@ function withBoxes(model: Model, agents: AgentInfo[], grouping: Grouping, collap
         continue;
       }
       const count = boxCountText(boxStats(g.all));
-      model.frames.push({ id, name: g.name, color: g.color, count, detail: [g.name, g.description ?? '', count].filter(Boolean).join('\n'), depth: g.parent ? 1 : 0, x: 0, y: 0, w: 0, h: 0 });
+      model.frames.push({ id, name: g.name, color: g.color, count, detail: [g.name, g.description ?? '', count, spendDetail(boxSpend(g))].filter(Boolean).join('\n'), depth: g.parent ? 1 : 0, x: 0, y: 0, w: 0, h: 0 });
     }
   }
 

@@ -81,7 +81,40 @@ export interface UsageInfo {
   error?: string;
 }
 
-export type AgentStatus = 'running' | 'completed' | 'failed' | 'stopped';
+/**
+ * `waiting`: o turno acabou mas há trabalho pendente (processo em segundo plano, subagentes que ainda vão
+ * reportar, ou uma pergunta feita a outro agente). O relatório final só sai quando nada mais falta.
+ */
+export type AgentStatus = 'running' | 'waiting' | 'completed' | 'failed' | 'stopped' | 'lost';
+
+/**
+ * Conta como trabalhando: só o que está confirmado vivo. `lost` (tarefa do SDK que o processo anterior do CLI levou
+ * junto) e `waiting` ficam de fora; agente restaurado do disco também, até ser retomado.
+ */
+export function isWorking(a: Pick<AgentInfo, 'status' | 'restored'>): boolean {
+  return a.status === 'running' && !a.restored;
+}
+
+/** Por que um agente está "aguardando". */
+export type PendingReason = 'background' | 'children' | 'question';
+
+/**
+ * O que falta para o agente poder entregar o relatório final. O hub recalcula a cada fim de turno e a cada
+ * mudança nos filhos; some quando o agente conclui.
+ */
+export interface PendingInfo {
+  reasons: PendingReason[];
+  /** Tarefas em segundo plano abertas na sessão (Bash run_in_background, subagente em background). */
+  background?: { id: string; description: string }[];
+  /** Ids dos agentes que ainda vão reportar a este. */
+  children?: string[];
+  /** A quem este agente perguntou (send_to_agent) e ainda espera resposta. */
+  asked?: string[];
+  /** ISO de quando começou a aguardar. */
+  since: string;
+  /** Texto do turno segurado (o que o agente escreveu ao fechar o turno com pendência), curto. */
+  note?: string;
+}
 
 /**
  * Worktree git de um agente isolado. A extensão cria (git worktree add) e sabe o caminho e a branch,
@@ -138,6 +171,8 @@ export const STATUS_RING = {
   running: '#3fb950',
   /** Parado ou falhou. */
   halted: '#f85149',
+  /** Âmbar claro, sem pulso: o turno acabou e o agente espera processo, filhos ou resposta. Não é o âmbar forte do "preso". */
+  waiting: '#e6c86e',
 } as const;
 
 export function agentColor(name: string | undefined, fallbackSeed: string): string {
@@ -191,6 +226,11 @@ export interface AgentInfo {
   model?: string;
   /** Sessão própria do agente no Claude Code. É o que permite retomar a conversa dele depois de fechar a janela. */
   sessionId?: string;
+  /** Tipo da tarefa do SDK (local_bash, local_agent...). Ausente em agentes roteados e continuações. */
+  taskType?: string;
+  /** Tarefa de shell: o comando e quando começou (ISO), para achar a árvore de processos dela. */
+  command?: string;
+  startedAt?: string;
   /** Veio do disco ao reabrir a conversa: o processo dele não está de pé até você retomar. */
   restored?: boolean;
   /** Agente vigia: o hub o acorda a cada tantos minutos. Continua definido depois de parado, para o mapa saber o que ele é. */
@@ -217,8 +257,21 @@ export interface AgentInfo {
   spent?: AgentSpent;
   /** Caminhos que este agente não lê nem grava (além dos do projeto em .agm/protected.json). */
   protectedPaths?: string[];
+  /** Globs relativos ao projeto que o agente reivindica (spawn_agent owns): outro agente que editar recebe aviso. */
+  owns?: string[];
+  /** Sobe com os servidores MCP de usuário e os conectores do claude.ai (spawn_agent com user_mcp). Padrão: só o servidor agents e o .mcp.json aprovado. */
+  userMcp?: boolean;
   /** Marcado pelo detector de agente preso. Some quando o agente volta a progredir ou o turno acaba. */
   stuck?: { reason: string; since: string };
+  /** Status "waiting": o que falta antes do relatório final. Ausente nos outros status. */
+  pending?: PendingInfo;
+  /**
+   * Última nota de progresso (report_progress, ou o texto de um turno segurado). Não é relatório. `stale`: o agente
+   * concluiu, falhou ou parou depois dela, e o mapa e o list_agents a mostram como antiga.
+   */
+  progress?: { text: string; at: string; stale?: boolean };
+  /** Parou por limite de uso do fornecedor (429, janela da assinatura). `until` é a hora de reset quando conhecida. Não vai para o disco. */
+  limit?: { until?: string; text: string };
   /** Tentativa de um grupo Best-of-N (spawn_attempts). Todas do grupo têm a mesma cor e o mesmo `group`. */
   attempt?: AttemptInfo;
   /** Verificador independente de uma hipótese do laboratório: só lê e reexecuta com seed nova. */
@@ -250,6 +303,12 @@ export interface BoxInfo {
   color?: string;
   /** Caixa-mãe (sem mãe ela mesma). */
   parent?: string;
+  /** Orçamento da caixa (create_box com budget): soma do gasto dos agentes dela e das caixas-filhas. */
+  budget?: AgentBudget;
+  /** Quem criou (main ou id de agente). Só ele e o main mudam o orçamento e tiram agentes da caixa. */
+  createdBy?: string;
+  /** Parada pelo usuário quando o orçamento esgotou: nenhum agente novo entra até ele reabrir. Persistida, para valer depois do restore. */
+  closed?: boolean;
   /** ISO. */
   createdAt: string;
 }
@@ -387,6 +446,36 @@ export function lastCheckLabel(a: AgentInfo): string {
 
 export const EFFORT_LEVELS = ['', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
+/** Rótulo de cada status como o mapa, o popup e a lista mostram. */
+export const STATUS_LABEL: Record<AgentStatus, string> = {
+  running: 'trabalhando',
+  waiting: 'aguardando',
+  completed: 'concluído',
+  failed: 'falhou',
+  stopped: 'parado',
+  lost: 'encerrada com a sessão anterior',
+};
+
+/** "aguardando processo em segundo plano", "aguardando 2 subagentes (a3, a4)"... a partir do `pending` do agente. */
+export function pendingText(a: Pick<AgentInfo, 'pending'>): string {
+  const p = a.pending;
+  if (!p) {
+    return '';
+  }
+  const parts: string[] = [];
+  const bg = p.background?.length ?? 0;
+  if (bg) {
+    parts.push(bg === 1 ? 'processo em segundo plano' : `${bg} processos em segundo plano`);
+  }
+  if (p.children?.length) {
+    parts.push(`${p.children.length} ${p.children.length === 1 ? 'subagente' : 'subagentes'} (${p.children.join(', ')})`);
+  }
+  if (p.asked?.length) {
+    parts.push(`resposta de ${p.asked.join(', ')}`);
+  }
+  return parts.length ? `aguardando ${parts.join(', ')}` : 'aguardando';
+}
+
 export type HostMessage =
   | {
       type: 'init';
@@ -412,6 +501,10 @@ export type HostMessage =
     }
   | { type: 'profiles'; list: ProfileOption[] }
   | { type: 'agent'; agent: AgentInfo }
+  /** Resposta a taskProcs: a árvore de processos de uma tarefa de shell. */
+  | { type: 'taskProcs'; procs: TaskProcs }
+  /** Lista de processos órfãos do projeto (resposta a scanOrphans, ou depois de encerrar). `open` abre a lista. */
+  | { type: 'orphans'; groups: OrphanView[]; error?: string; scannedAt: string; open?: boolean }
   /** Lista inteira das caixas da conversa, a cada mudança (vazia ao trocar de conversa). */
   | { type: 'boxes'; list: BoxInfo[] }
   | { type: 'agentItem'; id: string; item: HistoryItem }
@@ -465,7 +558,10 @@ export type HostMessage =
   | { type: 'brain'; exists: boolean }
   /** `fromId`: agente que entregou o relatório, para a linha usar a cor e o título dele. */
   /** `origin: 'companion'`: o usuário mandou pelo botão "Enviar ao principal" do chat lateral. */
-  | { type: 'userEcho'; text: string; from?: string; fromId?: string; origin?: 'companion' }
+  /** `origin: 'remote'`: a mensagem chegou pelo Remote Control (claude.ai/code ou app do celular). */
+  | { type: 'userEcho'; text: string; from?: string; fromId?: string; origin?: 'companion' | 'remote' }
+  /** Remote Control desta conversa mudou de estado (ou é o estado inicial). */
+  | { type: 'remoteControl'; state: RemoteControlState }
   /** Nome da sessão mudou (gerado pelo Claude Code ou /rename): o cabeçalho acompanha. */
   | { type: 'sessionTitle'; title: string }
   /** Chat lateral: troca o texto da caixa (pergunta pré-preenchida, sem enviar). */
@@ -503,6 +599,20 @@ export type HostMessage =
       browsersError?: string;
     };
 
+/**
+ * Remote Control da conversa. `off`: desligado. `connecting`: ligando (ou religando depois de reiniciar o processo).
+ * `connected`: a sessão aceita mensagens de `sessionUrl` (claude.ai/code ou app). `disconnected`: a ponte caiu ou
+ * não subiu, com `reason`. `unavailable`: o Claude Code ou a organização não deixam (disableRemoteControl, conta sem claude.ai).
+ */
+export interface RemoteControlState {
+  status: 'off' | 'connecting' | 'connected' | 'disconnected' | 'unavailable';
+  sessionUrl?: string;
+  connectUrl?: string;
+  reason?: string;
+  /** Com `disconnected`: o usuário desligou, mas o Claude Code não confirmou; a ponte pode continuar de pé. */
+  stuck?: boolean;
+}
+
 /** Um navegador com a extensão Claude in Chrome conectado à conta (resposta de list_connected_browsers). */
 export interface ConnectedBrowser {
   name: string;
@@ -515,7 +625,48 @@ export interface ConnectedBrowser {
 export type ExternalProviderName = 'gemini' | 'openai';
 
 /** Botão dentro de um aviso. Hoje só abre a configuração de chave de um provedor externo. */
-export type NoticeAction = { kind: 'configureKey'; provider: ExternalProviderName; label: string };
+export type NoticeAction =
+  | { kind: 'configureKey'; provider: ExternalProviderName; label: string }
+  /** Abre a lista de processos órfãos do projeto. */
+  | { kind: 'orphans'; label: string };
+
+/** Um processo como o popup e a lista de órfãos mostram. `startedAt` em ISO. */
+export interface ProcView {
+  pid: number;
+  ppid: number;
+  name: string;
+  commandLine: string;
+  cwd?: string;
+  startedAt?: string;
+  ports: number[];
+}
+
+/** Árvore de processos de uma tarefa de shell: raiz e descendentes, raiz primeiro. */
+export interface TaskProcs {
+  agentId: string;
+  /** Ausente: a raiz não está viva, ou nunca foi identificada. */
+  root?: ProcView;
+  members: ProcView[];
+  /**
+   * A raiz foi identificada enquanto a tarefa rodava (foto de PID, nome e início). Falso: tarefa que parou antes de
+   * qualquer leitura; não há busca nova, porque ela acharia o processo de outra tarefa com o mesmo comando.
+   */
+  identified: boolean;
+  /** Portas que o comando cita (--port 3002, :5173), no ar ou não. */
+  expectedPorts: { port: number; up: boolean }[];
+  error?: string;
+  scannedAt: string;
+}
+
+/** Árvore órfã: processos do projeto que nenhum painel rastreia. */
+export interface OrphanView {
+  root: ProcView;
+  members: ProcView[];
+  ports: number[];
+  parentAlive: boolean;
+  /** Pai da raiz: vivo (terminal externo, outro claude) ou já encerrado (sobra de sessão). */
+  parent?: { pid: number; name?: string; alive: boolean };
+}
 
 /** Item do autocompletar de "@". `path` é relativo ao cwd, com "/". */
 export interface FileResult {
@@ -547,6 +698,13 @@ export type WebviewMessage =
   | { type: 'setMode'; value: string }
   | { type: 'setEffort'; value: string }
   | { type: 'stopAgent'; id: string }
+  /** Lê a árvore de processos de uma tarefa de shell (popup do nó). */
+  | { type: 'taskProcs'; id: string }
+  /** Encerra a árvore inteira de uma tarefa de shell; o host confirma num diálogo. */
+  | { type: 'killTaskTree'; id: string }
+  | { type: 'scanOrphans' }
+  /** Encerra as árvores órfãs com estas raízes (PID, nome e início, conferidos antes do kill); o host confirma num diálogo. */
+  | { type: 'killOrphans'; roots: { pid: number; name: string; startedAt?: string }[] }
   | { type: 'forkAgent'; id: string; profileId: string; model: string; effort: string; text: string; stopOriginal: boolean }
   | { type: 'sendToParent' }
   | { type: 'agentSend'; id: string; text: string }
@@ -583,6 +741,8 @@ export type WebviewMessage =
   | { type: 'setChrome'; value: boolean }
   /** Relê a lista de navegadores conectados (clique no indicador). */
   | { type: 'refreshBrowsers' }
+  /** Remote Control: ligar ou desligar nesta conversa, abrir o link da sessão no navegador ou copiá-lo. */
+  | { type: 'remoteControl'; action: 'on' | 'off' | 'open' | 'copy' }
   /** Botões do popup de um agente isolado: abrir o diff no editor, mesclar ou descartar (os dois últimos com confirmação modal). */
   /** Botão "Podar"/"Restaurar" do popup de uma hipótese na árvore do laboratório. Só marca; nada é apagado. */
   | { type: 'labAction'; kind: 'prune' | 'unprune'; hypothesis_id: string }

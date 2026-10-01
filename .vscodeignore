@@ -7,3 +7,10 @@ esbuild.mjs
 .vscode/**
 .gitignore
 media/codicons/codicon.csv
+
+# Estado local e artefatos que não podem ir no pacote (conversas, cache de autenticação, cérebro)
+.agm/**
+projects/**
+mcp-needs-auth-cache.json
+*.tmp
+docs/**

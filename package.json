@@ -2,7 +2,7 @@
   "name": "agent-graph-master",
   "displayName": "Agent Graph Master",
   "description": "Contas do Claude Code e do Codex, chat próprio por conta e mapa de agentes com roteamento de relatórios.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -78,6 +78,18 @@
         "title": "Atualizar status",
         "category": "Agent Graph Master",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "agentGraphMaster.orphanProcesses",
+        "title": "Processos órfãos do projeto",
+        "category": "Agent Graph Master",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "agentGraphMaster.remoteControl",
+        "title": "Remote Control (ligar/desligar no chat ativo)",
+        "category": "Agent Graph Master",
+        "icon": "$(remote)"
       },
       {
         "command": "agentGraphMaster.setGeminiKey",
@@ -337,6 +349,12 @@
           "minimum": 5,
           "description": "Janela, em segundos, em que as escritas no cérebro compartilhado se juntam num resumo só por destinatário."
         },
+        "agentGraphMaster.brain.mainNotifyWindowSeconds": {
+          "type": "number",
+          "default": 600,
+          "minimum": 5,
+          "description": "Janela, em segundos, do resumo de novidades do cérebro para o chat principal (orquestrador). Ele recebe um resumo por frente; decisões e armadilhas saem na hora."
+        },
         "agentGraphMaster.brain.graphStaleDays": {
           "type": "number",
           "default": 14,
@@ -400,6 +418,23 @@
           "maximum": 8,
           "description": "Quantas execuções o run_seeds roda ao mesmo tempo. Em GPU única, deixe 1."
         },
+        "agentGraphMaster.maxHeavyProcesses": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 64,
+          "description": "Quantos processos pesados lançados pelo hub rodam ao mesmo tempo, somando todos os agentes e conversas desta janela: seeds do run_seeds, trials de varredura, avaliação oficial e cofre. 0: metade dos núcleos da máquina. Com mais de um rodando, o hub põe OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, NUMEXPR_NUM_THREADS e VECLIB_MAXIMUM_THREADS = 1 nos processos novos que não definem esses valores."
+        },
+        "agentGraphMaster.subagentUserMcp": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Agentes roteados sobem com os servidores MCP de usuário e os conectores do claude.ai da conta (Slack, Drive, Notion...). Desligado (padrão), cada agente recebe só o servidor `agents` e o `.mcp.json` aprovado do projeto: milhares de tokens de schema e dezenas de processos a menos. Vigias sempre herdam os conectores, e `spawn_agent` com `user_mcp: true` liga para um agente específico."
+        },
+        "agentGraphMaster.limitThreadsWhenParallel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Quando já há outro agente roteado rodando, a sessão de cada agente novo sobe com OMP_NUM_THREADS, MKL_NUM_THREADS, OPENBLAS_NUM_THREADS, NUMEXPR_NUM_THREADS e VECLIB_MAXIMUM_THREADS = 1, para dois processos numéricos não disputarem todos os núcleos. Variável que você já definiu no ambiente não é sobrescrita."
+        },
         "agentGraphMaster.autoVerify": {
           "type": "boolean",
           "default": true,
@@ -444,6 +479,11 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Conversas novas começam com o interruptor **Usar o navegador (Claude in Chrome)** ligado. O Claude passa a controlar o Chrome em que a extensão Claude in Chrome está conectada, com as contas já logadas nele. Só um dono do navegador por vez: se um agente estiver com ele, a conversa começa desligada. Dá para ligar e desligar em cada conversa pelo menu do \"+\"."
+        },
+        "agentGraphMaster.remoteControlAtStartup": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Cada chat novo liga o **Remote Control** ao abrir: a conversa passa a aceitar mensagens do claude.ai/code e do app do Claude no celular, e o painel mostra o link da sessão. Precisa de login com conta claude.ai. **Risco:** no modo sem perguntas (bypass), quem tiver acesso à sua conta controla esta máquina pelo Claude; por isso, em bypass, cada chat pede confirmação antes de ligar. Não vale para agentes roteados. Organização com `disableRemoteControl` nas managed settings deixa o Remote Control indisponível."
         },
         "agentGraphMaster.browserActionsNeedApproval": {
           "type": "boolean",

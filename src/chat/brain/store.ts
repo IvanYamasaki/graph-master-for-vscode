@@ -31,6 +31,8 @@ export const NOTE_WARN_CHARS = 24_000;
 export const ENTRY_MAX_CHARS = 4_000;
 /** O índice é resumo: as listas encolhem até ele caber aqui. */
 export const INDEX_MAX_CHARS = 12_000;
+/** Resumo de entrada do agente (briefing). */
+export const BRIEFING_MAX_CHARS = 2_200;
 
 const FOLDERS = ['agentes', 'frentes', 'temas', 'fatos'] as const;
 type Folder = (typeof FOLDERS)[number];
@@ -321,6 +323,8 @@ export class BrainStore {
       this.appendEntry(ws, note, 'Relatórios', parts.join('\n'), 'host', {
         actor: agentId,
         line: `relatório entregue a ${r.to}: ${lines.find((l) => l.trim()) ?? ''}`,
+        // Entregue ao main direto: ele já leu o relatório, o aviso só repetiria.
+        silent: r.to === 'main',
       });
       return note.rel;
     });
@@ -436,7 +440,8 @@ export class BrainStore {
         old.meta = { ...old.meta, status: 'superada', superadaPor: rel };
         old.body = `**Superada por:** [${title}](${relLink(old.rel, rel)}) em ${day}.\n\n${old.body.replace(/^\*\*Superada por:\*\*[^\n]*\n+/, '')}`;
       }
-      this.events.push({ rel, author: args.author, line: title, boxId: (note.meta as FactMeta).frente, at: iso });
+      const frente = (note.meta as FactMeta).frente;
+      this.events.push({ rel, author: args.author, line: title, boxId: frente, boxName: frente ? this.frontNote(ws, frente)?.title : undefined, kind: (note.meta as FactMeta).tipo, at: iso });
       return { rel, entryId: 'fato', created: true, warnings };
     });
   }
@@ -555,6 +560,8 @@ export class BrainStore {
         entryId: entry?.id,
         line: firstLine(args.newText) || '(trecho apagado)',
         boxId: this.boxOfNote(ws, note, args.author),
+        boxName: this.boxName(ws, this.boxOfNote(ws, note, args.author)),
+        kind: note.meta.kind === 'fato' ? note.meta.tipo : undefined,
         edited: true,
         at: this.now().toISOString(),
       });
@@ -647,6 +654,77 @@ export class BrainStore {
     }
     const note = this.frontNote(this.load(), boxId);
     return note && path.join(this.dir, note.rel);
+  }
+
+  /**
+   * Resumo de entrada de um agente novo, montado pelo host: a frente dele (descrição, colegas, o que já foi
+   * entregue), os fatos vigentes da frente, as decisões e armadilhas de todo o projeto e os fatos que combinam com a
+   * tarefa. Vai no prompt, para o agente não reler índice, frente e fatos um por um. Sem cérebro ou sem nada
+   * a dizer: undefined. Só leitura do disco, sem fila.
+   */
+  briefing(opts: { boxId?: string; task?: string }): string | undefined {
+    if (!this.exists()) {
+      return undefined;
+    }
+    const ws = this.load();
+    const front = opts.boxId ? this.frontNote(ws, opts.boxId) : undefined;
+    const facts = [...ws.values()]
+      .filter((n): n is Note & { meta: FactMeta } => n.meta.kind === 'fato' && n.meta.status !== 'superada')
+      .sort((a, b) => b.meta.criado.localeCompare(a.meta.criado));
+    const used = new Set<string>();
+    const factLine = (n: Note & { meta: FactMeta }) => {
+      used.add(n.rel);
+      const m = n.meta;
+      return `- ${oneLine(n.title, 150)} (${m.tipo}, ${m.confianca}${m.area.length ? `, ${m.area.slice(0, 4).join('/')}` : ''}) · ${m.agente} · ${n.rel}`;
+    };
+    const out: string[] = [];
+    if (front) {
+      const fm = front.meta as FrontMeta;
+      out.push(`Sua frente: ${front.title} (${fm.boxId})${fm.description ? `. ${oneLine(fm.description, 240)}` : ''}`);
+      const agents = this.agentsOf(ws, fm);
+      if (agents.length) {
+        out.push('Colegas da frente (agente · estado · tarefa):');
+      }
+      for (const a of agents.slice(0, 8)) {
+        const am = a.meta as AgentMeta;
+        const done = am.lastReport?.headline ? ` → ${oneLine(am.lastReport.headline, 100)}` : '';
+        out.push(`- ${am.id} · ${statusLabel(am.status)} · ${oneLine(am.description, 80)}${done}`);
+      }
+      // Decisões e armadilhas da frente primeiro, depois o resto, do mais novo para o mais velho.
+      const rank = (n: Note & { meta: FactMeta }) => Number(n.meta.tipo !== 'decisao' && n.meta.tipo !== 'armadilha');
+      const own = facts.filter((n) => n.meta.frente === fm.boxId).sort((a, b) => rank(a) - rank(b)).slice(0, 6);
+      if (own.length) {
+        out.push('', 'Fatos vigentes da frente (decisões e armadilhas primeiro):', ...own.map(factLine));
+      }
+    }
+    const rules = facts.filter((n) => !used.has(n.rel) && (n.meta.tipo === 'decisao' || n.meta.tipo === 'armadilha')).slice(0, 3);
+    if (rules.length) {
+      out.push('', 'Decisões e armadilhas vigentes de outras frentes:', ...rules.map(factLine));
+    }
+    const terms = new Set(
+      fold(`${opts.task ?? ''} ${front?.title ?? ''}`)
+        .split(/[^a-z0-9_.]+/)
+        .filter((t) => t.length >= 5),
+    );
+    if (terms.size) {
+      const scored = facts
+        .filter((n) => !used.has(n.rel))
+        .map((n) => {
+          const hay = fold(`${n.title} ${n.meta.area.join(' ')}`);
+          return { n, score: [...terms].filter((t) => hay.includes(t)).length };
+        })
+        .filter((x) => x.score >= 2)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3);
+      if (scored.length) {
+        out.push('', 'Fatos que parecem tratar da sua tarefa:', ...scored.map((x) => factLine(x.n)));
+      }
+    }
+    if (!out.length) {
+      return undefined;
+    }
+    const text = out.join('\n');
+    return text.length > BRIEFING_MAX_CHARS ? `${text.slice(0, BRIEFING_MAX_CHARS - 1).trimEnd()}…` : text;
   }
 
   // ---------- Fila e gravação ----------
@@ -766,7 +844,15 @@ export class BrainStore {
     }
     for (const front of ws.values()) {
       if (front.meta.kind === 'frente') {
-        writeIfChanged(path.join(this.dir, stateRel(front.rel)), this.renderState(ws, front));
+        const file = path.join(this.dir, stateRel(front.rel));
+        const before = readText(file);
+        const text = this.renderState(ws, front);
+        writeIfChanged(file, text);
+        // ESTADO.md que já existia e mudou só vira novidade se a mesma escrita trouxe conteúdo (fato, nota, relatório).
+        // Agente criado ou com status novo reescreve o ESTADO.md sem dizer nada ao orquestrador.
+        if (before !== undefined && before !== text && this.events.some((e) => !e.state)) {
+          this.events.push({ rel: stateRel(front.rel), author: 'host', line: 'ESTADO.md mudou', boxId: front.meta.boxId, boxName: front.title, state: true, at: this.now().toISOString() });
+        }
       }
     }
     writeIfChanged(path.join(this.dir, HOW_TO_FILE), HOW_TO);
@@ -973,16 +1059,24 @@ export class BrainStore {
    * Entrada: marcador invisível (id, autor, data ISO), cabeçalho visível e o texto. Devolve o id.
    * `news`: quem aparece no aviso de novidade (no resumo do relatório o host escreve em nome do agente) e a linha.
    */
-  private appendEntry(ws: Workspace, note: Note, section: string, text: string, author: string, news?: { actor?: string; line?: string }): string {
+  private appendEntry(ws: Workspace, note: Note, section: string, text: string, author: string, news?: { actor?: string; line?: string; silent?: boolean }): string {
     const iso = this.now().toISOString();
     const max = [...note.body.matchAll(MARKER)].reduce((m, x) => Math.max(m, Number(x[1].slice(1))), 0);
     const id = `e${max + 1}`;
     const who = this.authorLabel(ws, note.rel, author);
     const entry = `<!-- ${id} | ${author.replace(/[|>]/g, '')} | ${iso} -->\n**${fmtDate(iso)} · ${who}**\n${text}`;
     note.body = insertInSection(note.body, section, entry);
+    if (news?.silent) {
+      return id;
+    }
     const actor = news?.actor ?? author;
-    this.events.push({ rel: note.rel, author: actor, entryId: id, line: news?.line ?? firstLine(text), boxId: this.boxOfNote(ws, note, actor), at: iso });
+    const boxId = this.boxOfNote(ws, note, actor);
+    this.events.push({ rel: note.rel, author: actor, entryId: id, line: news?.line ?? firstLine(text), boxId, boxName: this.boxName(ws, boxId), at: iso });
     return id;
+  }
+
+  private boxName(ws: Workspace, boxId?: string): string | undefined {
+    return boxId ? this.frontNote(ws, boxId)?.title : undefined;
   }
 
   /** Caixa de uma nota: a da frente, a do agente dono da nota ou, nas notas gerais, a de quem escreveu. */

@@ -287,6 +287,47 @@ textarea.feedback {
   font-size: 12px;
 }
 
+/* Mensagem que chegou pelo Remote Control (claude.ai/code ou app do celular). */
+.msg.user.from-remote .msg-origin {
+  color: var(--vscode-textLink-foreground, #3794ff);
+}
+
+/* ---------- Remote Control ---------- */
+
+.pill.remote {
+  gap: 5px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.pill.remote .codicon {
+  font-size: 13px;
+}
+
+.pill.remote .bstate {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+}
+
+.pill.remote .bstate.pending {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.pill.remote .bstate.connected {
+  background: #3fb950;
+}
+
+.pill.remote .bstate.failed {
+  background: #f85149;
+}
+
+.pill.remote.warn {
+  color: var(--vscode-errorForeground, #f85149);
+}
+
 /* ---------- Conversa ---------- */
 
 .log {
@@ -567,6 +608,11 @@ pre.code.add {
 .dot.failed,
 .dot.stopped {
   background: var(--err);
+}
+
+/* Âmbar claro, sem pulso: turno encerrado com processo, subagentes ou resposta pendente. */
+.dot.waiting {
+  background: #e6c86e;
 }
 
 @keyframes pulse {
@@ -2892,4 +2938,234 @@ button.empty-ex:focus-visible {
   padding: 0 4px;
   border: 1px solid var(--border);
   border-radius: 3px;
+}
+
+/* ---------- Processos das tarefas de shell (popup do nó) e lista de órfãos ---------- */
+
+.proc-row {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.proc-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.proc-label {
+  flex: 1;
+  font-weight: 600;
+  opacity: 0.85;
+}
+
+.proc-btn,
+.orphans-btn {
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--vscode-button-border, rgba(128, 128, 128, 0.4));
+  background: var(--vscode-button-secondaryBackground, transparent);
+  color: var(--vscode-button-secondaryForeground, inherit);
+  cursor: pointer;
+}
+
+.proc-btn:disabled,
+.orphans-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.orphans-btn.is-danger {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.proc-root {
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.proc-note {
+  opacity: 0.75;
+  overflow-wrap: anywhere;
+}
+
+.proc-note.is-error {
+  color: var(--err);
+  opacity: 1;
+}
+
+.proc-cmdline code {
+  display: block;
+  max-height: 4.5em;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  opacity: 0.85;
+  margin-bottom: 4px;
+}
+
+.proc-expected {
+  display: inline-block;
+  margin: 0 6px 4px 0;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 11px;
+}
+
+.proc-expected.is-up {
+  background: color-mix(in srgb, var(--ok) 20%, transparent);
+}
+
+.proc-expected.is-down {
+  background: color-mix(in srgb, var(--err) 18%, transparent);
+}
+
+.proc-children summary,
+.orphan-sum {
+  cursor: pointer;
+}
+
+.proc-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.proc-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 1px 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+}
+
+.proc-pid {
+  min-width: 5ch;
+  text-align: right;
+  opacity: 0.7;
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+
+.proc-name {
+  font-weight: 600;
+}
+
+.proc-port {
+  color: var(--ok);
+}
+
+.proc-cmd {
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.orphans {
+  position: fixed;
+  z-index: 60;
+  top: 8%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(760px, 94vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--vscode-editorWidget-background, #252526);
+  border: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.4));
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+}
+
+.orphans[hidden] {
+  display: none;
+}
+
+.orphans-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.3));
+}
+
+.orphans-title {
+  flex: 1;
+  font-weight: 600;
+}
+
+.orphans-x {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.orphans-status {
+  padding: 6px 10px;
+  opacity: 0.8;
+}
+
+.orphans-body {
+  overflow: auto;
+  padding: 0 10px 10px;
+}
+
+.orphan {
+  border-top: 1px solid var(--vscode-widget-border, rgba(128, 128, 128, 0.2));
+  padding: 6px 0;
+}
+
+.orphan-sum {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.orphan-meta {
+  flex: 1;
+  opacity: 0.7;
+}
+
+.orphan-cmd {
+  margin: 4px 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  opacity: 0.8;
+  overflow-wrap: anywhere;
+}
+
+.orphans-section {
+  margin-top: 10px;
+  padding-top: 6px;
+  border-top: 2px solid var(--warn);
+}
+
+.orphans-section-title {
+  font-weight: 600;
+  color: var(--warn);
+}
+
+.orphans-section-note {
+  opacity: 0.75;
+  margin-bottom: 4px;
+}
+
+.orphan.is-parent-alive .orphan-meta {
+  color: var(--warn);
+  opacity: 1;
 }

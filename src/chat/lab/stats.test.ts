@@ -5,6 +5,7 @@
  */
 import * as assert from 'node:assert/strict';
 import {
+  auc,
   benjaminiHochberg,
   bootstrapDiffCI,
   bootstrapMeanCI,
@@ -12,8 +13,10 @@ import {
   compareArms,
   mean,
   normInv,
+  pairedBootstrap,
   pairedT,
   requiredN,
+  rng,
   sd,
   tTwoSided,
   welch,
@@ -115,6 +118,73 @@ test('compareArms usa o pareado com amostras alinhadas', () => {
   assert.equal(c.mode, 'paired-samples');
   near(c.diff, 0.05, 1e-12, 'diff');
   assert.equal(c.units, 4);
+});
+
+test('AUC contra o sklearn, com empate valendo meio par', () => {
+  near(auc([0, 0, 1, 1], [0.1, 0.4, 0.35, 0.8]), 0.75, 1e-12, 'auc');
+  near(auc([0, 1, 0, 1], [0.5, 0.5, 0.2, 0.9]), 0.875, 1e-12, 'auc com empate');
+  assert.ok(Number.isNaN(auc([1, 1], [0.2, 0.3])), 'sem negativo, AUC não existe');
+});
+
+/** Conjunto sintético: `units` unidades com `per` linhas cada; a variante separa melhor as classes. */
+function synthetic(units: number, per: number, copies = false) {
+  const rand = rng(42);
+  const unit: string[] = [];
+  const label: number[] = [];
+  const base: number[] = [];
+  const variant: number[] = [];
+  for (let u = 0; u < units; u++) {
+    const y = rand() < 0.4 ? 1 : 0;
+    const nb = rand();
+    const nv = rand();
+    for (let k = 0; k < per; k++) {
+      unit.push(`u${u}`);
+      label.push(y);
+      base.push(0.35 * y + (copies ? nb : rand()));
+      variant.push(0.6 * y + (copies ? nv : rand()));
+    }
+  }
+  return { unit, label, base, variant };
+}
+
+test('bootstrap pareado por unidade: AUC melhor dá IC acima de zero e p pequeno', () => {
+  const rows = synthetic(300, 3);
+  const r = pairedBootstrap(rows, 'auc', 'higher', { seed: 7 });
+  near(r.baseValue, auc(rows.label, rows.base), 1e-12, 'AUC do baseline');
+  near(r.variantValue, auc(rows.label, rows.variant), 1e-12, 'AUC da variante');
+  near(r.diff, r.variantValue - r.baseValue, 1e-12, 'diff');
+  assert.ok(r.ci[0] > 0 && r.ci[1] > r.ci[0] && r.p < 0.01, JSON.stringify({ ci: r.ci, p: r.p }));
+  assert.equal(r.units, 300);
+  assert.equal(r.rows, 900);
+  assert.ok(Number.isNaN(r.effect), 'AUC não tem d_z');
+  const again = pairedBootstrap(rows, 'auc', 'higher', { seed: 7 });
+  assert.deepEqual(again.ci, r.ci, 'mesma semente, mesmo IC');
+});
+
+test('bootstrap pareado: linhas copiadas dentro da unidade não estreitam o IC', () => {
+  // 100 unidades com 5 cópias idênticas: tratar cada linha como independente mentiria sobre o n.
+  const rows = synthetic(100, 5, true);
+  const byUnit = pairedBootstrap(rows, 'auc', 'higher', { seed: 1, iters: 2000 });
+  const byRow = pairedBootstrap({ ...rows, unit: rows.unit.map((_, i) => String(i)) }, 'auc', 'higher', { seed: 1, iters: 2000 });
+  const w = (x: { ci: [number, number] }) => x.ci[1] - x.ci[0];
+  assert.ok(w(byUnit) > 1.6 * w(byRow), `largura por unidade ${w(byUnit)} contra por linha ${w(byRow)}`);
+});
+
+test('bootstrap pareado: média por linha com menor é melhor inverte o sinal', () => {
+  const rand = rng(3);
+  const unit = Array.from({ length: 60 }, (_, i) => `u${Math.floor(i / 2)}`);
+  const base = unit.map(() => 1 + rand() * 0.2);
+  const variant = base.map((x) => x - 0.1 + (rand() - 0.5) * 0.05);
+  const r = pairedBootstrap({ unit, base, variant }, 'mean', 'lower', { seed: 5 });
+  assert.ok(r.diff > 0.08 && r.ci[0] > 0 && r.effect > 0, JSON.stringify(r));
+  assert.equal(r.units, 30);
+});
+
+test('bootstrap pareado: braços iguais dão diferença 0 e p 1', () => {
+  const rows = synthetic(50, 2);
+  const r = pairedBootstrap({ ...rows, variant: rows.base }, 'auc', 'higher', { seed: 2 });
+  assert.equal(r.diff, 0);
+  assert.equal(r.p, 1);
 });
 
 if (failed) {

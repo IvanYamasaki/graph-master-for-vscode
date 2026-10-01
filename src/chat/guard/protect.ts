@@ -206,6 +206,11 @@ export class PathRules {
     return undefined;
   }
 
+  /** Padrão que protege este caminho relativo à raiz do projeto (sem olhar o disco), ou undefined. */
+  matchRelative(rel: string): string | undefined {
+    return this.matchRel(fold(rel.replace(/\\/g, '/')));
+  }
+
   /** Padrão que protege `target` (absoluto ou relativo ao agente), ou undefined. */
   match(target: string): string | undefined {
     for (const rel of this.relatives(target)) {
@@ -278,8 +283,48 @@ export class PathRules {
   }
 }
 
+const WALK_SKIP = new Set(['.git', 'node_modules']);
+const WALK_LIMIT = 100_000;
+
+/**
+ * Padrões que não casam com nenhum arquivo ou pasta do projeto em `root` (um cofre com eles protegeria o nada), e
+ * os que saem do projeto. Sem resposta (projeto grande demais para varrer), devolve lista vazia: não avisa no escuro.
+ */
+export function patternsWithoutFiles(root: string, patterns: string[]): { missing: string[]; outside: string[]; scanned: number } {
+  const outside = patterns.filter((p) => normalizePattern(p) === undefined);
+  const inside = patterns.filter((p) => normalizePattern(p) !== undefined);
+  const rules = inside.map((p) => new PathRules([p], [root]));
+  const hit = new Set<number>();
+  let scanned = 0;
+  const stack: string[] = [''];
+  while (stack.length && hit.size < rules.length) {
+    const rel = stack.pop()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(path.join(root, rel), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (++scanned > WALK_LIMIT) {
+        return { missing: [], outside, scanned };
+      }
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      rules.forEach((rule, i) => {
+        if (!hit.has(i) && rule.matchRelative(r)) {
+          hit.add(i);
+        }
+      });
+      if (e.isDirectory() && !WALK_SKIP.has(e.name)) {
+        stack.push(r);
+      }
+    }
+  }
+  return { missing: inside.filter((_, i) => !hit.has(i)), outside, scanned };
+}
+
 /** Arquivos que desligariam a proteção se um agente pudesse gravá-los. */
-const GUARD_CONFIG_FILES = [PROTECTED_CONFIG, '.vscode/settings.json'];
+const GUARD_CONFIG_FILES = [PROTECTED_CONFIG, '.vscode/settings.json', '.agm/lockbox.json'];
 
 const PATH_TOOLS: Record<string, string[]> = {
   Read: ['file_path'],
@@ -396,7 +441,7 @@ const POST_MATCHER = '^(Grep|Glob|Bash|PowerShell)$';
  * Hooks do SDK para uma sessão de agente. `rules` é chamado a cada ferramenta: a configuração do projeto
  * pode mudar com o agente rodando. `onBlock` avisa o hub (vai para o log do agente).
  */
-export function protectHooks(rules: () => PathRules | undefined, onBlock?: (toolName: string, reason: string) => void): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
+export function protectHooks(rules: () => PathRules | undefined, onBlock?: (toolName: string, reason: string, input: Record<string, unknown>) => void): Partial<Record<HookEvent, HookCallbackMatcher[]>> {
   return {
     PreToolUse: [
       {
@@ -414,7 +459,7 @@ export function protectHooks(rules: () => PathRules | undefined, onBlock?: (tool
             if (!reason) {
               return {};
             }
-            onBlock?.(input.tool_name, reason);
+            onBlock?.(input.tool_name, reason, (input.tool_input ?? {}) as Record<string, unknown>);
             return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
           },
         ],
@@ -439,4 +484,17 @@ export function protectHooks(rules: () => PathRules | undefined, onBlock?: (tool
       },
     ],
   };
+}
+
+/**
+ * Comando que o hub vai rodar a pedido de um subagente (run_seeds, start_sweep) fora dos hooks dele: passa pela
+ * mesma heurística do Bash com as regras do agente. Devolve o motivo do bloqueio ou undefined.
+ */
+export function commandBlocked(patterns: string[], roots: string[], command: string): string | undefined {
+  if (!patterns.length) {
+    return undefined;
+  }
+  const rules = new PathRules(patterns, roots);
+  const hit = rules.scanCommand(command);
+  return hit ? `Bloqueado: o comando cita caminho protegido (padrão ${hit}). O hub roda este comando fora dos seus hooks, então vale a mesma regra do Bash: sem avaliador nem dados de teste. A avaliação oficial é do orquestrador.` : undefined;
 }

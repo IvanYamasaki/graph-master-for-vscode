@@ -31,7 +31,7 @@ export function fmtTokensShort(n: number): string {
 }
 
 export function fmtUsd(v: number): string {
-  return v < 0.01 ? '<US$ 0,01' : `US$ ${v.toFixed(2).replace('.', ',')}`;
+  return v <= 0 ? 'US$ 0,00' : v < 0.01 ?'<US$ 0,01' : `US$ ${v.toFixed(2).replace('.', ',')}`;
 }
 
 export function fmtMinutes(m: number): string {
@@ -49,8 +49,9 @@ export function budgetLines(a: Pick<AgentInfo, 'budget' | 'spent' | 'provider'>)
     `${fmtTokensShort(s.tokens)}${b.maxTokens ? ` de ${fmtTokensShort(b.maxTokens)}` : ''} tokens processados`,
     `${fmtMinutes(s.minutes)}${b.maxMinutes ? ` de ${fmtMinutes(b.maxMinutes)}` : ''} de trabalho`,
   ];
-  if (s.usd !== undefined) {
-    lines.push(`${fmtUsd(s.usd)}${b.maxUsd ? ` de ${fmtUsd(b.maxUsd)}` : ''} estimados`);
+  // Com teto de US$, a linha aparece mesmo antes do primeiro custo chegar (gasto 0); sem ele, o resumo omitia o teto.
+  if (s.usd !== undefined || (b.maxUsd && a.provider !== 'codex')) {
+    lines.push(`${fmtUsd(s.usd ?? 0)}${b.maxUsd ? ` de ${fmtUsd(b.maxUsd)}` : ''} estimados`);
   } else if (a.provider === 'codex') {
     lines.push(b.maxUsd ? 'custo: o Codex não informa, max_usd não vale aqui' : 'custo: o Codex não informa');
   }

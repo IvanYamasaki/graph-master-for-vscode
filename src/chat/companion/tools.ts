@@ -195,9 +195,11 @@ function kindLabel(i: AgentInfo): string {
 
 const STATUS: Record<AgentInfo['status'], string> = {
   running: 'rodando',
+  waiting: 'aguardando',
   completed: 'concluído',
   failed: 'falhou',
   stopped: 'parado',
+  lost: 'encerrada com a sessão anterior',
 };
 
 function statusText(a: CompanionAgent, now: number): string {

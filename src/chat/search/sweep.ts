@@ -4,6 +4,7 @@
  * run no laboratório. Paralelismo, tempo por trial, tempo total e interrupção ficam aqui.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import { acquireHeavy } from '../guard/heavy';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { BuiltinSampler, etaSquared, medianPrune, paretoFront, type Direction, type Observation, type ParamSpec, type Params } from './sampler';
@@ -31,6 +32,8 @@ export interface SweepSpec {
   seed: number;
   creator: string;
   reportTo: string;
+  /** Pedida por agente com caminho protegido: erro de trial sem o fim do stderr (pode trazer o que ele não pode ler). */
+  hideOutput?: boolean;
 }
 
 export interface Trial {
@@ -152,6 +155,9 @@ export class Sweep {
     };
   }
 
+  /** Abortado no stop: tira da fila do semáforo os trials que ainda esperam vaga. */
+  private readonly abort = new AbortController();
+
   get running(): boolean {
     return this.state.status === 'rodando';
   }
@@ -166,6 +172,8 @@ export class Sweep {
     }
     this.state.status = 'interrompida';
     this.state.note = 'interrompida pelo usuário ou pelo orquestrador';
+    // Trials esperando vaga no semáforo saem da fila na hora.
+    this.abort.abort();
     for (const c of this.children) {
       kill(c);
     }
@@ -276,7 +284,7 @@ export class Sweep {
     }
     if (result.timedOut || result.code !== 0) {
       trial.state = 'fail';
-      trial.error = result.timedOut ? `passou de ${s.timeoutMinutes} min` : `código ${result.code}: ${result.stderr.trim().split(/\r?\n/).slice(-2).join(' ').slice(0, 300)}`;
+      trial.error = result.timedOut ? `passou de ${s.timeoutMinutes} min` : s.hideOutput ? `código ${result.code} (saída omitida: varredura de agente com caminho protegido)` : `código ${result.code}: ${result.stderr.trim().split(/\r?\n/).slice(-2).join(' ').slice(0, 300)}`;
       this.hooks.log(`Trial ${trial.number} falhou (${trial.error}). Comando: ${trial.command}`);
       return;
     }
@@ -286,8 +294,9 @@ export class Sweep {
       const read = this.hooks.readMetrics(metricsPath);
       if (read instanceof Error) {
         trial.state = 'fail';
-        trial.error = read.message;
-        this.hooks.log(`Trial ${trial.number}: ${read.message}`);
+        // Varredura de agente com caminho protegido: a mensagem pode citar o conteúdo do arquivo.
+        trial.error = s.hideOutput ? 'não consegui ler o JSON de métricas' : read.message;
+        this.hooks.log(`Trial ${trial.number}: ${trial.error}`);
         return;
       }
       metrics = read.metrics;
@@ -298,19 +307,41 @@ export class Sweep {
     const vals = s.objectives.map((o) => metrics?.[o.metric]);
     if (!metrics || vals.some((v) => typeof v !== 'number' || !Number.isFinite(v))) {
       trial.state = 'fail';
-      trial.error = `faltou ${s.objectives.map((o) => o.metric).join(', ')} na saída (achei: ${Object.keys(metrics ?? {}).join(', ') || 'nada'})`;
+      trial.error = `faltou ${s.objectives.map((o) => o.metric).join(', ')} na saída${s.hideOutput ? '' : ` (achei: ${Object.keys(metrics ?? {}).join(', ') || 'nada'})`}`;
       this.hooks.log(`Trial ${trial.number}: ${trial.error}`);
       return;
     }
     trial.values = vals as number[];
     trial.state = 'complete';
+    if (s.hideOutput) {
+      // Só as métricas pedidas nos objetivos vão ao quadro: nome de chave arbitrário também carrega dado.
+      metrics = Object.fromEntries(s.objectives.map((o, i) => [o.metric, trial.values![i]]));
+    }
     trial.runId = this.hooks.logRun(trial, metrics, file);
     this.hooks.log(
       `Trial ${trial.number}: ${s.objectives.map((o, i) => `${o.metric} = ${fmtValue(trial.values![i])}`).join(', ')} com ${fmtParams(trial.params)}${trial.runId ? ` (run ${trial.runId})` : ''}.`,
     );
   }
 
-  private exec(trial: Trial, progress: string): Promise<{ code: number | null; timedOut: boolean; stdout: string; stderr: string }> {
+  /** Espera vaga no semáforo de processos pesados (compartilhado com os outros agentes e buscas) e roda o trial. */
+  private async exec(trial: Trial, progress: string): Promise<{ code: number | null; timedOut: boolean; stdout: string; stderr: string }> {
+    const slot = await acquireHeavy(`${this.state.id} trial ${trial.number}`, {
+      concurrent: this.state.spec.parallel > 1,
+      cancelled: () => !this.running,
+      signal: this.abort.signal,
+      onQueued: (status) => this.hooks.log(`Trial ${trial.number} esperando vaga: ${status}.`),
+    });
+    if (!slot) {
+      return { code: null, timedOut: false, stdout: '', stderr: 'interrompido na fila' };
+    }
+    try {
+      return await this.spawnTrial(trial, progress, slot.env);
+    } finally {
+      slot.release();
+    }
+  }
+
+  private spawnTrial(trial: Trial, progress: string, env: NodeJS.ProcessEnv): Promise<{ code: number | null; timedOut: boolean; stdout: string; stderr: string }> {
     const s = this.state.spec;
     return new Promise((resolve) => {
       let stdout = '';
@@ -321,7 +352,7 @@ export class Sweep {
         cwd: s.workdir,
         shell: true,
         windowsHide: true,
-        env: { ...process.env, AGM_TRIAL: String(trial.number), AGM_PROGRESS: progress },
+        env: { ...env, AGM_TRIAL: String(trial.number), AGM_PROGRESS: progress },
       });
       this.children.add(child);
       child.stdout?.on('data', (b: Buffer) => (stdout = keep(stdout, b)));

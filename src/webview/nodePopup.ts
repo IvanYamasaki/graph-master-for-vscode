@@ -17,11 +17,14 @@
  *
  * Autossuficiente como o graph.ts: injeta o próprio <style> com prefixo `agm-pop`.
  */
-import { agentColor, STATUS_RING, lastCheckLabel, repeatLabel, watchLabel, type AgentInfo, type HistoryItem } from '../chat/protocol';
+import { agentColor, isWorking, STATUS_LABEL, STATUS_RING, lastCheckLabel, pendingText, repeatLabel, watchLabel, type AgentInfo, type HistoryItem } from '../chat/protocol';
 import type { WorktreeAction } from '../chat/protocol';
 import { createWorktreeRow, paintWorktreeRow } from './worktreeUi';
-import { createGuardRow, paintGuardRow } from './guardUi';
+import { budgetMeter, createGuardRow, paintGuardRow } from './guardUi';
+import { progressLabel, sumSpent } from '../chat/costs';
+import { fmtUsd } from '../chat/guard/format';
 import { createAttemptRow, paintAttemptRow } from './parallelUi';
+import { createProcRow, paintProcRow, type ProcRowDeps } from './procUi';
 
 export interface NodePopupDeps {
   getAgent(id: string): AgentInfo | undefined;
@@ -62,6 +65,8 @@ export interface NodePopupDeps {
   brainReady?(): boolean;
   /** Abre a nota do agente no cérebro (preview de Markdown). */
   openBrainNote?(id: string): void;
+  /** Tarefa de shell: árvore de processos lida pelo host, pedido de leitura, encerrar a árvore e abrir a lista de órfãos. */
+  procs?: ProcRowDeps;
 }
 
 /** O que o popup de uma caixa mostra. */
@@ -74,6 +79,8 @@ export interface BoxPopupInfo {
   collapsed: boolean;
   parentName?: string;
   childNames?: string[];
+  /** Gasto somado (agentes da caixa e das filhas) contra os tetos da caixa. */
+  spend?: { text: string; frac?: number; usd?: number };
 }
 
 export interface NodePopup {
@@ -151,6 +158,11 @@ const CSS = `
 .${P}-status { font-weight: 600; }
 .${P}-status.is-running { color: ${STATUS_RING.running}; }
 .${P}-status.is-failed, .${P}-status.is-stopped { color: ${STATUS_RING.halted}; }
+.${P}-status.is-waiting { color: ${STATUS_RING.waiting}; }
+.${P}-pend { color: var(--vscode-foreground, #ccc); line-height: 1.5; }
+.${P}-pend ul { margin: 4px 0 0 18px; padding: 0; }
+.${P}-pend li { margin: 1px 0; }
+.${P}-pend-note { font-style: italic; color: var(--vscode-descriptionForeground, #9aa0a6); margin-top: 6px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .${P}-time { font-variant-numeric: tabular-nums; }
 
 .${P}-body {
@@ -163,6 +175,8 @@ const CSS = `
 }
 .${P}-label + .${P}-label { margin-top: 0; }
 .${P}-section + .${P}-section { margin-top: 12px; }
+.${P}-meter { height: 3px; border-radius: 2px; background: rgba(128,128,128,0.25); overflow: hidden; margin: 2px 0 5px; }
+.${P}-meter-fill { height: 100%; border-radius: 2px; }
 .${P}-note { color: var(--vscode-descriptionForeground, #9aa0a6); line-height: 1.45; }
 .${P}-note.is-strong { color: var(--vscode-foreground, #ccc); }
 .${P}-summary { font-style: italic; color: var(--vscode-descriptionForeground, #9aa0a6); margin-top: 6px; line-height: 1.45; overflow-wrap: anywhere; }
@@ -323,13 +337,6 @@ function sameText(a: string | undefined, b: string | undefined): boolean {
   return !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
-const STATUS_LABEL: Record<AgentInfo['status'], string> = {
-  running: 'trabalhando',
-  completed: 'concluído',
-  failed: 'falhou',
-  stopped: 'parado',
-};
-
 const KIND_LABEL: Record<AgentInfo['kind'], string> = {
   subagent: 'subagente',
   routed: 'agente',
@@ -369,7 +376,7 @@ function fallbackDescribe(name: string, input: unknown): string {
 }
 
 function ringOf(a: AgentInfo): string {
-  return a.status === 'running' ? STATUS_RING.running : a.status === 'failed' || a.status === 'stopped' ? STATUS_RING.halted : '';
+  return a.status === 'running' ? STATUS_RING.running : a.status === 'waiting' ? STATUS_RING.waiting : a.status === 'failed' || a.status === 'stopped' ? STATUS_RING.halted : '';
 }
 
 function paintDot(dot: HTMLElement, a: AgentInfo): void {
@@ -445,7 +452,7 @@ function isWatching(a: AgentInfo): boolean {
 
 // ---------- componente ----------
 
-type Mode = 'root' | 'box' | 'running' | 'report' | 'none';
+type Mode = 'root' | 'box' | 'running' | 'waiting' | 'report' | 'none';
 type Side = 'right' | 'left' | 'below' | 'above';
 
 export function createNodePopup(deps: NodePopupDeps): NodePopup {
@@ -473,7 +480,8 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
   const wtRow = createWorktreeRow();
   const guardRow = createGuardRow();
   const attemptRow = createAttemptRow();
-  el.append(caret, h('div', `${P}-head`, dot, h('div', `${P}-titles`, title, kind), closeBtn), route, meta, guardRow, attemptRow, wtRow, body, actions);
+  const procRow = createProcRow();
+  el.append(caret, h('div', `${P}-head`, dot, h('div', `${P}-titles`, title, kind), closeBtn), route, meta, guardRow, attemptRow, wtRow, procRow, body, actions);
   document.body.append(el);
 
   let openId: string | undefined;
@@ -493,6 +501,8 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
   let summaryEl: HTMLElement | undefined;
   let recentList: HTMLOListElement | undefined;
   let recentSection: HTMLElement | undefined;
+  /** Seção "Aguardando" do agente com turno encerrado e trabalho pendente. */
+  let pendEl: HTMLElement | undefined;
   const rows = new Map<string, { li: HTMLLIElement; sig: string }>();
   let actionsSig = '';
   let stopping = false;
@@ -522,6 +532,9 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     if (a.status === 'running') {
       return 'running';
     }
+    if (a.status === 'waiting') {
+      return 'waiting';
+    }
     return reportOf(a) ? 'report' : 'none';
   }
 
@@ -538,6 +551,7 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     reportLabel = undefined;
     nowBox = undefined;
     summaryEl = undefined;
+    pendEl = undefined;
     recentList = undefined;
     recentSection = undefined;
     rows.clear();
@@ -557,12 +571,48 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
       recentList = h('ol', `${P}-list`);
       recentSection = h('div', `${P}-section`, h('div', `${P}-label`, 'Últimas ações'), recentList);
       body.append(h('div', `${P}-section`, h('div', `${P}-label`, 'Agora'), nowBox, summaryEl), recentSection);
+    } else if (m === 'waiting') {
+      pendEl = h('div', `${P}-pend`);
+      recentList = h('ol', `${P}-list`);
+      recentSection = h('div', `${P}-section`, h('div', `${P}-label`, 'Últimas ações'), recentList);
+      body.append(h('div', `${P}-section`, h('div', `${P}-label`, 'Aguardando'), pendEl), recentSection);
     } else if (m === 'none' && a) {
       summaryEl = h('div', `${P}-summary`);
       recentList = h('ol', `${P}-list`);
       recentSection = h('div', `${P}-section`, h('div', `${P}-label`, 'Últimas ações'), recentList);
       body.append(h('div', `${P}-section`, h('div', `${P}-note is-strong`, noReportText(a)), summaryEl), recentSection);
     }
+  }
+
+  /** O que falta para o relatório final: cada pendência numa linha, filhos com o status atual, e a nota do turno segurado. */
+  function paintPending(a: AgentInfo): void {
+    if (!pendEl) {
+      return;
+    }
+    const p = a.pending;
+    const kids = (p?.children ?? []).map((id) => {
+      const k = deps.getAgent(id);
+      return k ? `${id} (${k.description}): ${k.status === 'waiting' ? pendingText(k) || 'aguardando' : STATUS_LABEL[k.status]}` : id;
+    });
+    const sig = [p?.since ?? '', ...(p?.reasons ?? []), ...(p?.background?.map((t) => t.id + t.description) ?? []), ...kids, ...(p?.asked ?? []), p?.note ?? ''].join('|');
+    if (pendEl.dataset.sig === sig) {
+      return;
+    }
+    pendEl.dataset.sig = sig;
+    const lines: string[] = [];
+    for (const t of p?.background ?? []) {
+      lines.push(`processo em segundo plano: ${t.description}`);
+    }
+    lines.push(...kids.map((k) => `subagente ${k}`));
+    for (const who of p?.asked ?? []) {
+      lines.push(`resposta de ${who === 'main' ? 'conversa principal' : who}`);
+    }
+    const head = 'O turno acabou, mas o relatório final só sai quando isto terminar. O sistema acorda o agente sozinho; não é um agente preso.';
+    pendEl.replaceChildren(
+      h('div', '', head),
+      ...(lines.length ? [h('ul', '', ...lines.map((l) => h('li', '', l)))] : []),
+      ...(p?.note ? [h('div', `${P}-pend-note`, `Último texto do agente: ${p.note}`)] : []),
+    );
   }
 
   function noReportText(a: AgentInfo): string {
@@ -572,7 +622,10 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
       return last ? `${head} ${last[0].toUpperCase()}${last.slice(1)}.` : head;
     }
     if (a.status === 'failed') {
-      return 'Este agente falhou antes de entregar um relatório.';
+      return a.limit ? `Este agente parou por ${a.summary || 'limite de uso'} antes de entregar um relatório. Retomar pede para ele continuar de onde parou.` : 'Este agente falhou antes de entregar um relatório.';
+    }
+    if (a.status === 'lost') {
+      return 'Esta tarefa encerrou com a sessão anterior do Claude Code (processo reiniciado, conversa retomada ou compactada). Ela não roda mais, mas processos que ela lançou podem continuar vivos.';
     }
     if (a.status === 'stopped') {
       return a.restored ? 'Este agente está parado (veio do disco) e não entregou relatório.' : 'Este agente foi parado antes de entregar um relatório.';
@@ -677,7 +730,7 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
       timeEl = hasTime ? h('span', `${P}-time`) : undefined;
       watchEl = a.repeatEveryMinutes ? h('span', `${P}-watch`) : undefined;
       meta.replaceChildren(
-        ...([h('span', `${P}-status is-${a.status}`, watching && a.status !== 'running' ? 'vigiando' : STATUS_LABEL[a.status]), watchEl, timeEl, ...texts.map((t) => h('span', '', t))].filter(Boolean) as HTMLElement[]),
+        ...([h('span', `${P}-status is-${a.status}`, watching && a.status !== 'running' ? 'vigiando' : a.status === 'waiting' ? pendingText(a) || 'aguardando' : STATUS_LABEL[a.status]), watchEl, timeEl, ...texts.map((t) => h('span', '', t))].filter(Boolean) as HTMLElement[]),
       );
     }
     if (timeEl) {
@@ -693,6 +746,9 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     paintWorktreeRow(wtRow, a, deps.worktreeAction);
     paintGuardRow(guardRow, a);
     paintAttemptRow(attemptRow, a, deps.getAgents());
+    if (deps.procs) {
+      paintProcRow(procRow, a, deps.procs);
+    }
     if (m === 'report' && reportEl && reportLabel) {
       setText(
         reportLabel,
@@ -712,8 +768,13 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     if (m === 'running' && nowBox) {
       paintNow(a);
     }
+    if (m === 'waiting') {
+      paintPending(a);
+    }
     if (summaryEl) {
-      const summary = sameText(a.summary, a.description) ? '' : (a.summary?.trim() ?? '');
+      // A nota de progresso de agente que já concluiu aparece como antiga ("último progresso, antes de concluir").
+      const note = progressLabel(a);
+      const summary = [sameText(a.summary, a.description) ? '' : (a.summary?.trim() ?? ''), note ? note[0].toUpperCase() + note.slice(1) : ''].filter(Boolean).join(' · ');
       setText(summaryEl, summary);
       summaryEl.hidden = !summary;
     }
@@ -824,13 +885,14 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
 
   function paintActions(a: AgentInfo, m: Mode): void {
     const watching = isWatching(a);
-    const canStop = (a.status === 'running' && (a.kind === 'routed' || (a.kind === 'subagent' && !!a.taskId))) || watching;
-    // Vigia parado, restaurado ou não, religa pelo mesmo botão.
-    const canResume = a.restored || (!!a.repeatEveryMinutes && !watching);
+    // Aguardando também para: encerra a pendência e avisa quem esperava por ele.
+    const canStop = ((a.status === 'running' || a.status === 'waiting') && (a.kind === 'routed' || (a.kind === 'subagent' && !!a.taskId))) || watching;
+    // Vigia parado, restaurado ou não, religa pelo mesmo botão. Parado por limite de uso, o mesmo botão pede para continuar.
+    const canResume = a.restored || (!!a.repeatEveryMinutes && !watching) || (a.status === 'failed' && !!a.limit);
     const report = m === 'report' ? reportOf(a) : '';
     const leader = a.search?.kind === 'tournament' ? a.search.leader : undefined;
     const brainNote = !!deps.openBrainNote && !!deps.brainReady?.() && a.kind === 'routed' && !a.search && !a.infra && !a.repeatEveryMinutes;
-    const sig = `${a.id}|${m}|${canStop}|${!!report}|${canResume ? (a.sessionId ? 'r' : 'x') : ''}|${stopping}|${!!a.repeatEveryMinutes}|${leader?.id ?? ''}|${brainNote}`;
+    const sig = `${a.id}|${m}|${canStop}|${!!report}|${canResume ? (a.sessionId ? 'r' : 'x') : ''}|${stopping}|${!!a.repeatEveryMinutes}|${leader?.id ?? ''}|${brainNote}|${!!a.limit}`;
     if (sig === actionsSig) {
       return;
     }
@@ -867,9 +929,11 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     if (canResume) {
       const hint = a.repeatEveryMinutes
         ? `Liga de novo a verificação ${repeatLabel(a.repeatEveryMinutes)}.`
-        : 'Sobe o processo deste agente de novo, com o histórico inteiro dele.';
-      const resume = button(a.repeatEveryMinutes ? 'Retomar vigia' : 'Retomar', '', () => deps.resume(a.id), a.sessionId ? hint : 'A conversa deste agente não foi salva em disco, então não dá para retomá-lo.');
-      resume.disabled = !a.sessionId;
+        : a.limit && !a.restored
+          ? 'Pede ao agente para continuar de onde parou. Faça isso depois que o limite de uso liberar.'
+          : 'Sobe o processo deste agente de novo, com o histórico inteiro dele.';
+      const resume = button(a.repeatEveryMinutes ? 'Retomar vigia' : a.limit && !a.restored ? 'Tentar de novo' : 'Retomar', '', () => deps.resume(a.id), a.sessionId || (a.limit && !a.restored) ? hint : 'A conversa deste agente não foi salva em disco, então não dá para retomá-lo.');
+      resume.disabled = !a.sessionId && !(a.limit && !a.restored);
       list.push(resume);
     }
     if (canStop) {
@@ -916,13 +980,14 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     }
     meta.hidden = !extra.length;
 
-    const running = list.filter((a) => a.status === 'running');
+    const running = list.filter(isWorking);
     const done = list.filter((a) => a.status === 'completed').length;
     const halted = list.filter((a) => a.status === 'failed' || a.status === 'stopped').length;
     const tokens = list.reduce((s, a) => s + a.totalTokens, 0);
+    const usd = sumSpent(list.map((a) => a.spent)).usd;
     // A ordem da lista: quem roda primeiro, depois os mais recentes.
     const ordered = [...running, ...list.filter((a) => a.status !== 'running').reverse()];
-    const sig = [list.length, running.length, done, halted, tokens, ...ordered.map((a) => `${a.id}:${a.status}:${a.color ?? ''}:${a.lastTool ?? ''}:${a.description}`)].join('|');
+    const sig = [list.length, running.length, done, halted, tokens, usd?.toFixed(2) ?? '', ...ordered.map((a) => `${a.id}:${a.status}:${a.color ?? ''}:${a.lastTool ?? ''}:${a.description}`)].join('|');
     if (body.dataset.sig === sig) {
       return;
     }
@@ -936,6 +1001,7 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
       stat(String(done), done === 1 ? 'concluído' : 'concluídos'),
       halted ? stat(String(halted), 'pararam') : null,
       stat(fmtTokens(tokens), 'tokens'),
+      usd !== undefined ? stat(fmtUsd(usd), 'estimados') : null,
     );
     const rowsEl = ordered.slice(0, 12).map((a) => {
       const d = h('span', `${P}-dot`);
@@ -945,7 +1011,7 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
         `${P}-agent`,
         d,
         h('span', `${P}-agent-name`, a.description?.trim() || a.id),
-        h('span', `${P}-agent-side`, a.status === 'running' ? (a.lastTool ? toolLabel(a.lastTool) : 'trabalhando') : STATUS_LABEL[a.status]),
+        h('span', `${P}-agent-side`, a.status === 'running' ? (a.lastTool ? toolLabel(a.lastTool) : 'trabalhando') : a.status === 'waiting' ? pendingText(a) || 'aguardando' : STATUS_LABEL[a.status]),
       );
       b.type = 'button';
       b.addEventListener('click', () => {
@@ -966,6 +1032,20 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     );
     actionsSig = 'root';
     actions.replaceChildren();
+  }
+
+  /** Gasto da caixa contra o orçamento dela, com a barra quando há teto. */
+  function spendSection(spend: { text: string; frac?: number }): HTMLElement {
+    const parts: HTMLElement[] = [h('div', `${P}-label`, spend.frac !== undefined ? `Orçamento da caixa · ${Math.round(spend.frac * 100)}%` : 'Gasto da caixa')];
+    if (spend.frac !== undefined) {
+      const m = budgetMeter(spend.frac);
+      const fill = h('div', `${P}-meter-fill`);
+      fill.style.width = `${Math.round(m.frac * 100)}%`;
+      fill.style.background = m.color;
+      parts.push(h('div', `${P}-meter`, fill));
+    }
+    parts.push(h('div', `${P}-note`, spend.text));
+    return h('div', `${P}-section`, ...parts);
   }
 
   function paintBox(boxId: string, b: BoxPopupInfo): void {
@@ -990,12 +1070,13 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     watchEl = undefined;
 
     const list = b.agents;
-    const running = list.filter((a) => a.status === 'running');
+    const running = list.filter(isWorking);
     const done = list.filter((a) => a.status === 'completed').length;
     const halted = list.filter((a) => a.status === 'failed' || a.status === 'stopped').length;
     const tokens = list.reduce((s, a) => s + a.totalTokens, 0);
     const time = list.reduce((s, a) => s + duration(a), 0);
-    const sig = [boxId, list.length, running.length, done, halted, tokens, ...list.map((a) => `${a.id}:${a.status}:${a.color ?? ''}:${a.totalTokens}:${a.description}`)].join('|');
+    const spend = b.spend;
+    const sig = [boxId, list.length, running.length, done, halted, tokens, spend?.text ?? '', ...list.map((a) => `${a.id}:${a.status}:${a.color ?? ''}:${a.totalTokens}:${a.description}`)].join('|');
     if (body.dataset.sig !== sig) {
       body.dataset.sig = sig;
       const stat = (n: string, label: string): HTMLElement => h('div', `${P}-stat`, h('b', '', n), h('span', '', label));
@@ -1036,7 +1117,9 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
           halted ? stat(String(halted), 'pararam') : null,
           stat(fmtTokens(tokens), 'tokens'),
           stat(fmtDuration(time), 'tempo somado'),
+          spend?.usd !== undefined ? stat(fmtUsd(spend.usd), 'estimados') : null,
         ),
+        ...(spend ? [spendSection(spend)] : []),
         h('div', `${P}-section`, h('div', `${P}-label`, 'Agentes da caixa'), ...rowsEl),
       );
     }

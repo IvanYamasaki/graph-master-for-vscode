@@ -6,6 +6,7 @@ import type { PermissionMode, SessionMessage } from '@anthropic-ai/claude-agent-
 import { getSessionInfo, getSessionMessages, listSessions } from '@anthropic-ai/claude-agent-sdk';
 import { Profile, ProfileStore, configDirEnv, isCodex } from '../profiles';
 import { AgentRecord, ChatSession, profileEnv, toolResultImages, toolResultText } from './session';
+import { isClaudeUrl } from './remoteControl';
 import { CodexSession, codexModelOptions, knownCodexModels, prefetchCodexModels } from './codexSession';
 import { AgentHub, AnySession, MAIN_ID, browserApproval } from './hub';
 import type { LabReports } from './lab/reportHost';
@@ -16,6 +17,8 @@ import { ExternalProviders } from './external';
 import { probeBrowsers } from './browserProbe';
 import { resolveClaudeExecutable } from '../claudePath';
 import { CompanionLink, CompanionPanel } from './companion/panel';
+import { RECONCILE_EVERY_MS } from './taskLiveness';
+import { StampedKill, killSnapshot, killSummary, orphanDetail, scanOrphans, snapFromView } from './taskProcs';
 import type { CompanionAgent, CompanionSource, MainMessage } from './companion/types';
 
 export const CHAT_VIEW_TYPE = 'agentGraphMaster.chat';
@@ -61,6 +64,32 @@ interface PanelState {
   sessionId?: string;
 }
 
+/**
+ * Confirmação modal do Remote Control com o modo bypass. `toggle`: o usuário ligou. `startup`: a configuração ligou.
+ * `mode`: o modo virou bypass com a ponte ligada. `restart`: o processo novo ia religar a ponte em bypass.
+ */
+async function confirmRemoteBypass(why: 'toggle' | 'startup' | 'mode' | 'restart'): Promise<boolean> {
+  const title = {
+    toggle: 'Ligar o Remote Control com as permissões ignoradas (bypass)?',
+    startup: 'Ligar o Remote Control neste chat (agentGraphMaster.remoteControlAtStartup)?',
+    mode: 'O modo virou bypass com o Remote Control ligado. Manter o Remote Control?',
+    restart: 'Religar o Remote Control com o modo bypass?',
+  }[why];
+  const button = why === 'toggle' || why === 'startup' ? 'Ligar mesmo assim' : 'Manter ligado';
+  const ok = await vscode.window.showWarningMessage(
+    title,
+    {
+      modal: true,
+      detail:
+        'Este chat roda em modo bypass: o Claude executa comandos e edita arquivos sem pedir aprovação.\n\n' +
+        'Com o Remote Control ligado, quem tiver acesso à sua conta claude.ai (navegador ou app do celular) manda mensagens para esta sessão e, por ela, controla esta máquina sem nenhuma confirmação.\n\n' +
+        (why === 'mode' || why === 'restart' ? 'Cancelar desliga o Remote Control.' : 'Se não quiser isso, cancele e troque o modo de permissão antes.'),
+    },
+    button,
+  );
+  return ok === button;
+}
+
 export class ChatPanel {
   private static readonly all = new Set<ChatPanel>();
 
@@ -81,6 +110,8 @@ export class ChatPanel {
   /** Navegadores conectados à conta, lidos da ponte do Claude in Chrome. Relidos ao ligar e no clique do indicador. */
   private browsers?: { list?: ConnectedBrowser[]; error?: string; at: number };
   private probing = false;
+  /** Reconciliação periódica das tarefas "trabalhando" com o que o CLI ainda conhece. */
+  private reconcileTimer?: ReturnType<typeof setInterval>;
 
   static open(env: ChatEnv, profile: Profile, options: ChatOptions = {}): ChatPanel {
     const panel = vscode.window.createWebviewPanel(
@@ -107,6 +138,29 @@ export class ChatPanel {
   }
 
   static {
+    // Comando da paleta: abre a lista de órfãos no chat ativo; sem chat aberto, a lista vem num seletor do VS Code.
+    vscode.commands.registerCommand('agentGraphMaster.orphanProcesses', async () => {
+      const list = [...ChatPanel.all];
+      const target = list.find((p) => p.panel.active) ?? list.at(-1);
+      if (target) {
+        target.panel.reveal();
+        await target.postOrphans(true);
+        return;
+      }
+      await pickOrphans(workspaceCwd());
+    });
+    // Comando da paleta: liga ou desliga o Remote Control do chat ativo (ou do último aberto).
+    vscode.commands.registerCommand('agentGraphMaster.remoteControl', async () => {
+      const list = [...ChatPanel.all];
+      const target = list.find((p) => p.panel.active) ?? list.at(-1);
+      if (!target) {
+        void vscode.window.showInformationMessage('Abra um chat do Agent Graph Master para ligar o Remote Control.');
+        return;
+      }
+      target.panel.reveal();
+      const s = target.session;
+      await target.setRemoteControl(!(s instanceof ChatSession && (s.remote.mayReceive || s.remote.state.status === 'connected')));
+    });
     CompanionPanel.setup({
       findLink: (mainSessionId) => [...ChatPanel.all].find((p) => p.session.sessionId === mainSessionId)?.link(),
       loadHistory: async (profile, cwd, sessionId) => toHistory(await withConfigDir(profile, () => getSessionMessages(sessionId, { dir: cwd }))),
@@ -166,9 +220,17 @@ export class ChatPanel {
           systemAppend: () => this.hub.systemAppendFor(MAIN_ID),
           chrome: chromeAtStart,
           browserApproval,
+          remoteControl: true,
         });
     if (this.session instanceof ChatSession) {
       this.session.onBrowserChange = () => this.postBrowser();
+      this.session.onRemoteConfirm = (why) => this.askRemoteBypass(why);
+      this.session.onOrphanHint = (text) => this.post({ type: 'notice', level: 'info', text, action: { kind: 'orphans', label: 'Processos órfãos' } });
+      this.reconcileTimer = setInterval(() => {
+        if (this.session instanceof ChatSession && this.session.hasRunningTasks) {
+          this.session.reconcileTasks();
+        }
+      }, RECONCILE_EVERY_MS);
     }
     this.files = FileIndex.acquire(cwd);
     // Aba restaurada já volta com o título que tinha; o nome da sessão chega logo depois pela leitura abaixo.
@@ -190,6 +252,7 @@ export class ChatPanel {
     panel.onDidDispose(() => {
       ChatPanel.all.delete(this);
       clearInterval(this.usageTimer);
+      clearInterval(this.reconcileTimer);
       this.files.release();
       editorWatch.forEach((d) => d?.dispose());
       this.hub.dispose();
@@ -199,11 +262,25 @@ export class ChatPanel {
       }
     });
 
+    // Início e fim de turno da conversa principal: o hub decide se o texto é a resposta a quem perguntou ao main.
+    this.session.onBusyChange = (busy) => {
+      if (busy) {
+        this.hub.noteMainTurnStart();
+      }
+    };
+    this.session.onTurnEnd = (turn) => this.hub.onMainTurnEnd(this.session.lastTurnText, turn.queued);
     if (options.fork) {
       const { parent, forkId } = options.fork;
-      this.session.onBusyChange = (busy) => parent.updateFork(forkId, { status: busy ? 'running' : 'completed' });
-      this.session.onTurnEnd = ({ contextTokens, isError }) =>
-        parent.updateFork(forkId, { totalTokens: contextTokens, status: isError ? 'failed' : 'completed', model: this.session.model || undefined });
+      const ownBusy = this.session.onBusyChange;
+      this.session.onBusyChange = (busy) => {
+        ownBusy?.(busy);
+        parent.updateFork(forkId, { status: busy ? 'running' : 'completed' });
+      };
+      const own = this.session.onTurnEnd;
+      this.session.onTurnEnd = (turn) => {
+        own?.(turn);
+        parent.updateFork(forkId, { totalTokens: turn.contextTokens, status: turn.isError ? 'failed' : 'completed', model: this.session.model || undefined });
+      };
     }
   }
 
@@ -234,8 +311,34 @@ export class ChatPanel {
     switch (msg.type) {
       case 'ready':
         await this.onReady();
+        // Painel aberto (ou recarregado): o que diz "trabalhando" tem de estar vivo.
+        if (this.session instanceof ChatSession) {
+          this.session.reconcileTasks();
+        }
+        return;
+      case 'taskProcs': {
+        const read = this.session instanceof ChatSession ? await this.session.taskProcs(msg.id) : undefined;
+        if (read) {
+          this.post({ type: 'taskProcs', procs: read.procs });
+        }
+        return;
+      }
+      case 'killTaskTree':
+        await this.killTaskTree(msg.id);
+        return;
+      case 'scanOrphans':
+        await this.postOrphans(false);
+        return;
+      case 'killOrphans':
+        await this.killOrphans(msg.roots);
         return;
       case 'send':
+        // /remote-control (ou /rc) digitado no chat liga e desliga, como na extensão oficial; o CLI não o trata fora do terminal.
+        if (/^\/(remote-control|rc)\s*$/i.test(msg.text.trim()) && this.session instanceof ChatSession && !msg.attachments?.length) {
+          const s = this.session;
+          await this.setRemoteControl(!(s.remote.mayReceive || s.remote.state.status === 'connected'));
+          return;
+        }
         // Novidades do cérebro guardadas para o orquestrador vão na frente da mensagem (sem abrir turno à parte).
         this.session.send(this.hub.brain.withNews(MAIN_ID, msg.text), msg.attachments);
         return;
@@ -342,6 +445,9 @@ export class ChatPanel {
       case 'refreshBrowsers':
         await this.refreshBrowsers();
         return;
+      case 'remoteControl':
+        await this.remoteControlAction(msg.action);
+        return;
       case 'worktreeAction':
         await this.hub.worktreeAction(msg.id, msg.action);
         return;
@@ -395,6 +501,9 @@ export class ChatPanel {
     }
     this.postActiveFile();
     this.postBrowser();
+    if (this.session instanceof ChatSession) {
+      this.post({ type: 'remoteControl', state: this.session.remote.state });
+    }
     this.post({ type: 'brain', exists: this.hub.brain.isActive });
     for (const msg of this.outbox.splice(0)) {
       void this.panel.webview.postMessage(msg);
@@ -416,6 +525,165 @@ export class ChatPanel {
       this.session.send(this.options.seed.prompt);
     }
     this.startUsagePolling();
+    // Remote Control ao abrir o chat só com a configuração ligada; em bypass passa pela mesma confirmação do interruptor.
+    if (this.session instanceof ChatSession && vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('remoteControlAtStartup', false)) {
+      await this.setRemoteControl(true, true);
+    }
+  }
+
+  // ---------- Remote Control ----------
+
+  /**
+   * Liga ou desliga o Remote Control desta conversa. Em bypass, ligar pede confirmação modal: quem entrar na conta
+   * claude.ai controla esta máquina pelo Claude sem aprovação nenhuma.
+   */
+  async setRemoteControl(on: boolean, atStartup = false): Promise<void> {
+    if (!(this.session instanceof ChatSession)) {
+      this.post({ type: 'notice', level: 'error', text: 'O Remote Control só funciona em conversas do Claude (não do Codex).' });
+      return;
+    }
+    const session = this.session;
+    if (!on) {
+      await session.setRemoteControl(false);
+      return;
+    }
+    if (!session.remote.available) {
+      this.post({ type: 'notice', level: 'error', text: `Remote Control indisponível: ${session.remote.state.reason ?? 'o Claude Code não permite nesta conta ou organização'}.` });
+      return;
+    }
+    if (session.permissionMode === 'bypassPermissions') {
+      const ok = await confirmRemoteBypass(atStartup ? 'startup' : 'toggle');
+      if (!ok) {
+        if (atStartup) {
+          this.post({ type: 'notice', level: 'info', text: 'Remote Control não ligado neste chat (confirmação recusada).' });
+        }
+        return;
+      }
+      session.remote.bypassConfirmed = true;
+    }
+    // O painel anuncia conectado, queda e motivo a cada mudança de estado (mensagem remoteControl).
+    await session.setRemoteControl(true);
+  }
+
+  /**
+   * O modo virou bypass com a ponte ligada, ou o processo novo ia religá-la em bypass: pergunta de novo. Recusar
+   * desliga a ponte. Um modal por vez: pedidos que chegam com ele aberto esperam a mesma resposta.
+   */
+  private remoteConfirm?: Promise<void>;
+  private askRemoteBypass(why: 'mode' | 'restart'): void {
+    if (!(this.session instanceof ChatSession) || this.remoteConfirm) {
+      return;
+    }
+    const session = this.session;
+    this.remoteConfirm = (async () => {
+      const ok = await confirmRemoteBypass(why);
+      await session.confirmRemoteBypass(ok);
+      if (!ok) {
+        this.post({ type: 'notice', level: 'info', text: 'Remote Control desligado: o modo bypass não foi confirmado para uso remoto.' });
+      }
+    })().finally(() => (this.remoteConfirm = undefined));
+  }
+
+  private async remoteControlAction(action: 'on' | 'off' | 'open' | 'copy'): Promise<void> {
+    if (action === 'on' || action === 'off') {
+      await this.setRemoteControl(action === 'on');
+      return;
+    }
+    const url = this.session instanceof ChatSession ? this.session.remote.state.sessionUrl : undefined;
+    if (!url) {
+      return;
+    }
+    if (action === 'open') {
+      // Só abre https no claude.ai: o link vem do CLI, mas o navegador não abre nada que ele não devia mandar.
+      if (!isClaudeUrl(url)) {
+        this.post({ type: 'notice', level: 'error', text: `Link do Remote Control fora do claude.ai, não abri: ${url}` });
+        return;
+      }
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+    } else {
+      await vscode.env.clipboard.writeText(url);
+      this.post({ type: 'notice', level: 'info', text: 'Link da sessão copiado.' });
+    }
+  }
+
+  // ---------- Processos das tarefas de shell ----------
+
+  /**
+   * Encerra a árvore de uma tarefa de shell, depois de confirmar num diálogo modal. Só o que a leitura mostrou ao usuário
+   * pode morrer: a foto (PID, nome, início) é conferida de novo depois do modal, e o que não bater fica vivo.
+   */
+  private async killTaskTree(id: string): Promise<void> {
+    if (!(this.session instanceof ChatSession)) {
+      return;
+    }
+    const session = this.session;
+    const record = session.agents.get(id);
+    const read = await session.taskProcs(id);
+    if (!record || !read) {
+      return;
+    }
+    this.post({ type: 'taskProcs', procs: read.procs });
+    if (!read.procs.root) {
+      const why = read.procs.identified ? 'os processos dela já encerraram' : 'o processo dela não foi identificado enquanto ela rodava; veja Processos órfãos';
+      this.post({ type: 'notice', level: 'info', text: `Nada a encerrar na tarefa "${record.info.description}": ${why}.`, action: read.procs.identified ? undefined : { kind: 'orphans', label: 'Processos órfãos' } });
+      return;
+    }
+    const detail = read.procs.members.map((m) => `${m.pid} ${m.name}${m.ports.length ? ` (porta ${m.ports.join(', ')})` : ''}${m.startedAt ? ` · desde ${new Date(m.startedAt).toLocaleTimeString()}` : ''}`).join('\n');
+    const ok = await vscode.window.showWarningMessage(
+      `Encerrar ${read.procs.members.length} ${read.procs.members.length === 1 ? 'processo' : 'processos'} da tarefa "${record.info.description}"?`,
+      { modal: true, detail },
+      'Encerrar',
+    );
+    if (ok !== 'Encerrar') {
+      return;
+    }
+    if (record.info.status === 'running') {
+      // Parar pelo SDK também mata a árvore pela foto; o registro da tarefa sai direito.
+      await session.stopAgent(id);
+    }
+    const r = await killSnapshot(read.snap);
+    if (r.killed.length || r.failed.length || r.refused || r.skipped?.length) {
+      this.post({ type: 'notice', level: r.failed.length || r.refused ? 'error' : 'info', text: `Tarefa "${record.info.description}": ${killSummary(r)}.` });
+    }
+    const after = await session.taskProcs(id);
+    if (after) {
+      this.post({ type: 'taskProcs', procs: after.procs });
+    }
+  }
+
+  /** Lê os órfãos do projeto e manda ao webview; `open` abre a lista. */
+  async postOrphans(open: boolean): Promise<void> {
+    const found = await scanOrphans(this.session.cwd);
+    this.post({ type: 'orphans', groups: found.groups, error: found.error, scannedAt: new Date().toISOString(), open });
+  }
+
+  /**
+   * Encerra as árvores órfãs com estas raízes, depois de confirmar num diálogo modal. A lista é relida: raiz que não
+   * bate mais (PID reaproveitado, processo já encerrado) não entra, e o que mudou na árvore depois da leitura fica vivo.
+   */
+  private async killOrphans(roots: { pid: number; name: string; startedAt?: string }[]): Promise<void> {
+    const found = await scanOrphans(this.session.cwd);
+    const wanted = roots.map(snapFromView);
+    const groups = found.groups.filter((g) => wanted.some((w) => w.pid === g.root.pid && w.name.toLowerCase() === g.root.name.toLowerCase() && sameStart(w.startedAt, g.root.startedAt)));
+    const missing = roots.filter((r) => !groups.some((g) => g.root.pid === r.pid));
+    if (!groups.length) {
+      this.post({ type: 'notice', level: 'info', text: 'As árvores escolhidas já não estão na lista de órfãos (encerraram ou o PID mudou de dono). Nada foi encerrado.' });
+      this.post({ type: 'orphans', groups: found.groups, error: found.error, scannedAt: new Date().toISOString() });
+      return;
+    }
+    const total = groups.reduce((n, g) => n + g.members.length, 0);
+    const alive = groups.filter((g) => g.parentAlive).length;
+    const ok = await vscode.window.showWarningMessage(
+      `Encerrar ${groups.length === 1 ? 'a árvore órfã' : `${groups.length} árvores órfãs`} (${total} ${total === 1 ? 'processo' : 'processos'})?${alive ? ` ${alive === 1 ? 'Uma delas foi aberta' : `${alive} delas foram abertas`} por um processo que ainda está aberto (terminal externo, outro claude).` : ''}`,
+      { modal: true, detail: orphanDetail(groups) + (missing.length ? `\n\nFora da lista agora (não serão tocados): ${missing.map((m) => m.pid).join(', ')}` : '') },
+      'Encerrar',
+    );
+    if (ok !== 'Encerrar') {
+      return;
+    }
+    const r = await killGroups(groups.map((g) => found.snaps.get(g.root.pid) ?? []));
+    this.post({ type: 'notice', level: r.failed.length || r.refused ? 'error' : 'info', text: `Processos órfãos: ${killSummary(r)}${missing.length ? `; ${missing.length} já não estavam na lista` : ''}.` });
+    await this.postOrphans(false);
   }
 
   // ---------- Navegador (Claude in Chrome) ----------
@@ -619,13 +887,17 @@ export class ChatPanel {
       fork: { parent: this, forkId, description: record.info.description },
       seed: { display: msg.text, prompt: buildSeed(record, msg.text) },
     });
-    child.session.onTurnEnd = ({ contextTokens, isError }) =>
+    // Encadeia com o que o chat filho já ligou (o hub dele e o fork), em vez de substituir.
+    const own = child.session.onTurnEnd;
+    child.session.onTurnEnd = (turn) => {
+      own?.(turn);
       this.updateFork(forkId, {
-        totalTokens: contextTokens,
+        totalTokens: turn.contextTokens,
         durationMs: Date.now() - started,
-        status: isError ? 'failed' : 'completed',
+        status: turn.isError ? 'failed' : 'completed',
         model: child.session.model || undefined,
       });
+    };
   }
 
   /** Continuar uma continuação: o registro vem do chat filho. */
@@ -1042,4 +1314,73 @@ function buildSeed(record: AgentRecord, userText: string): string {
   ]
     .filter((l, i, arr) => !(l === '' && arr[i - 1] === ''))
     .join('\n');
+}
+
+/** Mesma hora de início, com folga de 1 s; sem hora de um dos lados, não dá para desmentir. */
+function sameStart(a: Date | undefined, b: string | undefined): boolean {
+  return !a || !b || Math.abs(a.getTime() - Date.parse(b)) <= 1000;
+}
+
+/** Encerra cada árvore pela foto dela, somando os resultados. */
+async function killGroups(snaps: import('./proc').ProcSnap[][]): Promise<StampedKill> {
+  const total: StampedKill = { killed: [], failed: [] };
+  const skipped: number[] = [];
+  const refused: string[] = [];
+  for (const snap of snaps) {
+    const r = await killSnapshot(snap);
+    total.killed.push(...r.killed);
+    total.failed.push(...r.failed);
+    skipped.push(...(r.skipped ?? []));
+    if (r.refused) {
+      refused.push(r.refused);
+    }
+  }
+  if (skipped.length) {
+    total.skipped = skipped;
+  }
+  if (refused.length) {
+    total.refused = refused.join('; ');
+  }
+  return total;
+}
+
+function shortCommand(command: string): string {
+  const one = command.replace(/\s+/g, ' ').trim();
+  return one.length > 90 ? `${one.slice(0, 89)}…` : one;
+}
+
+/** Órfãos sem chat aberto: seletor múltiplo do VS Code e confirmação modal. Árvores de pai vivo vêm desmarcadas e sinalizadas. */
+async function pickOrphans(cwd: string): Promise<void> {
+  const found = await scanOrphans(cwd);
+  if (!found.groups.length) {
+    void vscode.window.showInformationMessage(found.error ? `Não consegui listar os processos: ${found.error}` : 'Nenhum processo órfão do projeto.');
+    return;
+  }
+  const items = found.groups.map((g) => ({
+    label: `${g.parentAlive ? '$(warning) ' : ''}${g.root.pid} ${g.root.name}`,
+    description: [
+      g.ports.length ? `porta ${g.ports.join(', ')}` : '',
+      `${g.members.length} ${g.members.length === 1 ? 'processo' : 'processos'}`,
+      g.root.startedAt ? `desde ${new Date(g.root.startedAt).toLocaleString()}` : '',
+      g.parentAlive ? `pai ${g.parent?.name ?? '?'} ${g.parent?.pid ?? ''} ainda aberto` : 'pai encerrado',
+    ]
+      .filter(Boolean)
+      .join(' · '),
+    detail: shortCommand(g.root.commandLine),
+    group: g,
+  }));
+  const picked = await vscode.window.showQuickPick(items, { canPickMany: true, title: 'Processos órfãos do projeto: marque as árvores para encerrar' });
+  if (!picked?.length) {
+    return;
+  }
+  const ok = await vscode.window.showWarningMessage(
+    `Encerrar ${picked.length === 1 ? 'a árvore marcada' : `${picked.length} árvores marcadas`}?`,
+    { modal: true, detail: orphanDetail(picked.map((p) => p.group)) },
+    'Encerrar',
+  );
+  if (ok === 'Encerrar') {
+    // killSnapshot relê a lista e só mata o que ainda bate com a foto tirada antes do seletor.
+    const r = await killGroups(picked.map((p) => found.snaps.get(p.group.root.pid) ?? []));
+    void vscode.window.showInformationMessage(`Processos órfãos: ${killSummary(r)}.`);
+  }
 }

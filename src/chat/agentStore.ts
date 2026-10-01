@@ -16,7 +16,7 @@ const MAX_REPORT_CHARS = 8000;
 /** Junta as gravações de uma rajada de updates numa só. */
 const SAVE_DELAY_MS = 1000;
 
-const STATUSES: readonly AgentStatus[] = ['running', 'completed', 'failed', 'stopped'];
+const STATUSES: readonly AgentStatus[] = ['running', 'waiting', 'completed', 'failed', 'stopped'];
 
 /** O que de um agente roteado sobrevive ao fechamento da janela. */
 export interface StoredAgent {
@@ -58,6 +58,9 @@ export interface StoredAgent {
   spent?: AgentSpent;
   /** Caminhos protegidos pedidos no spawn_agent (os do projeto vêm de .agm/protected.json). */
   protectedPaths?: string[];
+  /** Arquivos reivindicados (owns) e se o agente sobe com os MCP do usuário; ao retomar, valem de novo. */
+  owns?: string[];
+  userMcp?: boolean;
   /** Tentativa de Best-of-N: grupo, posição e, com o grupo fechado, valor, ranking e vencedora. */
   attempt?: AttemptInfo;
   /** Verificador independente: hipótese e veredito que ele verifica. */
@@ -195,6 +198,12 @@ function toStored(info: AgentInfo): StoredAgent {
   if (info.protectedPaths?.length) {
     stored.protectedPaths = [...info.protectedPaths];
   }
+  if (info.owns?.length) {
+    stored.owns = [...info.owns];
+  }
+  if (info.userMcp) {
+    stored.userMcp = true;
+  }
   if (info.attempt) {
     stored.attempt = { ...info.attempt };
   }
@@ -268,6 +277,8 @@ function toAgent(raw: unknown): StoredAgent | undefined {
     budget: toBudget(raw.budget),
     spent: toSpent(raw.spent),
     protectedPaths: Array.isArray(raw.protectedPaths) ? raw.protectedPaths.filter((p): p is string => typeof p === 'string' && !!p) : undefined,
+    owns: Array.isArray(raw.owns) ? raw.owns.filter((p): p is string => typeof p === 'string' && !!p) : undefined,
+    userMcp: raw.userMcp === true ? true : undefined,
     attempt: toAttempt(raw.attempt),
     verifier: isRecord(raw.verifier) && str(raw.verifier.hypothesisId) && str(raw.verifier.verdictId) ? { hypothesisId: str(raw.verifier.hypothesisId)!, verdictId: str(raw.verifier.verdictId)! } : undefined,
     box: str(raw.box),
@@ -284,7 +295,7 @@ function toBox(raw: unknown): BoxInfo | undefined {
   if (!id || !name) {
     return undefined;
   }
-  return { id, name, description: str(raw.description), color: str(raw.color), parent: str(raw.parent), createdAt: str(raw.createdAt) ?? new Date(0).toISOString() };
+  return { id, name, description: str(raw.description), color: str(raw.color), parent: str(raw.parent), budget: toBudget(raw.budget), createdBy: str(raw.createdBy), closed: raw.closed === true ? true : undefined, createdAt: str(raw.createdAt) ?? new Date(0).toISOString() };
 }
 
 function toBudget(raw: unknown): AgentBudget | undefined {

@@ -1,17 +1,20 @@
 import { Marked } from 'marked';
 import { createAgentGraph } from './graph';
-import { boxStats, boxCountText, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
+import { boxSpend, boxStats, boxCountText, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
 import { createNodePopup } from './nodePopup';
 import { createLabCards } from './labCards';
 import { createLabView } from './labTree';
 import { createGuardCards } from './guardCards';
 import { STUCK_RING } from './guardUi';
-import { COMPANION_MARK, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
+import { COMPANION_MARK, isWorking, STATUS_LABEL, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, pendingText, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
 import { COMPANION_ICON, COMPANION_OPEN_TITLE, createCompanionUi } from './companionUi';
 import type { CompanionInit } from '../chat/companion/types';
 import { describeBrowserAction, isBrowserTool } from '../chat/browser';
 import type { BrowserStatus } from '../chat/browser';
-import type { ConnectedBrowser } from '../chat/protocol';
+import type { ConnectedBrowser, RemoteControlState } from '../chat/protocol';
+import { remoteStatusText, remoteTransitionNotice } from '../chat/remoteControl';
+import type { TaskProcs } from '../chat/protocol';
+import { createOrphansView } from './orphansUi';
 import type { BoxInfo } from '../chat/protocol';
 import type { AgentInfo, Attachment, ExternalProviderName, HistoryItem, HostMessage, ModelOption, NoticeAction, ProfileOption, FileResult, SessionOption, SlashCommandOption, TaskProposal, UsageInfo, WebviewMessage } from '../chat/protocol';
 
@@ -132,6 +135,8 @@ const state = {
     browsers?: ConnectedBrowser[];
     browsersError?: string;
   },
+  /** Remote Control desta conversa (claude.ai/code e app do celular). */
+  remote: { status: 'off' } as RemoteControlState,
 };
 
 /** "Claude" ou "Codex": entra no cabeçalho, no placeholder e nos títulos dos botões. */
@@ -286,6 +291,7 @@ const agentsPill = pill('agents hidden', 'Agentes desta conversa', () => openMap
 /** Decisões esperando o usuário (permissões, tarefas externas, alertas do guarda). Abre a lista; cada item leva ao cartão. */
 const pendingPill = pill('pending-pill hidden', 'Decisões esperando você', (e) => openPendingMenu(e.currentTarget as HTMLElement));
 const browserPill = pill('quiet browser hidden', 'Claude in Chrome', (e) => openBrowserMenu(e.currentTarget as HTMLElement));
+const remotePill = pill('quiet remote hidden', 'Remote Control', (e) => openRemoteMenu(e.currentTarget as HTMLElement));
 const modelPill = pill('cap', 'Modelo e nível de raciocínio', (e) => openModelMenu(e.currentTarget as HTMLElement));
 const modePill = pill('quiet mode', 'Modo de permissão', (e) => openModeMenu(e.currentTarget as HTMLElement));
 agentsPill.setAttribute('aria-label', 'Mapa de agentes');
@@ -304,7 +310,7 @@ const composer = h(
     'div',
     { class: 'box' },
     input,
-    h('div', { class: 'row' }, addBtn, mentionBtn, workingDot, pendingPill, clockPill, agentsPill, browserPill, modelPill, h('div', { class: 'spacer' }), modePill, sendBtn),
+    h('div', { class: 'row' }, addBtn, mentionBtn, workingDot, pendingPill, clockPill, agentsPill, browserPill, remotePill, modelPill, h('div', { class: 'spacer' }), modePill, sendBtn),
   ),
   usageBar,
 );
@@ -767,6 +773,26 @@ function openAddMenu(): void {
             ? 'Desliga o Claude in Chrome nesta conversa (reinicia a sessão e continua a mesma conversa).'
             : 'Liga o Claude in Chrome nesta conversa: o Claude controla o Chrome em que a extensão está conectada. Cliques e digitação pedem aprovação.',
           onPick: () => send({ type: 'setChrome', value: !b.on }),
+        },
+      ],
+    });
+  }
+  if (state.provider === 'claude') {
+    const r = state.remote;
+    const on = r.status === 'connecting' || r.status === 'connected' || (r.status === 'disconnected' && (!!r.sessionUrl || !!r.stuck));
+    sections.push({
+      title: 'Remote Control',
+      items: [
+        {
+          icon: 'remote',
+          label: 'Continuar pelo celular ou claude.ai (Remote Control)',
+          selected: on,
+          disabled: r.status === 'unavailable',
+          detail: r.status === 'unavailable' ? (r.reason ?? 'indisponível') : r.status === 'off' ? undefined : remoteStatusText(r),
+          title: on
+            ? 'Desliga o Remote Control: a sessão no claude.ai deixa de receber e mandar mensagens para este chat.'
+            : 'Liga o Remote Control: esta conversa passa a aceitar mensagens do claude.ai/code e do app do Claude no celular. Precisa de login com conta claude.ai. Em modo bypass, pede confirmação.',
+          onPick: () => send({ type: 'remoteControl', action: on ? 'off' : 'on' }),
         },
       ],
     });
@@ -1564,6 +1590,56 @@ function openBrowserMenu(anchor: HTMLElement): void {
   ]);
 }
 
+/** Indicador do Remote Control no composer: aparece ligado, conectando ou caído. O clique abre link, copiar e desligar. */
+function renderRemotePill(): void {
+  const r = state.remote;
+  const show = state.provider === 'claude' && (r.status === 'connecting' || r.status === 'connected' || r.status === 'disconnected');
+  remotePill.classList.toggle('hidden', !show);
+  if (!show) {
+    return;
+  }
+  const dot = r.status === 'connected' ? 'connected' : r.status === 'connecting' ? 'pending' : 'failed';
+  fill(remotePill, icon('remote'), h('span', { class: `bstate ${dot}` }), h('span', {}, 'Remote Control'));
+  remotePill.classList.toggle('warn', r.status === 'disconnected');
+  remotePill.title = [
+    `Remote Control ${remoteStatusText(r)}.`,
+    r.sessionUrl ? `Sessão: ${r.sessionUrl}` : '',
+    r.reason ?? '',
+    '',
+    'Clique para abrir o link, copiar ou desligar.',
+  ]
+    .filter((l, i, arr) => l || arr[i - 1])
+    .join('\n');
+}
+
+function openRemoteMenu(anchor: HTMLElement): void {
+  const r = state.remote;
+  const items: MenuItem[] = [];
+  if (r.sessionUrl) {
+    items.push(
+      { icon: 'link-external', label: 'Abrir a sessão no claude.ai', hint: 'navegador', onPick: () => send({ type: 'remoteControl', action: 'open' }) },
+      { icon: 'copy', label: 'Copiar o link', title: r.sessionUrl, onPick: () => send({ type: 'remoteControl', action: 'copy' }) },
+    );
+  }
+  if (r.status === 'disconnected' && !r.stuck) {
+    items.push({ icon: 'refresh', label: 'Ligar de novo', onPick: () => send({ type: 'remoteControl', action: 'on' }) });
+  }
+  items.push({ icon: 'debug-disconnect', label: r.stuck ? 'Tentar desligar de novo' : 'Desligar o Remote Control', onPick: () => send({ type: 'remoteControl', action: 'off' }) });
+  openMenu(anchor, [
+    {
+      title: `Remote Control · ${remoteStatusText(r)}`,
+      items,
+      note: [
+        r.reason ?? '',
+        'O Claude continua rodando nesta máquina. No celular, abra o app do Claude (aba Code) ou o link acima; mensagens de lá aparecem aqui marcadas.',
+        state.mode === 'bypassPermissions' ? 'Modo bypass: quem tiver acesso à sua conta controla esta máquina sem aprovação.' : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+    },
+  ]);
+}
+
 /**
  * Rodapé abaixo do composer: "372k em contexto" à esquerda e as barrinhas de 5h e semana à direita,
  * com a mesma leitura (lastUsage) que alimenta a pílula do relógio.
@@ -1647,19 +1723,21 @@ function renderAgents(): void {
 
 function renderAgentsPill(): void {
   const list = [...agents.values()];
-  const running = list.filter((a) => a.status === 'running').length;
+  const running = list.filter(isWorking).length;
+  const waiting = list.filter((a) => a.status === 'waiting').length;
   agentsPill.classList.toggle('hidden', !list.length);
   if (!list.length) {
     return;
   }
-  const tone = running ? 'running' : list.some((a) => a.status === 'failed') ? 'failed' : 'completed';
+  const tone = running ? 'running' : waiting ? 'waiting' : list.some((a) => a.status === 'failed') ? 'failed' : 'completed';
+  const waitText = waiting ? ` · ${waiting} aguardando` : '';
   fill(
     agentsPill,
     h('span', { class: `dot ${tone}` }),
-    h('span', {}, running ? `${running} de ${list.length} trabalhando` : `${list.length} ${list.length === 1 ? 'agente' : 'agentes'}`),
+    h('span', {}, running ? `${running} de ${list.length} trabalhando${waitText}` : waiting ? `${waiting} de ${list.length} aguardando` : `${list.length} ${list.length === 1 ? 'agente' : 'agentes'}`),
   );
-  agentsPill.title = running
-    ? `${running} de ${list.length} ainda trabalhando. Clique para abrir o mapa de agentes.`
+  agentsPill.title = running || waiting
+    ? `${running} de ${list.length} ainda trabalhando${waiting ? `, ${waiting} aguardando processo, subagentes ou resposta` : ''}. Clique para abrir o mapa de agentes.`
     : `${list.length} ${list.length === 1 ? 'agente' : 'agentes'} nesta conversa. Clique para abrir o mapa.`;
 }
 
@@ -1667,7 +1745,7 @@ function renderAgentsPill(): void {
 const RUN_LIMIT = 3;
 
 function renderRunBar(): void {
-  const running = [...agents.values()].filter((a) => a.status === 'running');
+  const running = [...agents.values()].filter(isWorking);
   // A faixa aparece e some entre o log e o composer: quem estava no fim da conversa continua no fim.
   const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 160;
   runBar.classList.toggle('hidden', !running.length);
@@ -1711,8 +1789,8 @@ let ticker: number | undefined;
  * vermelho contínuo quando parou ou falhou, sem anel quando terminou bem.
  */
 function agentDot(a: AgentInfo): HTMLSpanElement {
-  // Âmbar quando o guarda acha que o agente está preso: o mesmo anel do nó no grafo.
-  const ring = a.status === 'running' ? (a.stuck ? STUCK_RING : STATUS_RING.running) : a.status === 'failed' || a.status === 'stopped' ? STATUS_RING.halted : '';
+  // Âmbar forte quando o guarda acha que o agente está preso; âmbar claro quando ele aguarda: os mesmos anéis do nó no grafo.
+  const ring = a.status === 'running' ? (a.stuck ? STUCK_RING : STATUS_RING.running) : a.status === 'waiting' ? STATUS_RING.waiting : a.status === 'failed' || a.status === 'stopped' ? STATUS_RING.halted : '';
   const el = h('span', { class: `agdot${ring ? ' ring' : ''}${a.status === 'running' ? ' live' : ''}`, 'aria-hidden': 'true' });
   el.style.setProperty('--agm-color', agentColor(a.color, a.id));
   if (ring) {
@@ -1921,7 +1999,7 @@ const guardCards = createGuardCards({
   onPending: (id, el, label, detail, agentId) => setPending(`guard:${id}`, el ? { el, label, detail, icon: 'warning', agentId } : null),
 });
 
-function addUser(text: string, from?: string, container: HTMLElement = log, atts: Attachment[] = [], fromId?: string, origin?: 'companion'): void {
+function addUser(text: string, from?: string, container: HTMLElement = log, atts: Attachment[] = [], fromId?: string, origin?: 'companion' | 'remote'): void {
   // No histórico, a mensagem do "Enviar ao principal" chega com a marca na primeira linha.
   if (!from && text.startsWith(COMPANION_MARK)) {
     text = text.slice(COMPANION_MARK.length).trim();
@@ -1977,6 +2055,9 @@ function addUser(text: string, from?: string, container: HTMLElement = log, atts
   if (origin === 'companion') {
     bubble.classList.add('from-companion');
     bubble.append(h('div', { class: 'msg-origin', title: 'Você enviou esta resposta do chat lateral de consulta' }, icon(COMPANION_ICON), 'da consulta lateral'));
+  } else if (origin === 'remote') {
+    bubble.classList.add('from-remote');
+    bubble.append(h('div', { class: 'msg-origin', title: 'Mensagem enviada pelo claude.ai/code ou pelo app do celular' }, icon('remote'), 'pelo Remote Control'));
   }
   {
     if (atts.length) {
@@ -2366,6 +2447,9 @@ function addNotice(text: string, level: 'info' | 'error', action?: NoticeAction)
   if (action?.kind === 'configureKey') {
     el.append(h('button', { class: 'notice-action', type: 'button', onclick: () => send({ type: 'configureKey', provider: action.provider }) }, icon('key'), action.label));
   }
+  if (action?.kind === 'orphans') {
+    el.append(h('button', { class: 'notice-action', type: 'button', onclick: () => orphansView.open() }, icon('debug-disconnect'), action.label));
+  }
   append(el);
 }
 
@@ -2428,6 +2512,7 @@ function clearLog(): void {
   agents.clear();
   boxes = [];
   agentItems.clear();
+  taskProcs.clear();
   agentCards.clear();
   taskCards.clear();
   pendingDecisions.clear();
@@ -2743,7 +2828,19 @@ function anchorFor(id: string): DOMRect | undefined {
  */
 /** Cartões de veredito do laboratório no log; o popup deles usa as classes do popup de nó. */
 const labCards = createLabCards({ append: (el) => append(el) });
+/** Árvore de processos de cada tarefa de shell, lida pelo host quando o popup dela abre. */
+const taskProcs = new Map<string, TaskProcs>();
+const orphansView = createOrphansView(send);
 const popup = createNodePopup({
+  procs: {
+    getProcs: (id) => taskProcs.get(id),
+    requestProcs: (id) => send({ type: 'taskProcs', id }),
+    killTree: (id) => send({ type: 'killTaskTree', id }),
+    openOrphans: () => {
+      popup.close();
+      orphansView.open();
+    },
+  },
   rootLabel: 'Conversa principal',
   getAgent: (id) => agents.get(id),
   getAgents: () => [...agents.values()],
@@ -2782,6 +2879,7 @@ const popup = createNodePopup({
       collapsed: graph.isBoxCollapsed(boxId),
       parentName: g.parent ? grouping.groups.get(g.parent)?.name : undefined,
       childNames: g.children.map((c) => grouping.groups.get(c)?.name ?? c),
+      spend: boxSpend(g),
     };
   },
   toggleBox: (boxId) => graph.toggleBox(boxId),
@@ -2940,6 +3038,10 @@ const NO_SESSION_HINT = 'A conversa deste agente não foi salva em disco, então
 function resumeButton(a: AgentInfo, cls: string): HTMLElement | null {
   // Vigia parado (pelo usuário ou porque a janela fechou) volta a verificar pelo mesmo botão.
   const watcherOff = !!a.repeatEveryMinutes && !watching(a);
+  // Parado por limite de uso do fornecedor: o botão pede para continuar de onde parou.
+  if (a.limit && !a.restored && a.status === 'failed') {
+    return h('button', { class: cls, title: 'Pede ao agente para continuar de onde parou. Faça isso depois que o limite de uso liberar.', onclick: () => send({ type: 'resumeAgent', id: a.id }) }, 'Tentar de novo');
+  }
   if (!a.restored && !watcherOff) {
     return null;
   }
@@ -2954,7 +3056,7 @@ function resumeButton(a: AgentInfo, cls: string): HTMLElement | null {
 }
 
 function statusLabel(s: AgentInfo['status']): string {
-  return { running: 'trabalhando', completed: 'concluído', failed: 'falhou', stopped: 'parado' }[s];
+  return STATUS_LABEL[s];
 }
 
 function agentMeta(a: AgentInfo): string {
@@ -3158,6 +3260,7 @@ function paintCardActivity(id: string): void {
 
 const GROUPS: { title: string; match: AgentInfo['status'][] }[] = [
   { title: 'Trabalhando', match: ['running'] },
+  { title: 'Aguardando', match: ['waiting'] },
   { title: 'Concluídos', match: ['completed'] },
   { title: 'Falhou ou parado', match: ['failed', 'stopped'] },
 ];
@@ -3170,7 +3273,7 @@ function subLine(...parts: (string | false | undefined)[]): HTMLElement | null {
 
 function renderMapHead(): void {
   const list = [...agents.values()];
-  const running = list.filter((a) => a.status === 'running').length;
+  const running = list.filter(isWorking).length;
   const tokens = list.reduce((sum, a) => sum + a.totalTokens, 0);
   // Uma linha curta: quantos e quantos trabalham. Tokens, conta e contexto ficam no title e no popup da raiz.
   mapHead.title = [`${fmtTokens(tokens)} tokens somados`, state.forkOf ? `Continuação de ${state.forkOf}` : '', state.profileName, state.contextTokens ? `${fmtTokens(state.contextTokens)} em contexto` : '']
@@ -3187,6 +3290,17 @@ function renderMapHead(): void {
   );
   fill(
     mapBrain,
+    h(
+      'button',
+      {
+        class: 'map-organize map-brain',
+        type: 'button',
+        title: 'Lista processos do projeto que nenhuma tarefa rastreia mais (servidores de dev de sessões anteriores) e permite encerrá-los',
+        onclick: () => orphansView.open(),
+      },
+      icon('debug-disconnect'),
+      h('span', { class: 'map-brain-label' }, 'Processos órfãos'),
+    ),
     brainReady
       ? h(
           'button',
@@ -3855,7 +3969,7 @@ function enterCompanionMode(init: CompanionInit): void {
     });
     document.body.classList.add('companion');
     top.after(companionUi.banner);
-    for (const el of [companionBtn, histBtn, newChatBtn, addBtn, agentsPill, pendingPill, browserPill, clockPill, modePill, usageBar, runBar]) {
+    for (const el of [companionBtn, histBtn, newChatBtn, addBtn, agentsPill, pendingPill, browserPill, remotePill, clockPill, modePill, usageBar, runBar]) {
       el.classList.add('companion-hidden');
     }
     empty.replaceChildren(...Array.from(companionUi.empty.childNodes));
@@ -4006,6 +4120,13 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
     case 'agent':
       onAgent(msg.agent);
       break;
+    case 'taskProcs':
+      taskProcs.set(msg.procs.agentId, msg.procs);
+      popup.refresh(msg.procs.agentId);
+      break;
+    case 'orphans':
+      orphansView.update(msg);
+      break;
     case 'boxes':
       boxes = msg.list;
       refreshMap();
@@ -4058,6 +4179,24 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       brainReady = msg.exists;
       renderMapHead();
       break;
+    case 'remoteControl': {
+      const note = remoteTransitionNotice(state.remote, msg.state);
+      state.remote = msg.state;
+      renderRemotePill();
+      if (note) {
+        addNotice(note.text, note.level);
+      }
+      if (openAt?.anchor === addBtn) {
+        closeMenu();
+        openAddMenu();
+      } else if (openAt?.anchor === remotePill) {
+        closeMenu();
+        if (!remotePill.classList.contains('hidden')) {
+          openRemoteMenu(remotePill);
+        }
+      }
+      break;
+    }
     case 'browserStatus':
       state.browser = { on: msg.on, status: msg.browser, owner: msg.owner, browsers: msg.browsers, browsersError: msg.browsersError };
       renderBrowserPill();
