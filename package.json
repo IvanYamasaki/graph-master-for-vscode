@@ -485,6 +485,16 @@
           "default": false,
           "markdownDescription": "Cada chat novo liga o **Remote Control** ao abrir: a conversa passa a aceitar mensagens do claude.ai/code e do app do Claude no celular, e o painel mostra o link da sessão. Precisa de login com conta claude.ai. **Risco:** no modo sem perguntas (bypass), quem tiver acesso à sua conta controla esta máquina pelo Claude; por isso, em bypass, cada chat pede confirmação antes de ligar. Não vale para agentes roteados. Organização com `disableRemoteControl` nas managed settings deixa o Remote Control indisponível."
         },
+        "agentGraphMaster.liveBubbles": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Sinais de vida no chat: balão de \"digitando\", balão de pensamento com o que o agente faz agora, faixa dos agentes ativos, contador de tempo e animações curtas de entrada. Só aparecem enquanto alguém trabalha de verdade, e `prefers-reduced-motion` desliga as animações. Desligado, o chat volta à linha simples \"Trabalhando…\"."
+        },
+        "agentGraphMaster.toolsExpanded": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "No chat principal, as chamadas de ferramenta (Bash, Read, Edit...) entre duas falas ficam numa linha só, tipo \"6 ações · Bash, Read, Edit\", e a lista abre com um clique. Ligado, essas linhas já aparecem abertas. Pedidos de permissão, perguntas, pesquisas e imagens ficam sempre à vista. No log de um agente aberto o grupo já começa aberto."
+        },
         "agentGraphMaster.browserActionsNeedApproval": {
           "type": "boolean",
           "default": true,

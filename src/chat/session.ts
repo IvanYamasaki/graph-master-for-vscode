@@ -18,7 +18,7 @@ import { resolveClaudeExecutable } from '../claudePath';
 import { researchEnv } from './infra/researchPack';
 import { decisionFor, projectMcpSettings, readProjectMcp } from './guard/mcpApproval';
 import { limitFromText } from './turnRules';
-import { LEVEL_GRACE_MS, TaskLife, isOrphanNotice, orphanNoticeIds, reconcileTasks } from './taskLiveness';
+import { LEVEL_GRACE_MS, TaskLife, isOrphanNotice, orphanNoticeIds, reconcileTasks, shellTaskLabel } from './taskLiveness';
 import { TaskProcsRead, killSnapshot, killSummary, readTaskProcs } from './taskProcs';
 import type { ProcSnap } from './proc';
 import { spawn } from 'child_process';
@@ -247,6 +247,9 @@ export class ChatSession {
   private initSeen = false;
   /** Último bloco de texto não vazio do turno, mesmo antes de uma ferramenta: vale quando o relatório foi seguido de brain_fact ou report_progress. */
   private turnLastText = '';
+  /** Raciocínio em streaming do bloco atual e quando o último trecho foi ao webview (balão de pensamento). */
+  private thinkBuf = '';
+  private thinkPostedAt = 0;
   /** Processo do CLI: sobe a cada start(). Item cujo último sinal de vida é de um processo anterior morreu com ele. */
   private epoch = 0;
   /** Sinais de vida de cada item de tarefa, pelo id do item (tool_use_id). */
@@ -256,6 +259,8 @@ export class ChatSession {
   private levelTimer?: ReturnType<typeof setTimeout>;
   /** Comando de cada chamada de Bash, pelo tool_use_id: vira o `command` da tarefa de shell e acha o PID dela. */
   private readonly bashCommands = new Map<string, string>();
+  /** Objetivo que o modelo deu a cada chamada de Bash (`description`): é o nome da tarefa de shell no mapa. */
+  private readonly bashDescriptions = new Map<string, string>();
   /** Tarefas que o usuário mandou parar: o fim delas não sugere órfãos. */
   private readonly stoppingByUser = new Set<string>();
   /** PID do processo do CLI desta sessão (capturado no spawn): a raiz de uma tarefa de shell só é procurada abaixo dele. */
@@ -1163,6 +1168,7 @@ export class ChatSession {
         } else if (ev.type === 'content_block_start') {
           stream.blockTypes.set(ev.index, ev.content_block.type);
           if (ev.content_block.type === 'thinking' || ev.content_block.type === 'redacted_thinking') {
+            this.thinkBuf = '';
             this.post({ type: 'thinking', value: true });
           } else if (ev.content_block.type === 'tool_use') {
             this.post({ type: 'toolStart', id: ev.content_block.id, name: ev.content_block.name });
@@ -1170,6 +1176,14 @@ export class ChatSession {
         } else if (ev.type === 'content_block_delta') {
           if (ev.delta.type === 'text_delta') {
             this.post({ type: 'textDelta', msgId: stream.msgId, index: ev.index, text: ev.delta.text });
+          } else if (ev.delta.type === 'thinking_delta') {
+            // Só o fim do raciocínio importa ao balão; um trecho a cada 0,6 s basta (o webview ainda troca a cada 1,5 s).
+            this.thinkBuf = (this.thinkBuf + ev.delta.thinking).slice(-400);
+            const now = Date.now();
+            if (now - this.thinkPostedAt >= 600) {
+              this.thinkPostedAt = now;
+              this.post({ type: 'live', id: 'main', phase: 'thinking', text: this.thinkBuf });
+            }
           }
         } else if (ev.type === 'content_block_stop') {
           const kind = stream.blockTypes.get(ev.index);
@@ -1210,6 +1224,10 @@ export class ChatSession {
             const command = (block.input as { command?: unknown }).command;
             if (typeof command === 'string') {
               this.bashCommands.set(block.id, command);
+            }
+            const goal = (block.input as { description?: unknown }).description;
+            if (typeof goal === 'string' && goal.trim()) {
+              this.bashDescriptions.set(block.id, goal.trim());
             }
           }
         }
@@ -1402,15 +1420,16 @@ export class ChatSession {
       case 'api_retry':
         this.post({ type: 'notice', level: 'info', text: 'A API falhou, tentando de novo...' });
         return;
-      case 'task_started':
+      case 'task_started': {
+        const shell = m.task_type === 'local_bash';
+        const description = shell ? shellTaskLabel(m.tool_use_id ? this.bashDescriptions.get(m.tool_use_id) : undefined, m.description) : m.description;
         if (m.is_backgrounded && !m.ambient && !m.skip_transcript) {
-          this.trackBackground(m.task_id, m.description, m.task_type);
+          this.trackBackground(m.task_id, description, m.task_type);
         }
         if (m.tool_use_id) {
-          const shell = m.task_type === 'local_bash';
           this.updateAgent(m.tool_use_id, {
             taskId: m.task_id,
-            description: m.description,
+            description,
             subagentType: m.subagent_type,
             prompt: m.prompt,
             status: 'running',
@@ -1427,6 +1446,7 @@ export class ChatSession {
           }
         }
         return;
+      }
       case 'background_tasks_changed': {
         // Sinal de nível: substitui o conjunto. Cobre bookend perdido (task_started sem task_notification).
         const live = new Set(m.tasks.filter((t) => !t.ambient).map((t) => t.task_id));
@@ -1447,7 +1467,8 @@ export class ChatSession {
         }
         for (const t of m.tasks) {
           if (!t.ambient) {
-            this.trackBackground(t.task_id, t.description, t.task_type);
+            // Já conhecida: fica o nome dado no task_started, não o comando cru.
+            this.trackBackground(t.task_id, this.backgroundTasks.get(t.task_id)?.description ?? (t.task_type === 'local_bash' ? shellTaskLabel(undefined, t.description) : t.description), t.task_type);
           }
         }
         return;
@@ -1694,4 +1715,62 @@ export function toolResultImages(content: unknown): string[] | undefined {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Prompt que nunca manda nada: o processo sobe, responde a pedidos de controle e não abre turno. */
+async function* silentPrompt(signal: AbortSignal): AsyncGenerator<SDKUserMessage> {
+  await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+}
+
+/**
+ * Limites do plano de uma conta sem chat aberto. Sobe um processo do CLI sem mensagem nenhuma (não gasta token),
+ * sem MCP, sem configurações de usuário e sem gravar sessão, pergunta o /usage e fecha.
+ */
+export async function probeClaudeUsage(profile: Profile, cwd: string, timeoutMs = 30000): Promise<UsageInfo> {
+  const fetchedAt = new Date().toISOString();
+  const executable = await resolveClaudeExecutable();
+  if (!executable) {
+    return { available: false, windows: [], fetchedAt, error: 'não achei o executável do Claude Code' };
+  }
+  const stop = new AbortController();
+  const q = query({
+    prompt: silentPrompt(stop.signal),
+    options: {
+      pathToClaudeCodeExecutable: executable,
+      cwd,
+      env: profileEnv(profile),
+      settingSources: [],
+      mcpServers: {},
+      strictMcpConfig: true,
+      persistSession: false,
+      extraArgs: { 'no-chrome': null },
+    },
+  });
+  // O iterador precisa estar sendo lido para as respostas de controle chegarem.
+  void (async () => {
+    try {
+      for await (const _ of q) {
+        // nada: só drena
+      }
+    } catch {
+      // processo fechado por nós
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const data = await Promise.race([
+      q.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
+      new Promise<never>((_, reject) => (timer = setTimeout(() => reject(new Error('o Claude Code não respondeu a tempo')), timeoutMs))),
+    ]);
+    if (!data.rate_limits_available || !data.rate_limits) {
+      return { available: false, subscription: data.subscription_type ?? undefined, windows: [], fetchedAt, error: 'esta conta não usa limites de plano (chave de API, sem login ou provedor externo)' };
+    }
+    return { available: true, subscription: data.subscription_type ?? undefined, windows: usageWindows(data.rate_limits), fetchedAt };
+  } catch (err) {
+    return { available: false, windows: [], fetchedAt, error: errorText(err) };
+  } finally {
+    clearTimeout(timer);
+    stop.abort();
+    q.close();
+  }
 }

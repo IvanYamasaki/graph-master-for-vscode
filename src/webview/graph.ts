@@ -46,6 +46,8 @@ export interface AgentGraphOptions {
    * que já apareceu: mudar sozinho faz a lista e o grafo pularem. Vale de novo depois de releaseAutoFolds.
    */
   holdAutoFold?: () => boolean;
+  /** O usuário arrastou um nó: posições fixadas por id. Quem usa o grafo guarda, para a conversa reabrir igual. */
+  onPinnedChange?: (pinned: Record<string, { x: number; y: number }>) => void;
 }
 
 /** Quais linhas aparecem. Esconder não muda o layout: só as linhas somem. */
@@ -72,6 +74,8 @@ export interface AgentGraph {
   isBoxCollapsed(boxId: string): boolean;
   /** Esquece os recolhimentos automáticos segurados: o próximo update recalcula (o mapa abrindo de novo). */
   releaseAutoFolds(): void;
+  /** Troca as posições fixadas (as salvas da conversa, ou {} ao trocar de conversa) e redesenha. */
+  setPinned(pinned: Record<string, { x: number; y: number }>): void;
   destroy(): void;
 }
 
@@ -621,16 +625,20 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
   }
 
   const nodes: NodeModel[] = [];
-  const running = agents.filter(isWorking).length;
-  const waiting = agents.filter((a) => a.status === 'waiting').length;
+  // Os nós-resumo de concluídos não são agentes: a raiz conta os agentes que eles escondem, não o resumo.
+  const real = agents.filter((a) => !a.foldSummary);
+  const folded = agents.reduce((n, a) => n + (a.foldSummary && !a.foldSummary.expanded ? a.foldSummary.total : 0), 0);
+  const total = real.length + folded;
+  const running = real.filter(isWorking).length;
+  const waiting = real.filter((a) => a.status === 'waiting').length;
   const waitingText = waiting ? ` · ${waiting} aguardando` : '';
   nodes.push({
     id: 'main',
     kind: 'root',
     title: wrapTitle(rootLabel, TITLE_CHARS, TITLE_LINES),
-    sub: agents.length ? `${agents.length} ${agents.length === 1 ? 'agente' : 'agentes'} · ${running} rodando${waitingText}` : 'sem agentes',
-    detail: `${rootLabel}\nraiz da árvore de agentes\n${agents.length} agente(s), ${running} rodando${waitingText}`,
-    aria: `${rootLabel}, raiz, ${agents.length} agentes`,
+    sub: total ? `${total} ${total === 1 ? 'agente' : 'agentes'} · ${running} rodando${waitingText}` : 'sem agentes',
+    detail: `${rootLabel}\nraiz da árvore de agentes\n${total} agente(s), ${running} rodando${waitingText}${folded ? `\n${folded} concluído(s) recolhido(s)` : ''}`,
+    aria: `${rootLabel}, raiz, ${total} agentes`,
     color: NEUTRAL,
     text: NEUTRAL,
     running: false,
@@ -718,6 +726,25 @@ function buildModel(agents: AgentInfo[], rootLabel: string, boxes: BoxInfo[] = [
     }
     if (last.icon) {
       last.title = wrapTitle(name, TITLE_CHARS - 3, TITLE_LINES);
+    }
+    const fs = a.foldSummary;
+    if (fs) {
+      // Nó-resumo dos concluídos de um criador: cinza, sem anel, e o clique abre ou fecha os agentes dele.
+      const more = fs.total > fs.count ? ` (+${fs.total - fs.count} abaixo)` : '';
+      Object.assign(last, {
+        icon: fs.expanded ? GLYPH_CHEV_DOWN : GLYPH_CHEV_RIGHT,
+        title: wrapTitle(name + more, TITLE_CHARS - 3, TITLE_LINES),
+        sub: truncate(`${fs.failed ? `${fs.failed} com falha · ` : ''}${fmtTokens(a.totalTokens)} tokens · ${fs.expanded ? 'recolher' : 'ver'}`, 30),
+        detail: `${fs.expanded ? 'Clique para recolher' : 'Clique para mostrar'} os agentes concluídos de ${whoLabel(parent, rootLabel)}:\n${fs.names.slice(0, 12).map((n) => `· ${n}`).join('\n')}${fs.names.length > 12 ? `\n… e mais ${fs.names.length - 12}` : ''}`,
+        aria: `${name}, de ${whoLabel(parent, rootLabel)}. ${fs.expanded ? 'Recolher' : 'Mostrar'} agentes concluídos`,
+        color: NEUTRAL,
+        text: readableOn(NEUTRAL),
+        ring: undefined,
+        running: false,
+        quiet: true,
+        meter: undefined,
+        progress: undefined,
+      });
     }
   }
 
@@ -2554,6 +2581,18 @@ export function createAgentGraph(options?: AgentGraphOptions): AgentGraph {
     boxes = list;
   }
 
+  function setPinned(next: Record<string, { x: number; y: number }>): void {
+    pinned.clear();
+    for (const [id, p] of Object.entries(next)) {
+      if (Number.isFinite(p?.x) && Number.isFinite(p?.y)) {
+        pinned.set(id, { x: p.x, y: p.y });
+      }
+    }
+    if (lastAgents.length) {
+      update(lastAgents);
+    }
+  }
+
   /** Só depois que createAgentGraph devolveu: quem recebe o aviso costuma ainda nem existir antes disso. */
   let constructed = false;
   let agentCount = 0;
@@ -2655,6 +2694,9 @@ export function createAgentGraph(options?: AgentGraphOptions): AgentGraph {
     if (dragId) {
       const id = dragId;
       dragId = undefined;
+      if (dragMoved && pinned.has(id)) {
+        options?.onPinnedChange?.(Object.fromEntries(pinned));
+      }
       if (!dragMoved) {
         if (dragHead && id.startsWith(BOX_NODE)) {
           toggleBox(id.slice(BOX_NODE.length));
@@ -2924,5 +2966,5 @@ export function createAgentGraph(options?: AgentGraphOptions): AgentGraph {
   constructed = true;
 
   setEdgeVisibility(visibility);
-  return { element, update, select, nodeRect, setEdgeVisibility, setBoxes, toggleBox, isBoxCollapsed, releaseAutoFolds, destroy };
+  return { element, update, select, nodeRect, setEdgeVisibility, setBoxes, toggleBox, isBoxCollapsed, releaseAutoFolds, setPinned, destroy };
 }

@@ -356,13 +356,33 @@ textarea.feedback {
   overflow-wrap: anywhere;
 }
 
+/* Balões: um pouco mais claros que o fundo, para destacar do log em qualquer tema. */
 .msg.user {
   align-self: flex-end;
   max-width: 85%;
-  background: var(--vscode-input-background);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  background: color-mix(in srgb, var(--vscode-foreground) 11%, var(--vscode-editor-background));
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 16%, transparent);
+  border-radius: 12px 12px 4px 12px;
   padding: 7px 11px;
+}
+
+.msg.assistant {
+  align-self: flex-start;
+  max-width: 92%;
+  background: color-mix(in srgb, var(--vscode-foreground) 6%, var(--vscode-editor-background));
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+  border-radius: 12px 12px 12px 4px;
+  padding: 7px 12px;
+}
+
+.msg.assistant:empty {
+  display: none;
+}
+
+/* Fala de um agente: o balão leva um toque da cor dele. */
+[style*='--agm-color'] .msg.assistant {
+  background: color-mix(in srgb, var(--agm-color) 8%, color-mix(in srgb, var(--vscode-foreground) 5%, var(--vscode-editor-background)));
+  border-color: color-mix(in srgb, var(--agm-color) 22%, transparent);
 }
 
 .msg.user .plain {
@@ -536,6 +556,86 @@ details.msg.report[open] .fold-less {
 .tbody {
   margin: 4px 0 4px 14px;
   padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+
+/* Sequência de ferramentas entre duas falas: uma linha discreta (ponto de estado, ícone, resumo); o clique abre a lista. */
+details.tool-group > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 2px 0;
+  font-size: 0.88em;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 0.8;
+}
+
+details.tool-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.tool-group > summary:hover,
+details.tool-group[open] > summary {
+  opacity: 1;
+  color: var(--fg);
+}
+
+details.tool-group > summary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+details.tool-group > summary .dot {
+  width: 6px;
+  height: 6px;
+}
+
+details.tool-group > summary .codicon {
+  font-size: 13px;
+  flex: none;
+}
+
+.tg-head {
+  flex: none;
+  font-weight: 500;
+}
+
+.tg-tail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+.tg-tail:not(:empty)::before {
+  content: '·';
+  margin-right: 7px;
+}
+
+/* Rodando, o texto de ação atual (head) pode ser longo: ele encolhe e a contagem fica. */
+details.tool-group[data-state='running'] > summary .tg-head {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+details.tool-group[data-state='running'] > summary .tg-tail {
+  flex: none;
+}
+
+details.tool-group[data-state='failed'] > summary .tg-tail {
+  color: var(--err);
+}
+
+.tg-list {
+  margin: 2px 0 4px 5px;
+  padding-left: 12px;
   border-left: 1px solid var(--border);
 }
 
@@ -2744,31 +2844,275 @@ details.ext-research[open] .fold-less {
   object-position: top left;
 }
 
-.shot-view {
+/* Visualizador de imagens (src/webview/imageViewer.ts): tela cheia escura, cores fixas em qualquer tema. */
+.iv {
   position: fixed;
   inset: 0;
-  z-index: 30;
+  z-index: 100;
+  background: rgba(8, 8, 10, 0.94);
+  color: #eee;
+  outline: none;
+  user-select: none;
+}
+
+.iv.hidden {
+  display: none;
+}
+
+.iv-stage {
+  position: absolute;
+  inset: 44px 0 0 0;
+  overflow: hidden;
+  cursor: zoom-out;
+}
+
+.iv-img {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  max-width: none;
+  transform-origin: center center;
+  cursor: zoom-in;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
+  background: repeating-conic-gradient(#2a2a2a 0% 25%, #333 0% 50%) 50% / 16px 16px;
+}
+
+.iv.zoomed .iv-img {
+  cursor: grab;
+}
+
+.iv.dragging .iv-img {
+  cursor: grabbing;
+}
+
+.iv.loading .iv-img {
+  opacity: 0;
+}
+
+.iv-top {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 0 14px;
+  background: linear-gradient(rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.25));
+}
+
+.iv-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.iv-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+  font-size: 0.9em;
+}
+
+.iv-spacer {
+  flex: 1;
+}
+
+.iv-note {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.14);
+  font-size: 0.85em;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.iv-note.on {
+  opacity: 1;
+}
+
+.iv-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.iv-btn:hover,
+.iv-btn:focus-visible {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.iv-btn.hidden {
+  display: none;
+}
+
+.iv-zoom {
+  min-width: 52px;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85em;
+}
+
+.iv-nav {
+  position: absolute;
+  top: 50%;
+  width: 44px;
+  height: 44px;
+  margin-top: -22px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.iv-nav .codicon {
+  font-size: 22px;
+}
+
+.iv-nav.prev {
+  left: 12px;
+}
+
+.iv-nav.next {
+  right: 12px;
+}
+
+.iv-caption {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  max-width: min(720px, calc(100% - 120px));
+  max-height: 30%;
+  overflow: auto;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  white-space: pre-wrap;
+  text-align: center;
+  user-select: text;
+}
+
+.iv-caption.hidden {
+  display: none;
+}
+
+/* Bolha de imagem de um agente (show_image): grade com cantos arredondados e a legenda embaixo. */
+.msg.img-bubble {
+  align-self: flex-start;
+  width: min(320px, 92%);
+  padding: 3px;
+  background: color-mix(in srgb, var(--vscode-foreground) 6%, var(--vscode-editor-background));
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+  border-radius: 12px 12px 12px 4px;
+}
+
+[style*='--agm-color'] .msg.img-bubble {
+  border-color: color-mix(in srgb, var(--agm-color) 22%, transparent);
+}
+
+.img-caption {
+  padding: 5px 8px 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ig {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  border-radius: 9px;
+  overflow: hidden;
+}
+
+.ig.n1 {
+  grid-template-columns: 1fr;
+}
+
+.ig-tile {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  padding: 16px;
-  background: rgba(0, 0, 0, 0.78);
-  cursor: zoom-out;
+  gap: 4px;
+  aspect-ratio: 1;
+  padding: 0;
+  border: 0;
+  background: color-mix(in srgb, var(--vscode-foreground) 10%, var(--vscode-editor-background));
+  color: var(--vscode-descriptionForeground);
+  cursor: zoom-in;
+  overflow: hidden;
 }
 
-.shot-view img {
-  max-width: 100%;
-  max-height: calc(100% - 28px);
+.ig.n1 .ig-tile {
+  aspect-ratio: auto;
+  min-height: 80px;
+}
+
+/* Três imagens: a primeira ocupa a linha de cima inteira. */
+.ig.n3 .ig-tile:first-child {
+  grid-column: span 2;
+  aspect-ratio: 2;
+}
+
+.ig-tile img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ig.n1 .ig-tile img {
+  height: auto;
+  max-height: 360px;
   object-fit: contain;
-  border-radius: 4px;
-  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
 }
 
-.shot-hint {
-  color: #ddd;
-  font-size: 0.85em;
+.ig-tile:hover img,
+.ig-tile:focus-visible img {
+  filter: brightness(1.08);
+}
+
+.ig-tile:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, #4d8fd6);
+  outline-offset: -2px;
+}
+
+.ig-tile.broken {
+  cursor: default;
+}
+
+.ig-tile.pending .codicon {
+  animation: codicon-spin 1.4s linear infinite;
+}
+
+.ig-err {
+  padding: 0 8px;
+  font-size: 0.8em;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.ig-more {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 1.6em;
+  font-weight: 600;
+}
+
+/* Anexo de imagem já enviado: o clique abre o visualizador. */
+.atts.sent .att.zoomable {
+  cursor: zoom-in;
 }
 
 
@@ -3168,4 +3512,955 @@ button.empty-ex:focus-visible {
 .orphan.is-parent-alive .orphan-meta {
   color: var(--warn);
   opacity: 1;
+}
+
+/* ---------- Cartão de agente no chat: segunda linha como numa conversa ---------- */
+
+/* O que o agente faz agora (ou a conclusão, quando termina), com o ícone do estado na frente. */
+.ag-line2.ag-chat {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 18px;
+}
+
+.ag-chat .codicon {
+  flex: none;
+  font-size: 12px;
+}
+
+.ag-chat-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ag-chat.live .codicon {
+  color: var(--vscode-charts-green, #3fb950);
+}
+
+.ag-chat.done {
+  color: var(--fg, var(--vscode-foreground));
+}
+
+.ag-chat.done .codicon {
+  color: var(--vscode-charts-green, #3fb950);
+}
+
+.ag-chat.fail .codicon {
+  color: var(--vscode-errorForeground, #f85149);
+}
+
+.ag-chat.wait .codicon {
+  color: var(--warn);
+}
+
+/* ---------- Thread do agente (painel à direita, como no Slack) ---------- */
+
+:root {
+  --thread-w: min(420px, 45vw);
+}
+
+.thread-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: var(--thread-w);
+  /* Acima do mapa: o "Abrir thread" do popup abre a thread com o mapa ainda aberto. */
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  /* Filete no topo na cor do agente, como o painel de detalhe. */
+  border-top: 3px solid var(--agm-color, var(--muted));
+}
+
+/* Largo: o chat encolhe e continua usável ao lado da thread. Estreito: a thread ocupa a tela, com "Voltar". */
+@media (min-width: 760px) {
+  body.thread-open #app {
+    padding-right: var(--thread-w);
+  }
+}
+
+@media (max-width: 759px) {
+  .thread-drawer {
+    width: 100%;
+    border-left: none;
+  }
+}
+
+.thread-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.thread-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 0;
+}
+
+.thread-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.thread-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.thread-who {
+  font-weight: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-sub {
+  color: var(--muted);
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 14px;
+}
+
+.thread-parent {
+  display: flex;
+  gap: 10px;
+  padding: 8px 10px 8px 0;
+}
+
+/* "3 respostas" com a linha até a borda, como no Slack. */
+.thread-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 6px;
+  color: var(--muted);
+  font-size: 0.85em;
+}
+
+.thread-divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.thread-msg {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+.thread-msg-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.thread-msg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.thread-author {
+  font-weight: 600;
+}
+
+.thread-time {
+  color: var(--muted);
+  font-size: 0.8em;
+}
+
+.thread-body {
+  overflow-wrap: anywhere;
+}
+
+.thread-msg.error .thread-body {
+  color: var(--err);
+}
+
+.thread-img {
+  max-width: 100%;
+  max-height: 220px;
+  border-radius: 4px;
+  cursor: zoom-in;
+}
+
+.thread-av {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--muted);
+}
+
+.thread-av .codicon {
+  font-size: 12px;
+}
+
+.thread-av.user {
+  background: color-mix(in srgb, var(--vscode-foreground) 45%, var(--vscode-editor-background));
+}
+
+.thread-msg > .thread-av {
+  width: 28px;
+  height: 28px;
+  font-size: 10px;
+  border-radius: 6px;
+}
+
+.thread-av.agent {
+  background: var(--agm-color, var(--muted));
+}
+
+.thread-live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0 2px 28px;
+  color: var(--muted);
+  font-size: 0.88em;
+}
+
+.thread-composer {
+  border-top: 1px solid var(--border);
+}
+
+.thread-composer .hint {
+  flex: 1 1 140px;
+}
+
+/* Rodapé da thread no post: avatares, "12 respostas" em azul e "Última resposta hoje às 14h24". */
+.thread-foot {
+  margin-top: 4px;
+}
+
+.thread-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 3px 8px 3px 3px;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 6px;
+  font-size: 0.88em;
+}
+
+.thread-link:hover {
+  border-color: var(--border);
+  background: var(--bg);
+}
+
+.thread-avs {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.thread-avs .thread-av {
+  width: 20px;
+  height: 20px;
+  font-size: 8px;
+  border-radius: 5px;
+}
+
+.thread-count {
+  color: var(--vscode-textLink-foreground, var(--accent));
+  font-weight: 700;
+}
+
+.thread-link:hover .thread-count {
+  text-decoration: underline;
+}
+
+.thread-last {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-reply {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85em;
+}
+
+.thread-reply .codicon {
+  font-size: 13px;
+}
+
+/* ---------- Chat principal como canal do Slack ---------- */
+
+/* Coluna do avatar: 36 px de avatar e o respiro até o texto. */
+.log.slack {
+  --sl-gutter: 46px;
+  gap: 0;
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+/* Tudo o que não tem cabeçalho próprio fica na coluna do texto, à esquerda, sem balão. */
+.log.slack > .sl-body,
+.log.slack > .sl-meta,
+.log.slack > details.msg.report {
+  margin-left: var(--sl-gutter);
+}
+
+.log.slack > .msg.user,
+.log.slack > .msg.assistant {
+  position: relative;
+  align-self: stretch;
+  max-width: none;
+  background: none;
+  border: none;
+  border-radius: 0;
+  padding: 1px 0;
+}
+
+.log.slack > .msg.user .plain {
+  white-space: pre-wrap;
+}
+
+.log.slack > .sl-cont {
+  margin-top: 2px;
+}
+
+/* Hover numa mensagem: fundo leve em toda a largura, como no Slack. */
+.log.slack > .msg.user:hover,
+.log.slack > .msg.assistant:hover {
+  background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+  box-shadow: calc(-1 * var(--sl-gutter)) 0 0 0 color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+}
+
+/* Hora da continuação: só no hover, na margem do avatar. */
+.log.slack > .sl-cont[data-sl-time]:hover::before {
+  content: attr(data-sl-time);
+  position: absolute;
+  left: calc(-1 * var(--sl-gutter));
+  width: calc(var(--sl-gutter) - 8px);
+  top: 3px;
+  text-align: right;
+  font-size: 0.75em;
+  color: var(--muted);
+}
+
+/* Cabeçalho da sequência: avatar quadrado arredondado, nome em negrito, selo e hora em cinza. */
+.sl-head {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 14px;
+  padding-left: var(--sl-gutter);
+  min-height: 20px;
+}
+
+.log.slack > .sl-head:first-child,
+.log.slack > .sl-day + .sl-head {
+  margin-top: 4px;
+}
+
+.sl-av {
+  position: absolute;
+  left: 0;
+  top: 2px;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.sl-av.user {
+  background: color-mix(in srgb, var(--vscode-foreground) 45%, var(--vscode-editor-background));
+}
+
+.sl-av.claude {
+  background: var(--accent);
+}
+
+.sl-av .codicon {
+  font-size: 18px;
+}
+
+.sl-name {
+  font-weight: 700;
+  color: var(--fg, var(--vscode-foreground));
+}
+
+.sl-badge {
+  font-size: 0.68em;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 0 4px;
+  border-radius: 3px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+  align-self: center;
+}
+
+.sl-time {
+  font-size: 0.8em;
+  color: var(--muted);
+}
+
+/* Divisor de dia: linha fina com o rótulo no meio. */
+.sl-day {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 16px 0 4px;
+  color: var(--muted);
+  font-size: 0.8em;
+  font-weight: 600;
+}
+
+.sl-day::before,
+.sl-day::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.sl-day > span {
+  padding: 1px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+/* Ferramentas do orquestrador: uma linha discreta presa à fala dele. */
+.log.slack > details.tool-group,
+.log.slack > details.tool.slim {
+  margin-top: 1px;
+  margin-bottom: 1px;
+}
+
+.log.slack > details.tool-group > summary {
+  display: inline-flex;
+  max-width: 100%;
+  padding: 1px 8px 1px 6px;
+  border-radius: 5px;
+  font-size: 0.82em;
+  opacity: 0.75;
+}
+
+.log.slack > details.tool-group > summary:hover,
+.log.slack > details.tool-group[open] > summary {
+  background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent);
+}
+
+/* Estatística do turno: pequena e cinza, mais visível no hover. */
+.log.slack > .result {
+  text-align: left;
+  font-size: 0.72em;
+  opacity: 0.5;
+  margin-top: 1px;
+}
+
+.log.slack > .result:hover {
+  opacity: 0.9;
+}
+
+.log.slack > .result.error {
+  opacity: 0.9;
+}
+
+/* Notas do sistema (permissão, aviso, cartões) respiram entre as falas. */
+.log.slack > .sl-meta:not(.result) {
+  margin-top: 6px;
+  margin-bottom: 6px;
+}
+
+.log.slack > details.msg.report {
+  margin-top: 10px;
+}
+
+/* Barra de ações no hover, no canto superior direito. */
+.sl-actions {
+  position: absolute;
+  top: -12px;
+  right: 6px;
+  z-index: 2;
+  display: none;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, var(--bg));
+  box-shadow: 0 1px 4px color-mix(in srgb, #000 18%, transparent);
+}
+
+.log.slack > .msg:hover > .sl-actions,
+.post:hover > .sl-actions,
+.post:focus-within > .sl-actions {
+  display: inline-flex;
+}
+
+.sl-act {
+  padding: 3px 5px;
+}
+
+.sl-act .codicon {
+  font-size: 14px;
+}
+
+/* Anexos enviados: cartão de arquivo, com a miniatura da imagem maior. */
+.log.slack .atts.sent .att {
+  max-width: 300px;
+  padding: 6px 10px 6px 6px;
+  gap: 10px;
+  border-radius: 8px;
+  background: var(--vscode-editorWidget-background, var(--card));
+}
+
+.log.slack .atts.sent .att .codicon {
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  font-size: 18px;
+  color: #fff;
+  background: var(--accent);
+}
+
+.log.slack .atts.sent .att .att-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.log.slack .atts.sent .att-name {
+  font-weight: 600;
+}
+
+/* ---------- Post de um agente e o lugar dele enquanto roda ---------- */
+
+.post,
+.log > .ag-card.chat-slot {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 4px 6px 4px 0;
+  border-radius: 6px;
+}
+
+.log:not(.slack) > .post,
+.log:not(.slack) > .ag-card.chat-slot {
+  padding-left: 6px;
+}
+
+.post:hover,
+.log > .ag-card.chat-slot:hover {
+  background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+}
+
+/* O lugar ao vivo não tem o fundo nem a borda de cartão: é uma pessoa no canal. */
+.log > .ag-card.chat-slot {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
+
+.log > .ag-card.compact.chat-slot + .ag-card.compact.chat-slot {
+  margin-top: 4px;
+}
+
+.post-av,
+.thread-av.post-av {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.post-main,
+.ag-card.chat-slot .ag-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.post-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.post-name {
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-weight: 700;
+  color: var(--fg, var(--vscode-foreground));
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.post-name:hover {
+  text-decoration: underline;
+}
+
+.post-id {
+  flex: none;
+  font-size: 0.78em;
+  color: var(--agm-color, var(--muted));
+  font-weight: 600;
+}
+
+.post-time {
+  flex: none;
+  font-size: 0.8em;
+  color: var(--muted);
+}
+
+.post-text {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.post-report {
+  margin-top: 3px;
+  font-size: 0.9em;
+}
+
+.post-report > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--muted);
+}
+
+.post-report > summary::-webkit-details-marker {
+  display: none;
+}
+
+.post-report > summary:hover {
+  color: var(--fg, var(--vscode-foreground));
+}
+
+.post-report > summary .codicon {
+  font-size: 12px;
+  transition: transform 0.12s ease;
+}
+
+.post-report[open] > summary .codicon {
+  transform: rotate(90deg);
+}
+
+.post-report-body {
+  margin-top: 6px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--agm-color, var(--border));
+  border-radius: 0 6px 6px 0;
+  background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent);
+  max-height: 480px;
+  overflow: auto;
+}
+
+/* "Responder em thread" e "Copiar" no hover do post. */
+.post-actions {
+  display: none;
+}
+
+/* Lugar ao vivo: título na linha de cima, digitando com a nota e a linha "Agora" embaixo. */
+.ag-card.chat-slot .ag-top .ag-title {
+  font-weight: 700;
+}
+
+.ag-card.chat-slot .ag-line2.ag-chat {
+  padding-left: 0;
+  margin-top: 2px;
+}
+
+.ag-card.chat-slot .ag-chat .lb-typing {
+  flex: none;
+  transform: scale(0.8);
+  transform-origin: left center;
+}
+
+.ag-now {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 2px;
+  font-size: 0.86em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.ag-now[hidden] {
+  display: none;
+}
+
+.ag-now-live {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--vscode-charts-green, #3fb950);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+.ag-now-tag {
+  flex: none;
+  font-weight: 700;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ag-now-what {
+  flex: none;
+}
+
+.ag-now-name {
+  flex: none;
+  font-weight: 600;
+  color: var(--fg, var(--vscode-foreground));
+}
+
+.ag-now-sum {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--vscode-editor-font-family);
+}
+
+/* ---------- Sinais de vida: digitando, pensamento e faixa de agentes ativos ---------- */
+
+/* Faixa entre o log e a caixa de texto. Linhas de altura fixa: só o número de linhas muda a altura. */
+.live-tray {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 14px 4px;
+  flex: none;
+}
+
+.lb-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  min-width: 0;
+  animation: lb-in 0.22s ease-out backwards;
+}
+
+.lb-row.clickable {
+  cursor: pointer;
+}
+
+.lb-row.clickable:hover .lb-name {
+  color: var(--fg);
+}
+
+.lb-avatar {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--lb-color, var(--accent));
+  animation: lb-pulse 1.6s ease-in-out infinite;
+}
+
+.lb-name {
+  flex: none;
+  max-width: 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.86em;
+  font-weight: 600;
+  color: var(--lb-color, var(--accent));
+}
+
+.lb-slot {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.lb-time {
+  flex: none;
+  font-size: 0.8em;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.lb-idle {
+  font-size: 0.84em;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+.lb-more {
+  font-size: 0.8em;
+  color: var(--muted);
+  padding-left: 17px;
+}
+
+.lb-bubble {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-width: 0;
+  animation: lb-in 0.22s ease-out backwards;
+}
+
+/* "Digitando": balão pequeno com três pontos que sobem e descem em sequência. */
+.lb-typing {
+  gap: 4px;
+  padding: 6px 10px;
+  border-radius: 12px 12px 12px 3px;
+  background: color-mix(in srgb, var(--lb-color, var(--accent)) 16%, var(--card));
+}
+
+.lb-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--lb-color, var(--accent));
+  animation: lb-bounce 1.1s ease-in-out infinite;
+}
+
+.lb-dot:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.lb-dot:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+/* Pensamento: nuvem com rabinho de bolhas, texto em itálico e mais apagado que uma mensagem. */
+.lb-thought {
+  position: relative;
+  padding: 3px 11px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--lb-color, var(--accent)) 9%, var(--card));
+  border: 1px dashed color-mix(in srgb, var(--lb-color, var(--accent)) 45%, transparent);
+  color: var(--muted);
+  font-style: italic;
+  font-size: 0.86em;
+  opacity: 0.88;
+}
+
+.lb-thought::before {
+  content: '';
+  position: absolute;
+  left: -6px;
+  bottom: 1px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--lb-color, var(--accent)) 30%, var(--card));
+}
+
+.lb-thought-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes lb-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+}
+
+@keyframes lb-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.45;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+@keyframes lb-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--lb-color, var(--accent)) 55%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 4px transparent;
+  }
+}
+
+/* Mensagem nova entra com um fade curto; cartões de agente trocam de cor de status devagar. */
+body.live-anim .log > :not(.lb-settled) {
+  animation: lb-in 0.2s ease-out backwards;
+}
+
+body.live-anim .ag-card {
+  transition:
+    border-color 0.4s ease,
+    background-color 0.4s ease,
+    opacity 0.4s ease;
+}
+
+/* Sem animação: pontos parados (três reticências fixas) e nada pulsando; o texto continua lá. */
+@media (prefers-reduced-motion: reduce) {
+  .lb-row,
+  .lb-bubble,
+  .lb-avatar,
+  .lb-dot,
+  body.live-anim .log > * {
+    animation: none;
+  }
+
+  .lb-dot {
+    opacity: 0.8;
+  }
 }

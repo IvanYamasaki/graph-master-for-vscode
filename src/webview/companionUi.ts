@@ -13,7 +13,7 @@ export interface CompanionUiDeps {
 
 /** Ícone do botão do cabeçalho do chat principal que abre o lateral. */
 export const COMPANION_ICON = 'comment-discussion';
-export const COMPANION_OPEN_TITLE = 'Consulta lateral: tirar dúvidas, depurar e perguntar o que um agente está fazendo, sem interferir nesta conversa';
+export const COMPANION_OPEN_TITLE = 'Consulta lateral: tirar dúvidas do projeto e depurar, sem interferir nesta conversa. Para um agente só, use a thread dele no cartão';
 
 const SEND_CLASS = 'companion-send';
 /** Onde o texto cru (markdown) de uma resposta fica guardado no elemento renderizado. */

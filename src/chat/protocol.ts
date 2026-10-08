@@ -2,6 +2,7 @@
 
 import type { BrowserStatus } from './browser';
 import type { CompanionInit } from './companion/types';
+import type { AgentPost, PostThread } from './threadModel';
 
 /** Primeira linha do texto que o "Enviar ao principal" do chat lateral manda à conversa principal. */
 export const COMPANION_MARK = '[Da consulta lateral, enviado pelo usuário]';
@@ -70,6 +71,25 @@ export interface SessionOption {
   /** ISO da última alteração. */
   lastModified: number;
   current: boolean;
+  /** Agentes do mapa salvos na pasta da conversa (`.agm/sessions/<id>/meta.json`). Ausente: nenhum. */
+  agents?: number;
+}
+
+/** Arrumação do mapa de uma conversa (`.agm/sessions/<id>/layout.json`): posições fixadas por id e caixas recolhidas. */
+export interface MapLayout {
+  pinned: Record<string, { x: number; y: number }>;
+  folds: Record<string, boolean>;
+}
+
+/** Uma conta cadastrada com os limites dela, para o menu da barra de limites. `usage` ausente: ainda lendo. */
+export interface AccountUsage {
+  id: string;
+  name: string;
+  account: string;
+  provider: Provider;
+  /** Conta deste chat. */
+  current: boolean;
+  usage?: UsageInfo;
 }
 
 export interface UsageInfo {
@@ -226,6 +246,11 @@ export interface AgentInfo {
   model?: string;
   /** Sessão própria do agente no Claude Code. É o que permite retomar a conversa dele depois de fechar a janela. */
   sessionId?: string;
+  /**
+   * Só no webview: nó-resumo do mapa que junta os agentes terminados de um criador. `count` são os filhos diretos,
+   * `total` com os descendentes; `expanded` quando o usuário os abriu.
+   */
+  foldSummary?: { count: number; total: number; failed: number; expanded: boolean; names: string[] };
   /** Tipo da tarefa do SDK (local_bash, local_agent...). Ausente em agentes roteados e continuações. */
   taskType?: string;
   /** Tarefa de shell: o comando e quando começou (ISO), para achar a árvore de processos dela. */
@@ -498,6 +523,10 @@ export type HostMessage =
       sessionTitle?: string;
       /** Preenchido quando este é o chat lateral de consulta de uma conversa principal. */
       companion?: CompanionInit;
+      /** agentGraphMaster.liveBubbles: balões de digitando e pensamento e a faixa de agentes ativos. Ausente = ligado. */
+      liveBubbles?: boolean;
+      /** agentGraphMaster.toolsExpanded: grupos de ferramenta do chat já abertos. Ausente = recolhidos. */
+      toolsExpanded?: boolean;
     }
   | { type: 'profiles'; list: ProfileOption[] }
   | { type: 'agent'; agent: AgentInfo }
@@ -507,6 +536,8 @@ export type HostMessage =
   | { type: 'orphans'; groups: OrphanView[]; error?: string; scannedAt: string; open?: boolean }
   /** Lista inteira das caixas da conversa, a cada mudança (vazia ao trocar de conversa). */
   | { type: 'boxes'; list: BoxInfo[] }
+  /** Arrumação do mapa salva na pasta da conversa, ao reabrir: nós arrastados e caixas recolhidas. */
+  | { type: 'mapLayout'; layout: MapLayout }
   | { type: 'agentItem'; id: string; item: HistoryItem }
   | { type: 'contextTokens'; value: number }
   | { type: 'models'; list: ModelOption[] }
@@ -522,12 +553,24 @@ export type HostMessage =
     }
   | { type: 'busy'; value: boolean }
   | { type: 'thinking'; value: boolean }
+  /**
+   * Sinal de vida de quem gera texto. `id`: "main" ou o id do agente (o hub reescreve o "main" da sessão do agente).
+   * `typing`: começou a escrever texto. `thinking`: está raciocinando; `text` é o fim do raciocínio em streaming,
+   * quando o modelo o entrega.
+   */
+  | { type: 'live'; id: string; phase: 'typing' | 'thinking'; text?: string }
+  /** A configuração agentGraphMaster.liveBubbles mudou com o chat aberto. */
+  | { type: 'liveConfig'; enabled: boolean }
+  /** A configuração agentGraphMaster.toolsExpanded mudou com o chat aberto. */
+  | { type: 'toolsConfig'; expanded: boolean }
   | { type: 'textDelta'; msgId: string; index: number; text: string }
   | { type: 'toolStart'; id: string; name: string }
   | { type: 'assistantText'; msgId: string; text: string }
   | { type: 'toolUse'; id: string; name: string; input: unknown }
   /** `images`: data URLs das imagens do resultado (capturas do navegador), já limitadas em tamanho pelo host. */
   | { type: 'toolResult'; id: string; text: string; isError: boolean; images?: string[] }
+  /** Resposta a resolveImages: `src` é URI de recurso do webview ou data URL; `error`, o motivo de não carregar. */
+  | { type: 'imagesResolved'; requestId: string; items: { path: string; src?: string; error?: string }[] }
   | {
       type: 'permission';
       requestId: string;
@@ -568,10 +611,19 @@ export type HostMessage =
   | { type: 'companionPrefill'; text: string }
   /** Chat lateral: perguntas de exemplo atualizadas (o último agente ativo muda). */
   | { type: 'companionExamples'; examples: string[] }
+  /** Posts dos agentes e threads da conversa (todos, ao abrir, retomar ou trocar de conversa). */
+  | { type: 'threads'; posts: AgentPost[]; list: PostThread[] }
+  /** Post novo (relatório entregue) ou que ganhou o texto do orquestrador. */
+  | { type: 'post'; post: AgentPost }
+  /** Uma thread mudou (mensagem nova, começou ou parou de esperar resposta). */
+  | { type: 'thread'; thread: PostThread }
+  /** O que o agente está fazendo na thread do post agora; sem `text`, parou. */
+  | { type: 'threadStatus'; postId: string; text?: string }
   | { type: 'insertText'; text: string }
   /** Resposta a `resolveUris`: anexos prontos (com caminho relativo) para o webview mostrar no preview. */
   | { type: 'attachments'; list: Attachment[] }
   | { type: 'usage'; usage: UsageInfo }
+  | { type: 'accountsUsage'; list: AccountUsage[] }
   | { type: 'sessions'; list: SessionOption[]; error?: string }
   /** Comandos de barra que funcionam fora do terminal, para o autocompletar do composer. */
   | { type: 'commands'; list: SlashCommandOption[] }
@@ -715,10 +767,18 @@ export type WebviewMessage =
   | { type: 'resumeAgent'; id: string; text?: string }
   /** Pede uma leitura dos limites agora (clique no rodapé). */
   | { type: 'refreshUsage' }
+  /** Limites de todas as contas. `force` relê mesmo o que ainda está no cache. */
+  | { type: 'accountsUsage'; force?: boolean }
+  /** Continua esta conversa em outra conta Claude: copia o transcrito e reabre o chat lá. */
+  | { type: 'transferSession'; profileId: string }
+  /** Passa um agente roteado do Claude para outra conta Claude, mantendo a sessão dele. */
+  | { type: 'agentSwitchAccount'; id: string; profileId: string }
   | { type: 'newChat' }
   /** Pede a lista de conversas para o dropdown; o host responde com `sessions`. */
   | { type: 'listSessions' }
   | { type: 'resumeSession'; id: string }
+  /** O usuário arrumou o mapa (arrastou um nó, recolheu uma caixa): o host grava na pasta da conversa. */
+  | { type: 'mapLayout'; layout: MapLayout }
   | { type: 'mentionFile' }
   /** Pede de novo a lista de comandos de barra; o host responde com `commands`. */
   | { type: 'listCommands' }
@@ -737,6 +797,10 @@ export type WebviewMessage =
   | { type: 'configureKey'; provider: ExternalProviderName }
   /** Clique numa miniatura de imagem gerada: abre o arquivo (relativo ao cwd) no editor. */
   | { type: 'openFile'; path: string }
+  /** Bolha do show_image: pede ao host o endereço de cada imagem (caminhos absolutos); volta em imagesResolved. */
+  | { type: 'resolveImages'; requestId: string; paths: string[] }
+  /** Botões do visualizador de imagens: abrir o arquivo no editor ou salvar uma cópia (arquivo ou data URL). */
+  | { type: 'imageAction'; action: 'open' | 'save'; path?: string; src?: string; name?: string }
   /** Interruptor "Usar o navegador (Claude in Chrome)" do chat principal. */
   | { type: 'setChrome'; value: boolean }
   /** Relê a lista de navegadores conectados (clique no indicador). */
@@ -752,7 +816,11 @@ export type WebviewMessage =
   /** Botão "Cérebro" do mapa (sem agentId: o index.md) ou "Nota no cérebro" do popup de um agente. Abre no preview de Markdown. */
   | { type: 'openBrain'; agentId?: string }
   /** Chat lateral: clique em "Enviar ao principal" numa resposta. Só o clique do usuário gera esta mensagem. */
-  | { type: 'companionToMain'; text: string };
+  | { type: 'companionToMain'; text: string }
+  /** Pergunta escrita na thread de um post ("a3#2"): responde a persona só leitura do agente. */
+  | { type: 'threadSend'; postId: string; text: string }
+  /** Botão de parar da thread: interrompe a resposta em andamento. */
+  | { type: 'threadInterrupt'; postId: string };
 
 // ---------- Laboratório (quadro de experimentos em .agm/lab/) ----------
 

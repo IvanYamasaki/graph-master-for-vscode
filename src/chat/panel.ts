@@ -5,21 +5,27 @@ import { randomBytes, randomUUID } from 'crypto';
 import type { PermissionMode, SessionMessage } from '@anthropic-ai/claude-agent-sdk';
 import { getSessionInfo, getSessionMessages, listSessions } from '@anthropic-ai/claude-agent-sdk';
 import { Profile, ProfileStore, configDirEnv, isCodex } from '../profiles';
-import { AgentRecord, ChatSession, profileEnv, toolResultImages, toolResultText } from './session';
+import { AgentRecord, ChatSession, probeClaudeUsage, profileEnv, toolResultImages, toolResultText } from './session';
 import { isClaudeUrl } from './remoteControl';
-import { CodexSession, codexModelOptions, knownCodexModels, prefetchCodexModels } from './codexSession';
+import { CodexSession, codexModelOptions, knownCodexModels, prefetchCodexModels, probeCodexUsage } from './codexSession';
+import { copySession, findSession, targetTranscript } from './transfer';
 import { AgentHub, AnySession, MAIN_ID, browserApproval } from './hub';
 import type { LabReports } from './lab/reportHost';
 import { AgentStore } from './agentStore';
+import { SessionStore } from './sessionStore';
 import { FileIndex, editorFiles } from './fileIndex';
-import { Attachment, AgentInfo, COMPANION_MARK, ConnectedBrowser, HistoryItem, HostMessage, ProfileOption, WebviewMessage } from './protocol';
+import { AccountUsage, Attachment, AgentInfo, COMPANION_MARK, ConnectedBrowser, HistoryItem, HostMessage, ProfileOption, WebviewMessage } from './protocol';
 import { ExternalProviders } from './external';
+import { handleImageMessage } from './imageFiles';
 import { probeBrowsers } from './browserProbe';
 import { resolveClaudeExecutable } from '../claudePath';
 import { CompanionLink, CompanionPanel } from './companion/panel';
+import { AgentThreads } from './threadHost';
+import { FolderThreadStore } from './threadStore';
 import { RECONCILE_EVERY_MS } from './taskLiveness';
 import { StampedKill, killSnapshot, killSummary, orphanDetail, scanOrphans, snapFromView } from './taskProcs';
 import type { CompanionAgent, CompanionSource, MainMessage } from './companion/types';
+import type { MapLayout, SessionOption, UsageInfo } from './protocol';
 
 export const CHAT_VIEW_TYPE = 'agentGraphMaster.chat';
 
@@ -55,6 +61,9 @@ export interface ChatOptions {
   model?: string;
   effort?: string;
   fork?: ForkLink;
+  permissionMode?: PermissionMode;
+  /** Coluna onde a aba abre; sem isso abre ao lado. */
+  viewColumn?: vscode.ViewColumn;
   /** Primeira mensagem enviada assim que o chat abre. `display` é o que aparece na tela, `prompt` é o que vai para o Claude. */
   seed?: { display: string; prompt: string };
 }
@@ -96,6 +105,8 @@ export class ChatPanel {
   /** Claude ou Codex, conforme o fornecedor da conta. As duas têm a mesma superfície. */
   readonly session: AnySession;
   private readonly hub: AgentHub;
+  /** Posts dos agentes (um por relatório entregue) e a thread de cada um, dentro deste chat. */
+  private readonly threads: AgentThreads;
   private ready = false;
   private usageTimer?: ReturnType<typeof setInterval>;
   private usageInFlight = false;
@@ -117,7 +128,7 @@ export class ChatPanel {
     const panel = vscode.window.createWebviewPanel(
       CHAT_VIEW_TYPE,
       '',
-      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
+      { viewColumn: options.viewColumn ?? vscode.ViewColumn.Beside, preserveFocus: false },
       ChatPanel.webviewOptions(env.context),
     );
     return new ChatPanel(env, panel, profile, options);
@@ -203,7 +214,7 @@ export class ChatPanel {
       profiles: () => env.store.all(),
       post: (msg) => this.post(msg),
       permissionMode: () => this.session.permissionMode,
-      store: new AgentStore(env.context.workspaceState),
+      store: new AgentStore(env.context.workspaceState, SessionStore.for(cwd)),
       browserChanged: () => this.postBrowser(),
     });
     // O interruptor começa como a configuração manda, se o navegador estiver livre (outra aba pode estar com ele).
@@ -216,6 +227,7 @@ export class ChatPanel {
       : new ChatSession(profile, cwd, (msg) => this.post(msg), {
           model: options.model,
           effort: options.effort,
+          permissionMode: options.permissionMode,
           mcpServers: this.hub.mcpServersFor(MAIN_ID),
           systemAppend: () => this.hub.systemAppendFor(MAIN_ID),
           chrome: chromeAtStart,
@@ -232,6 +244,15 @@ export class ChatPanel {
         }
       }, RECONCILE_EVERY_MS);
     }
+    this.threads = new AgentThreads({
+      profile: () => this.link().profile,
+      cwd,
+      persistence: new FolderThreadStore(cwd),
+      mainSessionId: () => this.session.sessionId,
+      source: () => this.companionSource(),
+      post: (msg) => this.post(msg),
+      startPaused: !!options.resumeId,
+    });
     this.files = FileIndex.acquire(cwd);
     // Aba restaurada já volta com o título que tinha; o nome da sessão chega logo depois pela leitura abaixo.
     if (!(options.resumeId && panel.title)) {
@@ -248,6 +269,14 @@ export class ChatPanel {
     const editorWatch = [
       vscode.window.onDidChangeActiveTextEditor(() => this.postActiveFile()),
       vscode.workspace.onDidCloseTextDocument?.(() => this.postActiveFile()),
+      vscode.workspace.onDidChangeConfiguration?.((e) => {
+        if (e.affectsConfiguration('agentGraphMaster.liveBubbles')) {
+          this.post({ type: 'liveConfig', enabled: vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('liveBubbles', true) });
+        }
+        if (e.affectsConfiguration('agentGraphMaster.toolsExpanded')) {
+          this.post({ type: 'toolsConfig', expanded: vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('toolsExpanded', false) });
+        }
+      }),
     ];
     panel.onDidDispose(() => {
       ChatPanel.all.delete(this);
@@ -256,6 +285,7 @@ export class ChatPanel {
       this.files.release();
       editorWatch.forEach((d) => d?.dispose());
       this.hub.dispose();
+      this.threads.dispose();
       this.session.dispose();
       if (options.fork) {
         options.fork.parent.updateFork(options.fork.forkId, { status: 'stopped' });
@@ -305,6 +335,13 @@ export class ChatPanel {
     } else {
       this.outbox.push(msg);
     }
+    // Depois da mensagem do agente: relatório novo vira post. Texto completo do orquestrador: os blocos <post>
+    // viram o texto do post do agente (o webview tira os blocos do que mostra).
+    if (msg.type === 'agent') {
+      this.threads?.noteAgent(msg.agent);
+    } else if (msg.type === 'assistantText') {
+      this.threads?.takeSummaries(msg.text);
+    }
   }
 
   private async onMessage(msg: WebviewMessage): Promise<void> {
@@ -352,6 +389,8 @@ export class ChatPanel {
         const { requestId, type: _type, ...answer } = msg;
         if (this.hub.ownsPermission(requestId)) {
           this.hub.respondPermission(requestId, answer);
+        } else if (this.threads.ownsPermission(requestId)) {
+          this.threads.respondPermission(requestId, answer);
         } else {
           this.session.respondPermission(requestId, answer);
         }
@@ -367,8 +406,8 @@ export class ChatPanel {
         this.session.setEffort(msg.value);
         return;
       case 'newChat':
-        // Conversa nova em aba nova, com sessão, hub e agentes próprios. Esta aba fica como está.
-        ChatPanel.open(this.env, this.profile);
+        // Conversa nova em aba nova no mesmo grupo de abas, com sessão, hub e agentes próprios. Esta aba fica como está.
+        ChatPanel.open(this.env, this.profile, { viewColumn: this.panel.viewColumn });
         return;
       case 'resolveTask':
         this.hub.resolveTask(msg.id, msg.action);
@@ -381,6 +420,11 @@ export class ChatPanel {
         return;
       case 'resumeSession':
         await this.resume(msg.id);
+        return;
+      case 'mapLayout':
+        if (this.session.sessionId) {
+          SessionStore.for(this.session.cwd).write(this.session.sessionId, 'layout', msg.layout);
+        }
         return;
       case 'mentionFile':
         this.mentionFile();
@@ -412,6 +456,12 @@ export class ChatPanel {
       case 'agentSend':
         this.hub.sendFromUser(msg.id, msg.text);
         return;
+      case 'threadSend':
+        this.threads.send(msg.postId, msg.text);
+        return;
+      case 'threadInterrupt':
+        await this.threads.interrupt(msg.postId);
+        return;
       case 'agentSetModel':
         await this.hub.setModel(msg.id, msg.value);
         return;
@@ -427,6 +477,15 @@ export class ChatPanel {
       case 'refreshUsage':
         await this.refreshUsage();
         return;
+      case 'accountsUsage':
+        await this.postAccountsUsage(!!msg.force);
+        return;
+      case 'transferSession':
+        await this.transferSession(msg.profileId);
+        return;
+      case 'agentSwitchAccount':
+        await this.hub.switchAccount(msg.id, msg.profileId);
+        return;
       case 'forkAgent':
         await this.forkAgent(msg);
         return;
@@ -438,6 +497,10 @@ export class ChatPanel {
         return;
       case 'openFile':
         await this.openProjectFile(msg.path);
+        return;
+      case 'resolveImages':
+      case 'imageAction':
+        await handleImageMessage(this.panel.webview, msg, this.session.cwd, [workspaceCwd()], (m) => this.post(m));
         return;
       case 'setChrome':
         this.setChrome(msg.value);
@@ -494,6 +557,8 @@ export class ChatPanel {
         image: ExternalProviders.get().defaultProvider('image'),
         imageFolder: ExternalProviders.get().imageFolder(),
       },
+      liveBubbles: vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('liveBubbles', true),
+      toolsExpanded: vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('toolsExpanded', false),
     });
     this.post({ type: 'profiles', list: this.env.profileOptions() });
     if (knownCodexModels().length) {
@@ -505,20 +570,21 @@ export class ChatPanel {
       this.post({ type: 'remoteControl', state: this.session.remote.state });
     }
     this.post({ type: 'brain', exists: this.hub.brain.isActive });
+    this.threads.postAll();
     for (const msg of this.outbox.splice(0)) {
       void this.panel.webview.postMessage(msg);
     }
     if (!firstLoad) {
       return;
     }
-    if (this.options.resumeId) {
-      await this.loadHistory(this.options.resumeId);
-    }
+    const history = this.options.resumeId ? await this.loadHistory(this.options.resumeId) : [];
     this.session.start(this.options.resumeId);
     this.saveState();
     if (this.options.resumeId) {
-      // Conversa retomada: os agentes roteados dela voltam do workspaceState, parados, esperando o usuário retomar.
+      // Conversa retomada: os agentes roteados dela voltam da pasta da conversa, parados, esperando o usuário retomar.
       this.hub.restore(this.options.resumeId);
+      this.threads.load(this.options.resumeId, history);
+      this.postMapLayout(this.options.resumeId);
     }
     if (this.options.seed) {
       this.post({ type: 'userEcho', text: this.options.seed.display });
@@ -775,6 +841,136 @@ export class ChatPanel {
     }
   }
 
+  /**
+   * Limites de todas as contas. A deste chat vem do processo dele; as outras, de um chat aberto com a mesma conta
+   * ou de um processo curto que só pergunta o /usage. O menu recebe a lista de novo a cada conta lida.
+   */
+  private async postAccountsUsage(force: boolean): Promise<void> {
+    const profiles = this.env.store.all();
+    const options = new Map(this.env.profileOptions().map((o) => [o.id, o]));
+    const result = new Map<string, UsageInfo | undefined>();
+    const send = () =>
+      this.post({
+        type: 'accountsUsage',
+        list: profiles.map(
+          (p): AccountUsage => ({
+            id: p.id,
+            name: p.name,
+            account: options.get(p.id)?.account ?? '',
+            provider: isCodex(p) ? 'codex' : 'claude',
+            current: p.id === this.profile.id,
+            usage: result.get(p.id),
+          }),
+        ),
+      });
+    for (const p of profiles) {
+      const cached = usageCache.get(p.id);
+      result.set(p.id, !force && cached && Date.now() - cached.at < USAGE_CACHE_MS ? cached.usage : undefined);
+    }
+    send();
+    await Promise.all(
+      profiles
+        .filter((p) => !result.get(p.id))
+        .map(async (p) => {
+          const usage = await this.readAccountUsage(p);
+          usageCache.set(p.id, { usage, at: Date.now() });
+          result.set(p.id, usage);
+          send();
+        }),
+    );
+  }
+
+  private readAccountUsage(profile: Profile): Promise<UsageInfo> {
+    const live = [this, ...ChatPanel.all].find((p) => p.profile.id === profile.id && ChatPanel.all.has(p));
+    if (live) {
+      return live.session.readUsage();
+    }
+    let running = usageProbes.get(profile.id);
+    if (!running) {
+      running = (isCodex(profile) ? probeCodexUsage(profile, this.session.cwd) : probeClaudeUsage(profile, this.session.cwd)).finally(() => usageProbes.delete(profile.id));
+      usageProbes.set(profile.id, running);
+    }
+    return running;
+  }
+
+  // ---------- Troca de conta da conversa ----------
+
+  /**
+   * Continua esta conversa em outra conta Claude. O transcrito (com subagentes e checkpoints) é copiado para a pasta
+   * da conta escolhida e o chat reabre ali, retomando a sessão. A cópia na conta de origem fica como estava.
+   */
+  private async transferSession(targetId: string): Promise<void> {
+    const target = this.env.store.get(targetId);
+    const session = this.session;
+    const fail = (text: string) => this.post({ type: 'notice', level: 'error', text });
+    if (!target || target.id === this.profile.id) {
+      return;
+    }
+    if (!(session instanceof ChatSession) || isCodex(target)) {
+      fail('Só dá para trocar a conta de conversas do Claude, e para outra conta do Claude: o Codex grava a conversa em outro formato.');
+      return;
+    }
+    if (this.options.fork) {
+      fail('Uma continuação de agente não troca de conta; continue o agente direto na outra conta pelo mapa.');
+      return;
+    }
+    if (!session.sessionId) {
+      fail('A conversa ainda não existe: mande a primeira mensagem antes de trocar de conta.');
+      return;
+    }
+    if (session.isBusy) {
+      fail('Espere o turno terminar (ou interrompa) antes de trocar de conta.');
+      return;
+    }
+    if (path.resolve(target.configDir).toLowerCase() === path.resolve(this.profile.configDir).toLowerCase()) {
+      fail(`A conta "${target.name}" usa a mesma pasta desta; não há o que transferir.`);
+      return;
+    }
+    const sessionId = session.sessionId;
+    const source = await findSession(this.profile, sessionId, session.cwd);
+    if (!source) {
+      fail(`Não achei o transcrito desta conversa na pasta da conta ${this.profile.name}.`);
+      return;
+    }
+    const dest = targetTranscript(target, source);
+    const email = this.env.profileOptions().find((p) => p.id === target.id)?.account;
+    const warnings = [
+      'A conversa é copiada para a outra conta e esta aba reabre nela, com o mesmo histórico. A cópia nesta conta fica como está.',
+      session.hasRunningTasks ? 'Há tarefas em segundo plano rodando: elas param quando esta aba fechar.' : '',
+      session.remote.state.status === 'connected' ? 'O Remote Control desta aba é desligado; ligue de novo na conta nova, se quiser.' : '',
+      dest.exists ? `A conta ${target.name} já tem uma cópia desta conversa (de uma troca anterior). Ela será substituída por esta.` : '',
+      email ? '' : `A conta ${target.name} não mostra login agora. Sem login, a conversa abre mas não responde até você entrar nela.`,
+    ].filter(Boolean);
+    const ok = await vscode.window.showWarningMessage(
+      `Continuar esta conversa na conta ${target.name}${email ? ` (${email})` : ''}?`,
+      { modal: true, detail: warnings.join('\n\n') },
+      'Trocar de conta',
+    );
+    if (ok !== 'Trocar de conta' || !ChatPanel.all.has(this)) {
+      return;
+    }
+    if (session.isBusy || session.sessionId !== sessionId) {
+      fail('A conversa mudou enquanto a confirmação estava aberta; tente de novo.');
+      return;
+    }
+    try {
+      await copySession(source, this.profile, target);
+    } catch (err) {
+      fail(`Não consegui copiar a conversa para a conta ${target.name}: ${String(err)}`);
+      return;
+    }
+    this.hub.pinOwnAccount();
+    this.hub.flush();
+    // As sessões das threads são da conta que sai: a aba nova começa sessões novas na outra conta.
+    this.threads.resetSessions();
+    const env = this.env;
+    const options: ChatOptions = { resumeId: sessionId, model: session.model, effort: session.effort, permissionMode: session.permissionMode, viewColumn: this.panel.viewColumn };
+    // Fecha esta aba antes: o navegador e o Remote Control ficam livres para a aba nova.
+    this.panel.dispose();
+    const next = ChatPanel.open(env, target, options);
+    next.post({ type: 'notice', level: 'info', text: `Conversa trazida da conta ${this.profile.name}. O histórico é o mesmo; daqui em diante ela gasta os limites de ${target.name}.` });
+  }
+
   private saveState(): void {
     // O webview guarda o estado que o serializer usa ao recarregar a janela.
     this.post({ type: 'session', sessionId: this.session.sessionId ?? '', model: this.session.model, permissionMode: this.session.permissionMode });
@@ -790,7 +986,7 @@ export class ChatPanel {
   private async sendSessionList(): Promise<void> {
     if (this.session instanceof CodexSession) {
       try {
-        this.post({ type: 'sessions', list: await this.session.listSessions() });
+        this.post({ type: 'sessions', list: this.withAgentCounts(await this.session.listSessions()) });
       } catch (err) {
         this.post({ type: 'sessions', list: [], error: String(err) });
       }
@@ -802,50 +998,78 @@ export class ChatPanel {
       );
       this.post({
         type: 'sessions',
-        list: sessions.map((s) => ({
-          id: s.sessionId,
-          title: shorten(s.customTitle || s.summary || s.firstPrompt || s.sessionId, 80),
-          lastModified: s.lastModified,
-          current: s.sessionId === this.session.sessionId,
-        })),
+        list: this.withAgentCounts(
+          sessions.map((s) => ({
+            id: s.sessionId,
+            title: shorten(s.customTitle || s.summary || s.firstPrompt || s.sessionId, 80),
+            lastModified: s.lastModified,
+            current: s.sessionId === this.session.sessionId,
+          })),
+        ),
       });
     } catch (err) {
       this.post({ type: 'sessions', list: [], error: String(err) });
     }
   }
 
+  /** Nós arrastados e caixas recolhidas da conversa reaberta, de `.agm/sessions/<id>/layout.json`. */
+  private postMapLayout(sessionId: string): void {
+    const raw = SessionStore.for(this.session.cwd).read<Partial<MapLayout>>(sessionId, 'layout');
+    if (raw && typeof raw === 'object') {
+      this.post({ type: 'mapLayout', layout: { pinned: isPlainObject(raw.pinned) ? raw.pinned : {}, folds: isPlainObject(raw.folds) ? raw.folds : {} } });
+    }
+  }
+
+  /** Quantos agentes cada conversa tem no mapa, lido do meta.json da pasta dela (um arquivo pequeno por conversa). */
+  private withAgentCounts(list: SessionOption[]): SessionOption[] {
+    const sessions = SessionStore.for(this.session.cwd);
+    return list.map((s) => {
+      const agents = sessions.meta(s.id)?.agents;
+      return agents ? { ...s, agents } : s;
+    });
+  }
+
   private async resume(sessionId: string): Promise<void> {
     if (sessionId === this.session.sessionId) {
+      return;
+    }
+    // A mesma conversa em dois painéis teria dois hubs gravando a mesma pasta, cada um com a sua lista de agentes.
+    const open = [...ChatPanel.all].find((p) => p !== this && p.session.sessionId === sessionId);
+    if (open) {
+      open.panel.reveal();
       return;
     }
     this.post({ type: 'clear' });
     this.session.agents.clear();
     // Trocar de conversa não apaga os agentes da anterior: eles continuam salvos e voltam se ela for reaberta.
     this.hub.detach();
-    await this.loadHistory(sessionId);
+    this.threads.detach();
+    const history = await this.loadHistory(sessionId);
     this.session.start(sessionId);
     this.saveState();
     this.hub.restore(sessionId);
+    this.threads.load(sessionId, history);
+    this.postMapLayout(sessionId);
     this.sessionTitle = '';
     this.applyTitle();
     void this.refreshTitle(sessionId);
   }
 
-  private async loadHistory(sessionId: string): Promise<void> {
-    if (this.session instanceof CodexSession) {
-      try {
-        this.post({ type: 'history', items: await this.session.loadHistory(sessionId), title: '' });
-      } catch (err) {
-        this.post({ type: 'notice', level: 'error', text: `Não consegui carregar a conversa do Codex: ${String(err)}` });
-      }
-      return;
-    }
+  /** Manda o histórico ao webview e devolve os textos do orquestrador (os blocos <post> deles completam os posts). */
+  private async loadHistory(sessionId: string): Promise<string[]> {
+    let items: HistoryItem[];
     try {
-      const messages = await withConfigDir(this.profile, () => getSessionMessages(sessionId, { dir: this.session.cwd }));
-      this.post({ type: 'history', items: toHistory(messages), title: '' });
+      items =
+        this.session instanceof CodexSession
+          ? await this.session.loadHistory(sessionId)
+          : toHistory(await withConfigDir(this.profile, () => getSessionMessages(sessionId, { dir: this.session.cwd })));
     } catch (err) {
-      this.post({ type: 'notice', level: 'error', text: `Não consegui carregar a conversa: ${String(err)}` });
+      const what = this.session instanceof CodexSession ? 'a conversa do Codex' : 'a conversa';
+      this.post({ type: 'notice', level: 'error', text: `Não consegui carregar ${what}: ${String(err)}` });
+      return [];
     }
+    this.post({ type: 'history', items, title: '' });
+    return items.flatMap((i) => (i.kind === 'text' ? [i.text] : []));
   }
 
   // ---------- Subagentes ----------
@@ -1132,7 +1356,7 @@ export class ChatPanel {
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data: https:; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="${codicons}">
 <link rel="stylesheet" href="${style}">
@@ -1169,6 +1393,11 @@ function shorten(text: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
+
+/** Limites lidos de cada conta, para o menu de contas não subir um processo a cada clique. */
+const USAGE_CACHE_MS = 60_000;
+const usageCache = new Map<string, { usage: UsageInfo; at: number }>();
+const usageProbes = new Map<string, Promise<UsageInfo>>();
 
 let configDirLock: Promise<unknown> = Promise.resolve();
 
@@ -1383,4 +1612,9 @@ async function pickOrphans(cwd: string): Promise<void> {
     const r = await killGroups(picked.map((p) => found.snaps.get(p.group.root.pid) ?? []));
     void vscode.window.showInformationMessage(`Processos órfãos: ${killSummary(r)}.`);
   }
+}
+
+/** Objeto simples vindo de JSON (layout.json pode ser de outra versão ou estar editado à mão). */
+function isPlainObject<T>(value: unknown): value is Record<string, T> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

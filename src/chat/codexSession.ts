@@ -136,6 +136,37 @@ export async function prefetchCodexModels(profile: Profile, cwd: string): Promis
   }
 }
 
+/** Limites do plano de uma conta Codex sem chat aberto: sobe o app-server, lê e fecha. */
+export async function probeCodexUsage(profile: Profile, cwd: string): Promise<UsageInfo> {
+  const fetchedAt = new Date().toISOString();
+  const exe = await resolveCodexExecutable();
+  if (!exe) {
+    return { available: false, windows: [], fetchedAt, error: 'não achei o executável do Codex' };
+  }
+  const rpc = new CodexRpc(exe, codexEnv(profile), cwd, {
+    notification: () => undefined,
+    request: (method) => Promise.reject(unsupported(method)),
+    exit: () => undefined,
+  });
+  try {
+    await rpc.start();
+    const data = await rpc.request<{ rateLimits: RateSnapshot; rateLimitsByLimitId: Record<string, RateSnapshot> | null }>('account/rateLimits/read', undefined, 20000);
+    const snapshots = data.rateLimitsByLimitId ? Object.values(data.rateLimitsByLimitId) : [data.rateLimits];
+    const windows = snapshots.flatMap((s) => rateWindows(s, snapshots.length > 1));
+    return {
+      available: windows.length > 0,
+      subscription: data.rateLimits.planType ?? undefined,
+      windows,
+      fetchedAt,
+      error: windows.length ? undefined : 'o Codex não informou limites para esta conta',
+    };
+  } catch (err) {
+    return { available: false, windows: [], fetchedAt, error: errorText(err) };
+  } finally {
+    rpc.dispose();
+  }
+}
+
 /** Comandos de barra que a sessão resolve sozinha; o app-server do Codex não tem comandos de barra. */
 const LOCAL_COMMANDS: SlashCommandOption[] = [
   { name: 'compact', description: 'Resume a conversa para liberar contexto' },

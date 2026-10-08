@@ -29,6 +29,8 @@ export interface GuardHost {
   stop(id: string): Promise<void>;
   /** Linha no log do agente. */
   log(id: string, text: string): void;
+  /** Orçamento do agente esgotou: o hub avisa quem o criou, que pode liberar mais com extend_budget. */
+  budgetExhausted?(id: string, text: string): void;
   /** Caixas do mapa, com o budget de cada uma. Sem isto, não há orçamento por caixa. */
   boxes?(): BoxInfo[];
   /** Todos os agentes da conversa, para somar o gasto de uma caixa. */
@@ -81,7 +83,7 @@ export interface UsageReport {
 /** Trecho do prompt do orquestrador sobre orçamento, avaliador congelado e agente preso. */
 export const GUARD_GUIDE = [
   'Orçamento, avaliador congelado e agente preso:',
-  '- Em experimento, dê orçamento a cada agente: spawn_agent com budget { max_tokens, max_minutes, max_usd }. Aos 80% o mapa avisa; em 100% o sistema interrompe o agente e o usuário decide se dá mais ou para. Sem budget vale agentGraphMaster.defaultAgentBudget.',
+  '- Em experimento, dê orçamento a cada agente: spawn_agent com budget { max_tokens, max_minutes, max_usd }. Aos 80% o mapa avisa; em 100% o sistema interrompe o agente, avisa você (quem o criou) e mostra um cartão ao usuário. Você mesmo pode liberar mais com extend_budget({ agent_id, ... , reason }) sem esperar o usuário, para agentes que você criou (ou que estão abaixo deles); ou pare com stop_agent. Libere só quando o trabalho estiver perto do fim e valer o gasto. Sem budget vale agentGraphMaster.defaultAgentBudget.',
   '- Orçamento da frente inteira: create_box com budget. O gasto de todos os agentes da caixa e das caixas-filhas soma contra ele, com ou sem budget próprio, e vale também para agente que você esqueceu de limitar. Aos 80% o usuário é avisado; em 100% o hub interrompe os agentes da caixa, recusa agente novo nela e o usuário decide se dá mais. Numa rodada com vários agentes, crie a caixa com budget antes do primeiro spawn_agent.',
   '- Tokens contam entrada (com cache) e saída de cada chamada ao modelo, então crescem rápido: cada chamada já leva o contexto inteiro, e um agente com 20 ferramentas passa fácil de 500 mil. Para limitar tempo e dinheiro, prefira max_minutes e max_usd (custo estimado pelo SDK; não existe para agentes Codex).',
   '- Referência: leitura ou levantamento com haiku, max_minutes 10; código com sonnet, max_minutes 30 e max_usd 2; revisão com opus, max_usd 5. Ajuste ao que o usuário disser.',
@@ -464,6 +466,56 @@ export class AgentGuard {
     t.budgetAlert = alert.id;
     this.host.log(id, `> Guarda: orçamento esgotado (${budgetLines(info).join(' · ')}).`);
     this.host.post({ type: 'guardAlert', alert });
+    this.host.budgetExhausted?.(
+      id,
+      `O agente ${id} ("${info.description}") atingiu o orçamento e foi interrompido: ${budgetLines(info).join(' · ')}. Você pode liberar mais com extend_budget({ agent_id: "${id}", reason }) (sem valores: +${EXTEND_PERCENT}% em cada limite), ou parar com stop_agent. O usuário também vê o cartão e pode decidir antes.`,
+    );
+  }
+
+  /**
+   * Orçamento ampliado por quem criou o agente (extend_budget), sem passar pelo usuário. Valores dados viram o limite
+   * novo de cada medida e precisam passar do já gasto; sem valores, cada limite cresce `percent`. Fecha o cartão
+   * pendente e, se o turno foi interrompido pelo guarda, o agente continua de onde parou.
+   */
+  extendBy(id: string, by: string, reason: string, raw: { max_tokens?: number; max_minutes?: number; max_usd?: number; add_percent?: number }): { ok: boolean; text: string } {
+    const info = this.host.info(id);
+    if (!info) {
+      return { ok: false, text: `Agente "${id}" não existe.` };
+    }
+    const given = AgentGuard.budgetFrom(raw);
+    const current = info.budget;
+    if (!given && !hasBudget(current)) {
+      return { ok: false, text: `O agente ${id} não tem orçamento. Para dar um, passe max_tokens, max_minutes ou max_usd.` };
+    }
+    const spent = info.spent;
+    const budget: AgentBudget = given ? { ...current, ...Object.fromEntries(Object.entries(given).filter(([, v]) => v !== undefined)) } : this.extended(current!, spent, raw.add_percent ?? EXTEND_PERCENT);
+    const below = [
+      given?.maxTokens !== undefined && given.maxTokens <= (spent?.tokens ?? 0) ? `max_tokens ${given.maxTokens} (já gastou ${spent?.tokens})` : '',
+      given?.maxMinutes !== undefined && given.maxMinutes <= (spent?.minutes ?? 0) ? `max_minutes ${given.maxMinutes} (já trabalhou ${fmtMinutes(spent?.minutes ?? 0)})` : '',
+      given?.maxUsd !== undefined && given.maxUsd <= (spent?.usd ?? 0) ? `max_usd ${given.maxUsd} (já gastou ${fmtUsd(spent?.usd ?? 0)})` : '',
+    ].filter(Boolean);
+    if (below.length) {
+      return { ok: false, text: `Limite novo abaixo do já gasto: ${below.join('; ')}. Passe valores maiores ou omita para somar ${EXTEND_PERCENT}%.` };
+    }
+    const why = reason.trim() || 'sem motivo informado';
+    const lines = budgetLines({ ...info, budget }).join(' · ');
+    this.host.update(id, { budget, summary: `orçamento ampliado por ${by}` });
+    this.host.log(id, `> Orçamento ampliado por ${by}: ${lines}. Motivo: ${why}`);
+    this.host.post({ type: 'notice', level: 'info', text: `${by} liberou mais orçamento para o agente ${id} ("${info.description}"): ${lines}. Motivo: ${why}` });
+    const t = this.tracks.get(id);
+    const alert = t?.budgetAlert ? this.alerts.get(t.budgetAlert) : undefined;
+    if (alert?.status === 'pending') {
+      alert.status = 'extended';
+      alert.note = `Liberado por ${by}: ${lines}. Motivo: ${why}`;
+      this.host.post({ type: 'guardAlert', alert });
+    }
+    let resumed = false;
+    if (t?.needsContinue && (budgetFraction(budget, spent) ?? 0) < 1) {
+      t.needsContinue = false;
+      resumed = true;
+      this.host.continueAgent(id, `${by} liberou mais orçamento (${lines}). Continue a tarefa de onde parou e entregue o relatório final como combinado.`);
+    }
+    return { ok: true, text: `Orçamento do agente ${id}: ${lines}.${resumed ? ' Ele foi retomado de onde parou.' : ''}` };
   }
 
   /** Novo limite: o maior entre o limite e o já gasto, mais `percent` do limite. */
