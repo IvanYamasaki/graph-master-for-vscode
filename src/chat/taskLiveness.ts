@@ -137,6 +137,24 @@ export function commandPorts(command: string | undefined): number[] {
  * ou `&` final, cortada em 60 caracteres. O shell do CLI embrulha o comando (bash -c "...", cmd /c), então o trecho
  * precisa ser um pedaço que sobrevive ao embrulho.
  */
+/**
+ * Nome de uma tarefa de shell no mapa. O CLI manda o próprio comando como descrição; o que diz o objetivo é o
+ * `description` que o modelo passou ao Bash. Sem ele, o comando sem os `cd`/`export` da frente, numa linha só.
+ */
+export function shellTaskLabel(description: string | undefined, command: string | undefined): string {
+  const given = description?.replace(/\s+/g, ' ').trim();
+  if (given && given !== command?.replace(/\s+/g, ' ').trim()) {
+    return given;
+  }
+  const text = command ?? description ?? '';
+  const parts = text
+    .split(/&&|;|\n/)
+    .map((p) => p.trim())
+    .filter((p) => p && !/^(cd|export|set|source|\.)\s/i.test(p));
+  const label = (parts.join(' && ') || text).replace(/\s+/g, ' ').trim();
+  return label.length > 80 ? `${label.slice(0, 79)}…` : label || 'tarefa de shell';
+}
+
 export function commandNeedle(command: string | undefined): string | undefined {
   if (!command) {
     return undefined;

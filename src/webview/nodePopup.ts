@@ -25,6 +25,7 @@ import { progressLabel, sumSpent } from '../chat/costs';
 import { fmtUsd } from '../chat/guard/format';
 import { createAttemptRow, paintAttemptRow } from './parallelUi';
 import { createProcRow, paintProcRow, type ProcRowDeps } from './procUi';
+import { agentNow, flatLine as flat, mcpToolLabel as toolLabel, openTool as currentTool } from './liveLogic';
 
 export interface NodePopupDeps {
   getAgent(id: string): AgentInfo | undefined;
@@ -59,12 +60,20 @@ export interface NodePopupDeps {
   getBox?(boxId: string): BoxPopupInfo | undefined;
   /** Recolhe ou expande a caixa no grafo. */
   toggleBox?(boxId: string): void;
-  /** Abre o chat lateral de consulta com uma pergunta sobre este agente já na caixa (sem enviar). */
+  /** Abre a thread do post mais recente deste agente no chat principal (o agente responde, só leitura). */
   askAbout?(id: string): void;
+  /** O agente já entregou relatório, e então tem post com thread. Ausente: vale para todos. */
+  hasThread?(id: string): boolean;
   /** O projeto tem cérebro compartilhado: o popup de agente oferece "Nota no cérebro". */
   brainReady?(): boolean;
   /** Abre a nota do agente no cérebro (preview de Markdown). */
   openBrainNote?(id: string): void;
+  /**
+   * Contas Claude para onde o agente roteado pode ir (`current`: a dele agora). Vazio ou ausente: sem botão de troca.
+   */
+  accountsFor?(a: AgentInfo): { id: string; label: string; current: boolean }[];
+  /** Passa o agente para outra conta Claude, mantendo a sessão dele. O host confirma num diálogo. */
+  switchAccount?(id: string, profileId: string): void;
   /** Tarefa de shell: árvore de processos lida pelo host, pedido de leitura, encerrar a árvore e abrir a lista de órfãos. */
   procs?: ProcRowDeps;
 }
@@ -321,18 +330,6 @@ function prettyModel(id: string): string {
   return `${family.charAt(0).toUpperCase()}${family.slice(1)}${version ? ` ${version}` : ''}${long ? ` (${long[1]}M)` : ''}`;
 }
 
-/** Uma linha de texto corrido, sem sinais de markdown, para caber numa linha da lista. */
-function flat(text: string, max: number): string {
-  const t = text
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/^#{1,6}\s+/gm, '')
-    .replace(/\*\*(.+?)\*\*/g, '$1')
-    .replace(/[`>*_]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
-}
-
 function sameText(a: string | undefined, b: string | undefined): boolean {
   return !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
 }
@@ -353,11 +350,6 @@ const WHO: Record<string, string> = {
 
 function whoLabel(id: string): string {
   return WHO[id] ?? id;
-}
-
-function toolLabel(name: string): string {
-  const m = /^mcp__(.+?)__(.+)$/.exec(name);
-  return m ? `${m[1]} · ${m[2]}` : name;
 }
 
 /** Resumo de reserva quando o main.ts não passa o dele. */
@@ -396,20 +388,6 @@ interface Action {
   state: 'run' | 'ok' | 'err' | 'none';
   name: string;
   sum: string;
-}
-
-/** Ferramenta aberta mais recente (sem resultado ainda), ou undefined se o agente não está numa. */
-function currentTool(items: HistoryItem[]): Extract<HistoryItem, { kind: 'tool' }> | undefined {
-  const done = new Set<string>();
-  for (let i = items.length - 1; i >= 0; i--) {
-    const it = items[i];
-    if (it.kind === 'toolResult') {
-      done.add(it.id);
-    } else if (it.kind === 'tool') {
-      return done.has(it.id) ? undefined : it;
-    }
-  }
-  return undefined;
 }
 
 function recentActions(items: HistoryItem[], describe: (n: string, i: unknown) => string, skip?: string, limit = RECENT): Action[] {
@@ -505,6 +483,8 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
   let pendEl: HTMLElement | undefined;
   const rows = new Map<string, { li: HTMLLIElement; sig: string }>();
   let actionsSig = '';
+  /** Lista de contas aberta no lugar dos botões, para o agente com este id. */
+  let pickingAccount: string | undefined;
   let stopping = false;
   /** Popup de caixa: "Parar os que estão rodando" já recebeu o primeiro clique e espera a confirmação. */
   let stopArmed = false;
@@ -792,34 +772,8 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     if (!nowBox) {
       return;
     }
-    const items = deps.getItems(a.id);
-    const cur = currentTool(items);
-    let tag: string;
-    let name: string;
-    let sum: string;
-    let live = false;
-    if (cur) {
-      tag = 'usando';
-      name = toolLabel(cur.name);
-      sum = flat(describe(cur.name, cur.input), 200);
-      live = true;
-    } else if (items.length && items[items.length - 1].kind === 'text') {
-      const last = items[items.length - 1] as { text: string };
-      tag = 'escrevendo';
-      name = '';
-      sum = flat(last.text, 200);
-      live = true;
-    } else if (a.lastTool) {
-      tag = 'pensando · última ferramenta';
-      name = toolLabel(a.lastTool);
-      sum = '';
-      live = true;
-    } else {
-      tag = 'começando';
-      name = '';
-      sum = '';
-      live = true;
-    }
+    const { tag, name, sum } = agentNow(deps.getItems(a.id), a.lastTool, describe);
+    const live = true;
     const sig = `${tag}|${name}|${sum}|${live}`;
     if (nowBox.dataset.sig === sig) {
       return;
@@ -892,14 +846,38 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
     const report = m === 'report' ? reportOf(a) : '';
     const leader = a.search?.kind === 'tournament' ? a.search.leader : undefined;
     const brainNote = !!deps.openBrainNote && !!deps.brainReady?.() && a.kind === 'routed' && !a.search && !a.infra && !a.repeatEveryMinutes;
-    const sig = `${a.id}|${m}|${canStop}|${!!report}|${canResume ? (a.sessionId ? 'r' : 'x') : ''}|${stopping}|${!!a.repeatEveryMinutes}|${leader?.id ?? ''}|${brainNote}|${!!a.limit}`;
+    const accounts = a.kind === 'routed' && a.provider !== 'codex' && !a.search && !a.infra ? (deps.accountsFor?.(a) ?? []) : [];
+    const canSwitch = !!deps.switchAccount && accounts.some((c) => !c.current);
+    const busy = a.status === 'running';
+    const picking = canSwitch && pickingAccount === a.id;
+    const sig = `${a.id}|${m}|${canStop}|${!!report}|${canResume ? (a.sessionId ? 'r' : 'x') : ''}|${stopping}|${!!a.repeatEveryMinutes}|${leader?.id ?? ''}|${brainNote}|${!!a.limit}|${canSwitch ? accounts.map((c) => `${c.id}${c.current ? '*' : ''}`).join(',') : ''}|${busy}|${picking}`;
     if (sig === actionsSig) {
       return;
     }
     actionsSig = sig;
+    if (picking) {
+      // Escolha da conta nova: um botão por conta Claude, a atual desligada, e Cancelar volta aos botões normais.
+      const back = () => {
+        pickingAccount = undefined;
+        paint();
+      };
+      actions.replaceChildren(
+        ...accounts.map((c) => {
+          const b = button(c.current ? `${c.label} (atual)` : c.label, '', () => {
+            pickingAccount = undefined;
+            deps.switchAccount?.(a.id, c.id);
+            paint();
+          }, c.current ? 'O agente já roda nesta conta' : `Passar o agente para a conta ${c.label}`);
+          b.disabled = c.current || busy;
+          return b;
+        }),
+        button('Cancelar', '', back),
+      );
+      return;
+    }
     const list: HTMLButtonElement[] = [button('Abrir chat', 'is-primary', () => deps.openChat(a.id), 'Abre o painel do agente, com o log inteiro e a caixa de mensagem')];
-    if (deps.askAbout && !a.search && !a.infra) {
-      list.push(button('Perguntar sobre este agente', '', () => deps.askAbout?.(a.id), 'Abre a consulta lateral com uma pergunta sobre este agente na caixa, sem enviar. Não interfere nesta conversa.'));
+    if (deps.askAbout && !a.search && !a.infra && (deps.hasThread?.(a.id) ?? true)) {
+      list.push(button('Abrir thread', '', () => deps.askAbout?.(a.id), 'Abre ao lado do chat a thread do último relatório deste agente: pergunte e ele responde em primeira pessoa, só lendo o que fez. Não interfere nesta conversa.'));
     }
     if (brainNote) {
       list.push(button('Nota no cérebro', '', () => deps.openBrainNote?.(a.id), 'Abre a nota deste agente no cérebro compartilhado (.agm/brain/): tarefa, modelo, frente e o resumo do relatório'));
@@ -935,6 +913,14 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
       const resume = button(a.repeatEveryMinutes ? 'Retomar vigia' : a.limit && !a.restored ? 'Tentar de novo' : 'Retomar', '', () => deps.resume(a.id), a.sessionId || (a.limit && !a.restored) ? hint : 'A conversa deste agente não foi salva em disco, então não dá para retomá-lo.');
       resume.disabled = !a.sessionId && !(a.limit && !a.restored);
       list.push(resume);
+    }
+    if (canSwitch) {
+      const sw = button('Trocar conta', '', () => {
+        pickingAccount = a.id;
+        paint();
+      }, busy ? 'Espere o turno do agente terminar (ou pare) para trocar a conta.' : 'Passa o agente para outra conta Claude: mesmo nó, mesma sessão. A próxima mensagem já roda na conta nova.');
+      sw.disabled = busy;
+      list.push(sw);
     }
     if (canStop) {
       const idle = a.repeatEveryMinutes ? 'Parar vigia' : 'Parar';

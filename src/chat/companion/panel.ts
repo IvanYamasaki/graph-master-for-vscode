@@ -5,6 +5,7 @@ import type { ChatEnv } from '../panel';
 import type { Profile } from '../../profiles';
 import { ChatSession } from '../session';
 import { FileIndex, editorFiles } from '../fileIndex';
+import { handleImageMessage } from '../imageFiles';
 import type { HistoryItem, HostMessage, WebviewMessage } from '../protocol';
 import { COMPANION_SERVER, createCompanionServer } from './tools';
 import { COMPANION_BLOCKED_TOOLS, companionHooks, companionSystemAppend } from './policy';
@@ -238,6 +239,11 @@ export class CompanionPanel {
       case 'openFile':
         await this.openProjectFile(msg.path);
         return;
+      case 'resolveImages':
+      case 'imageAction':
+        // Sem o projeto no localResourceRoots: as imagens chegam como data URL.
+        await handleImageMessage(this.panel.webview, msg, this.session.cwd, [], (m) => this.post(m));
+        return;
       case 'companionToMain':
         this.sendToMain(msg.text);
         return;
@@ -328,7 +334,7 @@ export class CompanionPanel {
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data: https:; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'unsafe-inline'; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="stylesheet" href="${uri('media', 'codicons', 'codicon.css')}">
 <link rel="stylesheet" href="${uri('media', 'chat.css')}">

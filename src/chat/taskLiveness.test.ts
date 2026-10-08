@@ -3,7 +3,7 @@
  *   npx esbuild src/chat/taskLiveness.test.ts --bundle --platform=node --outfile=$TEMP/taskLiveness.test.js && node $TEMP/taskLiveness.test.js
  */
 import * as assert from 'node:assert/strict';
-import { LEVEL_GRACE_MS, ReconcileItem, commandNeedle, commandPorts, isOrphanNotice, orphanNoticeIds, reconcileTasks, workingCount } from './taskLiveness';
+import { LEVEL_GRACE_MS, ReconcileItem, commandNeedle, commandPorts, shellTaskLabel, isOrphanNotice, orphanNoticeIds, reconcileTasks, workingCount } from './taskLiveness';
 import { isWorking } from './protocol';
 
 let failed = 0;
@@ -108,6 +108,13 @@ test('portas citadas no comando', () => {
 test('trecho do comando para achar a raiz', () => {
   assert.equal(commandNeedle('cd apps/api && npm run start:dev > /tmp/api.log 2>&1 &'), 'npm run start:dev');
   assert.equal(commandNeedle('ls'), undefined);
+});
+
+test('nome da tarefa de shell: objetivo do Bash, senão o comando sem cd', () => {
+  assert.equal(shellTaskLabel('Treinar o modelo base', 'cd "/c/x" && python train.py'), 'Treinar o modelo base');
+  assert.equal(shellTaskLabel('cd "/c/x" && python train.py', 'cd "/c/x" && python train.py'), 'python train.py');
+  assert.equal(shellTaskLabel(undefined, 'cd /c/x; export A=1; npm run dev'), 'npm run dev');
+  assert.equal(shellTaskLabel(undefined, undefined), 'tarefa de shell');
   assert.equal(commandNeedle(undefined), undefined);
 });
 

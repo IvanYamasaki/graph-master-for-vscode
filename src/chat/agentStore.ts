@@ -3,16 +3,15 @@ import { AgentInfo, AgentStatus } from './protocol';
 import type { WorktreeInfo } from './protocol';
 import type { AgentBudget, AgentSpent } from './protocol';
 import type { AttemptInfo, BoxInfo } from './protocol';
+import type { SessionStore } from './sessionStore';
 
-/** Chave única no workspaceState; dentro dela cada conversa principal tem a sua lista de agentes. */
-const KEY = 'agentGraphMaster.routedAgents';
+/** Chave antiga no workspaceState, com todas as conversas juntas. Só é lida para migrar para a pasta de cada conversa. */
+const LEGACY_KEY = 'agentGraphMaster.routedAgents';
+/** Chave dentro da pasta da conversa: `.agm/sessions/<id>/agents.json`. */
+const SESSION_KEY = 'agents';
 
-/** Teto por conversa: o mapa de agentes não precisa de mais que isso, e o state é compartilhado com o resto da extensão. */
-const MAX_AGENTS = 40;
-/** Quantas conversas ficam guardadas; passando disso, a mais antiga sai. */
-const MAX_CONVERSATIONS = 20;
-/** Relatório longo é o que mais pesa; o resto do texto fica na sessão do próprio agente. */
-const MAX_REPORT_CHARS = 8000;
+/** Relatório longo é o que mais pesa; acima disso o resto fica na sessão do próprio agente. */
+const MAX_REPORT_CHARS = 60_000;
 /** Junta as gravações de uma rajada de updates numa só. */
 const SAVE_DELAY_MS = 1000;
 
@@ -76,27 +75,37 @@ interface StoredConversation {
   boxes?: BoxInfo[];
 }
 
-/** Mais caixas que isso numa conversa não cabe no mapa de qualquer jeito. */
-const MAX_BOXES = 40;
-
 type StoredMap = Record<string, StoredConversation>;
 
 /**
- * Guarda os agentes roteados por conversa principal no workspaceState. Nada vai para arquivo do projeto:
- * é estado da interface, e quem tem o histórico de verdade é o próprio Claude Code, pelo sessionId de cada agente.
+ * Guarda os agentes roteados e as caixas de cada conversa principal em `.agm/sessions/<id>/agents.json`
+ * (via SessionStore). Quem tem o histórico de verdade é o próprio Claude Code, pelo sessionId de cada agente.
+ *
+ * Antes tudo ficava numa chave só do workspaceState, com teto de 40 agentes por conversa: passando disso,
+ * `slice(-40)` jogava fora os primeiros, que sumiam do mapa na reabertura. Agora não há teto, e cada gravação
+ * junta o que já está no disco (agente nunca sai do hub, então quem falta na lista de quem grava é de outro
+ * painel ou de uma gravação anterior, não um agente apagado).
  */
 export class AgentStore {
   private timer?: ReturnType<typeof setTimeout>;
-  private pending?: { key: string; agents: StoredAgent[]; boxes: BoxInfo[] };
+  /** Uma entrada por conversa: trocar de chave no meio do debounce não perde a gravação da anterior. */
+  private readonly pending = new Map<string, { agents: StoredAgent[]; boxes: BoxInfo[] }>();
+  /** Última chave gravada desde o último flush; muda sem flush quando a conversa viva ganha id novo (fork, /clear). */
+  private lastKey?: string;
 
-  constructor(private readonly memento: Memento) {}
+  constructor(
+    memento: Memento,
+    private readonly sessions: SessionStore,
+  ) {
+    migrateLegacy(memento, sessions);
+  }
 
   load(key: string): StoredAgent[] {
-    return readMap(this.memento)[key]?.agents ?? [];
+    return this.read(key).agents;
   }
 
   loadBoxes(key: string): BoxInfo[] {
-    return readMap(this.memento)[key]?.boxes ?? [];
+    return this.read(key).boxes ?? [];
   }
 
   /** Agenda a gravação. Chamadas seguidas na mesma conversa viram uma só. */
@@ -104,19 +113,23 @@ export class AgentStore {
     if (!key) {
       return;
     }
-    // Só os mais recentes entram, e o relatório vai cortado.
-    this.pending = { key, agents: agents.slice(-MAX_AGENTS).map(toStored), boxes: boxes.slice(-MAX_BOXES).map((b) => ({ ...b })) };
+    if (this.lastKey && this.lastKey !== key) {
+      // A mesma conversa, viva, ganhou id novo: o resto da pasta (threads, imagens) vai junto para o id novo.
+      this.writeAll();
+      try {
+        this.sessions.fork(this.lastKey, key);
+      } catch (err) {
+        console.error('[agentGraphMaster] falha ao copiar a pasta da conversa:', err);
+      }
+    }
+    this.lastKey = key;
+    this.pending.set(key, { agents: agents.map(toStored), boxes: boxes.map((b) => ({ ...b })) });
     if (this.timer) {
       return;
     }
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      // Erro dentro de um timer não tem quem o pegue: sem este try, uma falha ao gravar derruba o processo.
-      try {
-        void this.write();
-      } catch (err) {
-        console.error('[agentGraphMaster] falha ao salvar os agentes:', err);
-      }
+      this.writeAll();
     }, SAVE_DELAY_MS);
   }
 
@@ -126,49 +139,89 @@ export class AgentStore {
       clearTimeout(this.timer);
       this.timer = undefined;
     }
-    void this.write();
+    this.writeAll();
+    // Depois de um flush o hub troca de conversa de propósito: a próxima chave não é fork desta.
+    this.lastKey = undefined;
   }
 
-  /** Esquece uma conversa (nova conversa no mesmo painel). */
+  /** Esquece os agentes de uma conversa. A pasta fica com o resto (threads, imagens). */
   forget(key: string): void {
-    if (this.pending?.key === key) {
-      this.pending = undefined;
+    this.pending.delete(key);
+    this.sessions.remove(key, SESSION_KEY);
+  }
+
+  private read(key: string): { agents: StoredAgent[]; boxes?: BoxInfo[] } {
+    if (!key) {
+      return { agents: [] };
     }
-    const map = readMap(this.memento);
-    if (map[key]) {
-      delete map[key];
-      void this.memento.update(KEY, map);
+    return toConversation(this.sessions.read(key, SESSION_KEY)) ?? { agents: [] };
+  }
+
+  private writeAll(): void {
+    const entries = [...this.pending];
+    this.pending.clear();
+    for (const [key, entry] of entries) {
+      // Erro dentro do timer não tem quem o pegue: sem este try, uma falha ao gravar derruba o processo.
+      try {
+        this.write(key, entry.agents, entry.boxes);
+      } catch (err) {
+        console.error('[agentGraphMaster] falha ao salvar os agentes:', err);
+      }
     }
   }
 
-  private async write(): Promise<void> {
-    const entry = this.pending;
-    this.pending = undefined;
-    if (!entry) {
+  private write(key: string, agents: StoredAgent[], boxes: BoxInfo[]): void {
+    const disk = this.read(key);
+    const merged = mergeById(disk.agents, agents);
+    const mergedBoxes = mergeById(disk.boxes ?? [], boxes);
+    if (!merged.length && !mergedBoxes.length) {
       return;
     }
-    const map = readMap(this.memento);
-    if (!entry.agents.length && !entry.boxes.length) {
-      delete map[entry.key];
-    } else {
-      map[entry.key] = { savedAt: Date.now(), agents: entry.agents, ...(entry.boxes.length ? { boxes: entry.boxes } : {}) };
-    }
-    await this.memento.update(KEY, prune(map));
+    this.sessions.write(key, SESSION_KEY, { savedAt: Date.now(), agents: merged, ...(mergedBoxes.length ? { boxes: mergedBoxes } : {}) });
+    this.sessions.updateMeta(key, { agents: merged.length });
   }
 }
 
-/** Deixa só as conversas mais recentes pela data da última gravação. */
-function prune(map: StoredMap): StoredMap {
-  const keys = Object.keys(map);
-  if (keys.length <= MAX_CONVERSATIONS) {
-    return map;
+/**
+ * Junta o disco com a lista de quem grava: a versão de quem grava vale para os ids que ele tem; os que só o disco tem
+ * ficam (outro painel na mesma conversa, ou gravação de antes de um restore incompleto). Mantém a ordem de criação.
+ */
+export function mergeById<T extends { id: string }>(disk: readonly T[], next: readonly T[]): T[] {
+  const byId = new Map(next.map((item) => [item.id, item]));
+  const out = disk.map((item) => byId.get(item.id) ?? item);
+  const seen = new Set(disk.map((item) => item.id));
+  for (const item of next) {
+    if (!seen.has(item.id)) {
+      out.push(item);
+    }
   }
-  const keep = keys.sort((a, b) => map[b].savedAt - map[a].savedAt).slice(0, MAX_CONVERSATIONS);
-  const next: StoredMap = {};
-  for (const key of keep) {
-    next[key] = map[key];
+  return out;
+}
+
+/**
+ * Leva as conversas da chave antiga do workspaceState para a pasta de cada uma e apaga a chave. Conversa que já tem
+ * `agents.json` junta as duas listas. Se alguma gravação falhar, a chave antiga fica para a próxima tentativa.
+ */
+export function migrateLegacy(memento: Memento, sessions: SessionStore): void {
+  if (memento.get<unknown>(LEGACY_KEY) === undefined) {
+    return;
   }
-  return next;
+  let failed = false;
+  for (const [key, conv] of Object.entries(readMap(memento))) {
+    try {
+      const disk = toConversation(sessions.read(key, SESSION_KEY));
+      const agents = mergeById(disk?.agents ?? [], conv.agents);
+      const boxes = mergeById(disk?.boxes ?? [], conv.boxes ?? []);
+      sessions.write(key, SESSION_KEY, { savedAt: conv.savedAt, agents, ...(boxes.length ? { boxes } : {}) });
+      sessions.updateMeta(key, { agents: agents.length });
+    } catch (err) {
+      failed = true;
+      console.error(`[agentGraphMaster] falha ao migrar os agentes da conversa ${key}:`, err);
+    }
+  }
+  if (!failed) {
+    void memento.update(LEGACY_KEY, undefined);
+  }
 }
 
 function toStored(info: AgentInfo): StoredAgent {
@@ -216,25 +269,31 @@ function toStored(info: AgentInfo): StoredAgent {
   return stored;
 }
 
-// ---------- Leitura defensiva: o que está no state pode ser de uma versão antiga da extensão ----------
+// ---------- Leitura defensiva: o que está no disco ou no state pode ser de uma versão antiga da extensão ----------
 
 function readMap(memento: Memento): StoredMap {
-  const raw = memento.get<unknown>(KEY);
+  const raw = memento.get<unknown>(LEGACY_KEY);
   const map: StoredMap = {};
   if (!isRecord(raw)) {
     return map;
   }
   for (const [key, value] of Object.entries(raw)) {
-    if (!isRecord(value) || !Array.isArray(value.agents)) {
-      continue;
-    }
-    const agents = value.agents.map(toAgent).filter((a): a is StoredAgent => a !== undefined);
-    const boxes = Array.isArray(value.boxes) ? value.boxes.map(toBox).filter((b): b is BoxInfo => b !== undefined) : [];
-    if (agents.length || boxes.length) {
-      map[key] = { savedAt: num(value.savedAt) ?? 0, agents, ...(boxes.length ? { boxes } : {}) };
+    const conv = toConversation(value);
+    if (conv && (conv.agents.length || conv.boxes?.length)) {
+      map[key] = conv;
     }
   }
   return map;
+}
+
+/** Uma conversa gravada (`agents.json` ou entrada da chave antiga), com cada agente e caixa validados. */
+function toConversation(value: unknown): StoredConversation | undefined {
+  if (!isRecord(value) || !Array.isArray(value.agents)) {
+    return undefined;
+  }
+  const agents = value.agents.map(toAgent).filter((a): a is StoredAgent => a !== undefined);
+  const boxes = Array.isArray(value.boxes) ? value.boxes.map(toBox).filter((b): b is BoxInfo => b !== undefined) : [];
+  return { savedAt: num(value.savedAt) ?? 0, agents, ...(boxes.length ? { boxes } : {}) };
 }
 
 function toAgent(raw: unknown): StoredAgent | undefined {

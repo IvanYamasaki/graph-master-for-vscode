@@ -1,5 +1,7 @@
 import { Marked } from 'marked';
 import { createAgentGraph } from './graph';
+import { doneNodeParent, foldDone, isDoneNode, isFinal } from './doneFold';
+import { reportHeadline } from '../chat/headline';
 import { boxSpend, boxStats, boxCountText, groupAgents, LOOSE_BOX, type Grouping } from './boxModel';
 import { createNodePopup } from './nodePopup';
 import { createLabCards } from './labCards';
@@ -15,8 +17,16 @@ import type { ConnectedBrowser, RemoteControlState } from '../chat/protocol';
 import { remoteStatusText, remoteTransitionNotice } from '../chat/remoteControl';
 import type { TaskProcs } from '../chat/protocol';
 import { createOrphansView } from './orphansUi';
+import { createLiveBubbles, typingDots } from './liveBubbles';
+import { agentNow } from './liveLogic';
+import { createThreadUi } from './threadUi';
+import { createSlackLog } from './slackLog';
+import { splitPostBlocks, type AgentPost } from '../chat/threadModel';
+import { FoldGroup, isAgentSpawn, isFoldable } from './toolFold';
+import { closeImageViewer, imageGrid, openImageViewer, setImageViewerActions, type ViewerItem } from './imageViewer';
+import { SHOW_IMAGE_TOOL, baseName, parseShowImage } from '../chat/imageShare';
 import type { BoxInfo } from '../chat/protocol';
-import type { AgentInfo, Attachment, ExternalProviderName, HistoryItem, HostMessage, ModelOption, NoticeAction, ProfileOption, FileResult, SessionOption, SlashCommandOption, TaskProposal, UsageInfo, WebviewMessage } from '../chat/protocol';
+import type { AccountUsage, AgentInfo, Attachment, ExternalProviderName, HistoryItem, HostMessage, ModelOption, NoticeAction, ProfileOption, FileResult, SessionOption, SlashCommandOption, TaskProposal, UsageInfo, WebviewMessage } from '../chat/protocol';
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: WebviewMessage): void;
@@ -35,6 +45,8 @@ interface SavedState {
   edges?: { creation: boolean; delivery: boolean };
   /** Caixas que o usuário recolheu (true) ou expandiu (false), por "<sessão>|<caixa>". */
   boxFold?: Record<string, boolean>;
+  /** O grafo mostra os agentes concluídos em vez de recolhê-los em quem os criou. */
+  showDone?: boolean;
 }
 const saved = (vscode.getState() ?? {}) as SavedState;
 
@@ -146,19 +158,37 @@ const codexModelWaiters: (() => void)[] = [];
 
 const agents = new Map<string, AgentInfo>();
 const agentItems = new Map<string, HistoryItem[]>();
-/** Cartão ao vivo de cada agente no log principal, guardado para atualizar no lugar. */
+/**
+ * Lugar ao vivo de cada agente no log principal (digitando e o que faz agora), guardado para atualizar no lugar.
+ * Quando ele entrega o relatório, o mesmo nó vira o post e sai daqui; se ele volta a rodar, ganha um lugar novo.
+ */
 const agentCards = new Map<string, HTMLElement>();
+/** Post de cada relatório entregue ("a3#2"), já no log. */
+const postEls = new Map<string, HTMLElement>();
+/** Relatórios do histórico (conversa reaberta): marcam onde o post daquele relatório entra no log. */
+const reportAnchors = new Map<HTMLElement, { agentId: string; text: string }>();
 /** Cartão de aprovação de cada tarefa proposta por um vigia. */
 const taskCards = new Map<string, HTMLElement>();
 /** Linhas do grafo visíveis. Começa como estava salvo. */
 let edgeVisibility = { creation: saved.edges?.creation ?? true, delivery: saved.edges?.delivery ?? true };
+/** Grafo com os concluídos à vista (true) ou recolhidos num nó-resumo em quem os criou (padrão). */
+let showDone = saved.showDone ?? false;
+/** Criadores cujos concluídos o usuário abriu pelo nó-resumo. */
+const expandedDone = new Set<string>();
+/** Quando cada agente terminou, visto aqui. Terminado há pouco fica à vista: dá para ver o fim antes de recolher. */
+const finishedAt = new Map<string, number>();
+const DONE_GRACE_MS = 60_000;
 /** Ferramentas de orquestração que o log principal engole: o cartão do agente já conta a história. */
 const hiddenTools = new Set<string>();
 const ORCHESTRATION_TOOL = /^mcp__agents__/;
 /** Pesquisa e imagem externas também vêm do servidor "agents", mas o resultado interessa ao usuário: aparecem no log. */
 const RESEARCH_TOOL = 'mcp__agents__web_research';
 const IMAGE_TOOL = 'mcp__agents__generate_image';
-const isOrchestration = (name: string) => ORCHESTRATION_TOOL.test(name) && name !== RESEARCH_TOOL && name !== IMAGE_TOOL;
+const isOrchestration = (name: string) => ORCHESTRATION_TOOL.test(name) && name !== RESEARCH_TOOL && name !== IMAGE_TOOL && name !== SHOW_IMAGE_TOOL;
+/** Linhas que o log principal engole: orquestração e subagentes nativos (Agent, Task), que já têm o cartão do agente. */
+const hiddenInLog = (name: string) => isOrchestration(name) || isAgentSpawn(name);
+/** agentGraphMaster.toolsExpanded: grupos de ferramenta do log principal já abertos. Padrão recolhido. */
+let toolsExpanded = false;
 const providerName = (p: unknown) => (p === 'gemini' ? 'Gemini' : p === 'openai' ? 'GPT' : '');
 /** Anexos escolhidos mas ainda não enviados. Esvazia no submit. */
 const pending: Attachment[] = [];
@@ -180,7 +210,7 @@ const EFFORTS: [string, string][] = [
 
 // ---------- Estrutura da página ----------
 
-const acct = h('div', { class: 'acct' });
+const acct = h('div', { class: 'acct', role: 'button', tabindex: '0', title: 'Contas: limites de cada uma e troca de conta desta conversa', onclick: () => openAccountsMenu(acct, true) });
 const histBtn = h(
   'button',
   { class: 'icon-btn square', title: 'Conversas anteriores desta conta', 'aria-label': 'Histórico de conversas', onclick: () => openHistoryMenu() },
@@ -195,6 +225,15 @@ const newChatBtn = h('button', { class: 'icon-btn square', title: 'Nova conversa
 const top = h('header', { class: 'top' }, acct, h('div', { class: 'spacer' }), companionBtn, histBtn, newChatBtn);
 const forkBanner = h('div', { class: 'fork-banner hidden' });
 const log = h('main', { class: 'log' });
+/** Texto cru das falas do orquestrador no log principal, para o "Copiar" da barra de ações. */
+const rawTexts = new WeakMap<HTMLElement, string>();
+
+/** Log principal como canal do Slack: cabeçalho por sequência de mensagens do mesmo autor, hora e barra de ações. */
+const slackLog = createSlackLog({
+  log,
+  brand,
+  rawText: (el) => rawTexts.get(el) ?? el.querySelector('.plain')?.textContent ?? el.textContent ?? '',
+});
 /** Pedidos de exemplo do chat novo: o clique só preenche a caixa, para o usuário ajustar antes de enviar. */
 const EXAMPLES: [string, string][] = [
   ['beaker', 'Registre a hipótese: warmup de 5 épocas melhora val_acc no CIFAR-100. Rode 5 seeds por braço e declare o veredito.'],
@@ -234,6 +273,13 @@ const empty = h(
 );
 log.append(empty);
 const activity = h('div', { class: 'activity hidden' });
+/** Balões de digitando e pensamento e a faixa de quem trabalha, entre o log e a caixa de texto. */
+const live = createLiveBubbles({
+  log,
+  colorOf: (id) => (id === 'main' ? 'var(--accent)' : agentColor(agents.get(id)?.color, id)),
+  labelOf: (id) => (id === 'main' ? brand() : agents.get(id)?.description || id),
+  onOpen: (id, anchor) => openCardPopup(anchor, id, false),
+});
 const runBar = h('div', {
   class: 'runbar hidden',
   role: 'button',
@@ -298,8 +344,8 @@ agentsPill.setAttribute('aria-label', 'Mapa de agentes');
 const sendBtn = h('button', { class: 'go', title: 'Enviar', 'aria-label': 'Enviar', onclick: () => (state.busy ? send({ type: 'interrupt' }) : submit()) });
 /** Lista de sugestões acima do composer: comandos de barra ("/") e arquivos ("@"). */
 const scPop = h('div', { class: 'sc-pop hidden', role: 'listbox', onmousedown: (e: Event) => e.preventDefault() });
-/** Rodapé fino: contexto à esquerda, barrinhas de 5h e semana à direita. Clique relê os limites. */
-const usageBar = h('div', { class: 'usage-bar', role: 'button', tabindex: '0', onclick: () => send({ type: 'refreshUsage' }) });
+/** Rodapé fino: contexto à esquerda, barrinhas de 5h e semana à direita. Clique abre os limites de todas as contas. */
+const usageBar = h('div', { class: 'usage-bar', role: 'button', tabindex: '0', onclick: () => openAccountsMenu(usageBar) });
 
 const composer = h(
   'footer',
@@ -317,9 +363,28 @@ const composer = h(
 const dropZone = h('div', { class: 'dropzone hidden' }, h('div', { class: 'drop-card' }, icon('cloud-upload'), h('span', {}, 'Solte aqui')));
 const menuLayer = h('div', { class: 'menu-layer hidden' });
 const overlay = h('div', { class: 'overlay hidden' });
-/** Captura de tela ampliada: clique ou Esc fecha. */
-const shotView = h('div', { class: 'shot-view hidden', role: 'dialog', 'aria-label': 'Captura de tela ampliada', onclick: () => closeShot() });
-document.getElementById('app')!.append(top, forkBanner, log, activity, runBar, composer, dropZone, menuLayer, overlay, shotView);
+document.getElementById('app')!.append(top, forkBanner, log, activity, live.el, runBar, composer, dropZone, menuLayer, overlay);
+
+/** Posts dos agentes no log e a thread de cada post, no painel à direita. */
+const threadUi = createThreadUi({
+  send,
+  agent: (id) => agents.get(id),
+  paintAgent,
+  colorOf: (id) => agentColor(agents.get(id)?.color, id),
+  md,
+  statusLabel: (a) => [statusLabel(a.status), agentMeta(a)].filter(Boolean).join(' · '),
+  suggest: suggestFor,
+  openImage: (src, caption) => openImageViewer([{ src, caption: caption || undefined }], 0),
+  openAgent: (anchor, id) => openCardPopup(anchor, id, false),
+  onPost: placePost,
+  onPosts: placeAllPosts,
+});
+document.getElementById('app')!.append(threadUi.drawer);
+// Botões do visualizador de imagens que precisam do host. "Abrir" só com caminho absoluto; salvar copia o arquivo ou grava o data URL.
+setImageViewerActions({
+  open: (item) => item.path && send({ type: 'imageAction', action: 'open', path: item.path }),
+  save: (item) => send({ type: 'imageAction', action: 'save', path: item.path, src: item.src?.startsWith('data:') ? item.src : undefined, name: item.name }),
+});
 
 
 
@@ -817,7 +882,7 @@ input.addEventListener('paste', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     // O menu já se fechou no handler de captura; este Esc não pode virar interrupt.
-    if (openAt || closeShot()) {
+    if (openAt || closeImageViewer()) {
       return;
     }
     if (!overlay.classList.contains('hidden')) {
@@ -1465,6 +1530,67 @@ function openUsageMenu(anchor: HTMLElement): void {
   ]);
 }
 
+/** Menu de contas aberto na barra de limites ou no nome da conta; a lista chega depois, uma conta por vez. */
+let accountsAnchor: { el: HTMLElement; below: boolean } | null = null;
+
+function openAccountsMenu(anchor: HTMLElement, below = false): void {
+  const wasOpen = openAt?.anchor === anchor;
+  accountsAnchor = { el: anchor, below };
+  openMenu(anchor, [{ title: 'Limites por conta', items: [{ label: 'Lendo as contas…' }] }], below);
+  if (!wasOpen) {
+    send({ type: 'accountsUsage' });
+  }
+}
+
+/** "5h 40% · semana 12%": as duas janelas principais, no mesmo resumo do rodapé. */
+function usageSummary(u?: AccountUsage['usage']): string {
+  if (!u) {
+    return 'lendo…';
+  }
+  if (!u.available) {
+    return u.error ?? 'limites indisponíveis';
+  }
+  const main = ['five_hour', 'seven_day'].map((k) => u.windows.find((w) => w.key === k)).filter((w): w is NonNullable<typeof w> => !!w);
+  const shown = main.length ? main : u.windows.slice(0, 2);
+  return shown
+    .map((w) => `${w.key === 'five_hour' ? '5h' : w.key === 'seven_day' ? 'semana' : w.label.toLowerCase()} ${Math.round(w.utilization)}%${w.resetsAt && w.utilization >= 75 ? ` (zera ${fmtReset(w.resetsAt)})` : ''}`)
+    .join(' · ');
+}
+
+function showAccountsUsage(list: AccountUsage[]): void {
+  if (!accountsAnchor || openAt?.anchor !== accountsAnchor.el) {
+    return;
+  }
+  // Trocar a conta da conversa: só chat Claude com sessão já criada, para outra conta Claude.
+  const canMove = state.provider !== 'codex' && !state.forkOf && !state.companion && !!state.sessionId;
+  const items: MenuItem[] = list.map((a) => {
+    const target = canMove && !a.current && a.provider === 'claude';
+    const worst = a.usage?.available ? Math.max(0, ...a.usage.windows.map((w) => w.utilization)) : 0;
+    const lines = (a.usage?.windows ?? []).map((w) => `${w.label}: ${Math.round(w.utilization)}% usado${w.resetsAt ? ` · zera ${fmtReset(w.resetsAt)}` : ''}`);
+    return {
+      label: `${a.name}${a.provider === 'codex' ? ' · Codex' : ''}${a.current ? ' · esta conversa' : ''}`,
+      detail: usageSummary(a.usage),
+      hint: a.account || undefined,
+      selected: a.current,
+      icon: a.usage?.available ? (worst >= 90 ? 'error' : worst >= 75 ? 'warning' : 'pass') : a.usage ? 'circle-slash' : 'loading',
+      title: [a.usage?.subscription ? `Plano ${a.usage.subscription}` : '', ...lines, target ? 'Clique para continuar esta conversa nesta conta.' : ''].filter(Boolean).join('\n'),
+      onPick: target ? () => send({ type: 'transferSession', profileId: a.id }) : () => undefined,
+      keepOpen: !target,
+    };
+  });
+  const note = canMove
+    ? 'Clique numa conta Claude para continuar esta conversa nela, com o mesmo histórico.'
+    : state.provider === 'codex'
+      ? 'Conversas do Codex não trocam de conta.'
+      : !state.sessionId
+        ? 'Mande a primeira mensagem para poder levar esta conversa a outra conta.'
+        : undefined;
+  refillMenu(accountsAnchor.el, [
+    { title: 'Limites por conta', items, note },
+    { items: [{ label: 'Atualizar todas', icon: 'refresh', keepOpen: true, onPick: () => send({ type: 'accountsUsage', force: true }) }] },
+  ]);
+}
+
 function openHistoryMenu(): void {
   const wasOpen = openAt?.anchor === histBtn;
   openMenu(histBtn, [{ title: 'Conversas anteriores', items: [{ label: 'Carregando…' }] }], true);
@@ -1480,7 +1606,7 @@ function showSessions(list: SessionOption[], error?: string): void {
       ? [{ label: 'Nenhuma conversa salva nesta conta ainda' }]
       : list.map((sn) => ({
           label: sn.title || 'Sem título',
-          hint: fmtWhen(sn.lastModified),
+          hint: sn.agents ? `${sn.agents} agente${sn.agents === 1 ? '' : 's'} · ${fmtWhen(sn.lastModified)}` : fmtWhen(sn.lastModified),
           selected: sn.current,
           disabled: sn.current,
           onPick: () => send({ type: 'resumeSession', id: sn.id }),
@@ -1651,7 +1777,7 @@ function renderUsageBar(): void {
   const lines = n ? [`${n.toLocaleString('pt-BR')} tokens em contexto nesta conversa`, ''] : [];
   if (!u?.available) {
     fill(usageBar, ctx, h('span', { class: 'usage-spacer' }), h('span', { class: 'usage-off' }, 'limites indisponíveis'));
-    lines.push(u?.error ?? 'Os limites chegam com a primeira resposta desta conta.', '', 'Clique para tentar de novo.');
+    lines.push(u?.error ?? 'Os limites chegam com a primeira resposta desta conta.', '', 'Clique para ver os limites de todas as contas.');
     usageBar.title = lines.join('\n');
     return;
   }
@@ -1683,7 +1809,7 @@ function renderUsageBar(): void {
   for (const w of u.windows) {
     lines.push(`${w.label}: ${Math.round(w.utilization)}% usado, ${Math.round(100 - w.utilization)}% livre${w.resetsAt ? ` · zera ${fmtReset(w.resetsAt)}` : ''}`);
   }
-  lines.push('', `Lido às ${fmtClock(u.fetchedAt)}. Clique para atualizar.`);
+  lines.push('', `Lido às ${fmtClock(u.fetchedAt)}. Clique para ver os limites de todas as contas.`);
   usageBar.title = lines.join('\n');
 }
 
@@ -1696,7 +1822,8 @@ function renderSend(): void {
 }
 
 function renderActivity(): void {
-  const show = state.busy || state.thinking;
+  // Com os balões ligados, a faixa deles já mostra o chat principal trabalhando.
+  const show = (state.busy || state.thinking) && !live.enabled;
   activity.classList.toggle('hidden', !show);
   activity.replaceChildren(h('span', { class: 'spinner' }), state.thinking ? 'Pensando…' : 'Trabalhando…');
 }
@@ -1907,9 +2034,11 @@ function append(el: HTMLElement, container: HTMLElement = log): void {
   empty.remove();
   container.append(el);
   if (container === log) {
+    slackLog.stamp(el);
     scrollDown();
   }
 }
+
 
 // ---------- Decisões pendentes ----------
 
@@ -2005,6 +2134,10 @@ function addUser(text: string, from?: string, container: HTMLElement = log, atts
     text = text.slice(COMPANION_MARK.length).trim();
     origin = 'companion';
   }
+  // Relatório de um agente que já tem lugar ou post no chat: o post mostra o texto e guarda o relatório inteiro.
+  if (from && fromId && container === log && (agentCards.has(fromId) || threadUi.hasPosts(fromId))) {
+    return;
+  }
   // Relatório entregue por um agente: uma linha só, que abre quando o usuário quer ler.
   if (from) {
     const body = h('div', { class: 'md' });
@@ -2047,6 +2180,9 @@ function addUser(text: string, from?: string, container: HTMLElement = log, atts
     );
     append(card, container);
     if (container === log) {
+      if (fromId) {
+        reportAnchors.set(card, { agentId: fromId, text });
+      }
       scrollDown(true);
     }
     return;
@@ -2061,7 +2197,20 @@ function addUser(text: string, from?: string, container: HTMLElement = log, atts
   }
   {
     if (atts.length) {
-      bubble.append(h('div', { class: 'atts sent' }, ...atts.map((a) => attChip(a))));
+      // Imagem anexada abre no visualizador, com as outras imagens da mesma mensagem.
+      const shots = atts.filter((a) => a.kind === 'image' && a.dataUrl);
+      const items: ViewerItem[] = shots.map((a) => ({ src: a.dataUrl, name: a.name, path: a.path }));
+      const chips = atts.map((a) => {
+        const chip = attChip(a);
+        const at = shots.indexOf(a);
+        if (at >= 0) {
+          chip.classList.add('zoomable');
+          chip.title = `Ampliar ${a.name}`;
+          chip.addEventListener('click', () => openImageViewer(items, at));
+        }
+        return chip;
+      });
+      bubble.append(h('div', { class: 'atts sent' }, ...chips));
     }
     if (text) {
       bubble.append(h('div', { class: 'plain' }, text));
@@ -2092,7 +2241,7 @@ function onTextDelta(msgId: string, index: number, text: string): void {
       for (const k of renderQueued) {
         const b = liveBlocks.get(k);
         if (b && !b.final) {
-          md(b.el, b.text);
+          mainMd(b.el, b.text);
         }
       }
       renderQueued = new Set();
@@ -2105,8 +2254,7 @@ function onAssistantText(msgId: string, text: string): void {
   for (const block of liveBlocks.values()) {
     if (block.msgId === msgId && !block.final) {
       block.final = true;
-      md(block.el, text);
-      companionUi?.markRaw(block.el, text);
+      companionUi?.markRaw(block.el, mainMd(block.el, text));
       scrollDown();
       return;
     }
@@ -2115,9 +2263,21 @@ function onAssistantText(msgId: string, text: string): void {
     return;
   }
   const el = h('div', { class: 'msg assistant md' });
-  md(el, text);
-  companionUi?.markRaw(el, text);
+  companionUi?.markRaw(el, mainMd(el, text));
   append(el);
+}
+
+/**
+ * Texto do orquestrador sem os blocos <post agent="aN"> (o host põe o conteúdo no post do agente). Em streaming o
+ * bloco pela metade também some. Fala que era só o bloco esconde a bolha. Devolve o texto mostrado.
+ */
+function mainMd(el: HTMLElement, text: string): string {
+  const shown = state.companion ? text : splitPostBlocks(text).text;
+  md(el, shown);
+  el.classList.toggle('hidden', !shown.trim());
+  rawTexts.set(el, shown);
+  slackLog.refresh(el);
+  return shown;
 }
 
 // ---------- Ferramentas ----------
@@ -2126,6 +2286,76 @@ interface ToolView {
   el: HTMLDetailsElement;
   head: HTMLElement;
   body: HTMLElement;
+  /** Grupo recolhido que guarda a linha. Ausente nas que ficam soltas (pergunta, plano, pesquisa, imagens). */
+  group?: ToolGroupView;
+  /** Já pôs as capturas dessa chamada no log. */
+  shots?: boolean;
+}
+
+/** Uma sequência de chamadas entre duas falas: uma linha só, com a lista completa a um clique. */
+interface ToolGroupView {
+  el: HTMLDetailsElement;
+  dot: HTMLElement;
+  head: HTMLElement;
+  tail: HTMLElement;
+  list: HTMLElement;
+  model: FoldGroup;
+  container: HTMLElement;
+}
+const toolGroups = new WeakMap<HTMLElement, ToolGroupView>();
+/** Último grupo de cada container. Só recebe chamada nova enquanto for o último filho: qualquer outra coisa depois dele encerra a sequência. */
+const lastGroup = new WeakMap<HTMLElement, ToolGroupView>();
+
+function groupFor(container: HTMLElement): ToolGroupView {
+  const last = lastGroup.get(container);
+  // Fala que ficou vazia (só tinha o bloco <post>) não separa duas sequências de ferramentas.
+  let end = container.lastElementChild;
+  while (end && end !== last?.el && end.matches('.msg.assistant.hidden, .msg.assistant:empty')) {
+    end = end.previousElementSibling;
+  }
+  if (last && last.el === end) {
+    return last;
+  }
+  const dot = h('span', { class: 'dot running' });
+  const head = h('span', { class: 'tg-head' });
+  const tail = h('span', { class: 'tg-tail' });
+  const list = h('div', { class: 'tg-list' });
+  // No log principal começa recolhido (a menos que a preferência diga o contrário). No log de um agente começa aberto:
+  // quem foi ver o agente quer ver o que ele faz, e o grupo continua recolhível.
+  const el = h('details', { class: 'tool-group' }, h('summary', {}, dot, icon('tools'), head, tail), list);
+  el.open = container === log ? toolsExpanded : true;
+  const group: ToolGroupView = { el, dot, head, tail, list, model: new FoldGroup(), container };
+  toolGroups.set(el, group);
+  lastGroup.set(container, group);
+  el.addEventListener('toggle', () => paintGroup(group));
+  append(el, container);
+  return group;
+}
+
+/** Repinta a linha do grupo. Com o balão de pensamento ligado ele já mostra a ação atual, então a linha só conta. */
+function paintGroup(g: ToolGroupView): void {
+  const label = g.model.label({ showCurrent: !live.enabled });
+  g.dot.className = `dot ${label.state === 'running' ? 'running' : label.state}`;
+  g.head.textContent = label.head;
+  g.tail.textContent = label.tail;
+  g.el.dataset.state = label.state;
+  g.el.querySelector('summary')!.title = `${label.title}. Clique para ${g.el.open ? 'recolher' : 'ver'} as ações.`;
+}
+
+function repaintGroups(): void {
+  for (const el of document.querySelectorAll<HTMLElement>('.tool-group')) {
+    const g = toolGroups.get(el);
+    if (g) {
+      paintGroup(g);
+    }
+  }
+}
+
+/** Preferência "ferramentas sempre abertas": vale para os grupos do log principal, os que já estão na tela também. */
+function applyToolsExpanded(): void {
+  for (const el of log.querySelectorAll<HTMLDetailsElement>(':scope > .tool-group')) {
+    el.open = toolsExpanded;
+  }
 }
 // Um mapa por container: a conversa principal e cada painel de agente renderizam as próprias linhas de ferramenta.
 const toolMaps = new WeakMap<HTMLElement, Map<string, ToolView>>();
@@ -2156,6 +2386,9 @@ function toolLabel(name: string): string {
   }
   if (name === IMAGE_TOOL) {
     return 'Gerar imagem';
+  }
+  if (name === SHOW_IMAGE_TOOL) {
+    return 'Mostrar imagem';
   }
   if (isBrowserTool(name)) {
     return 'Navegador';
@@ -2209,6 +2442,10 @@ function summarize(name: string, input: unknown): string {
       return `${providerName(i.provider ?? state.external.research)} · ${str(i.prompt)}`;
     case IMAGE_TOOL:
       return `${providerName(i.provider ?? state.external.image)} · ${str(i.prompt)}${i.save_to ? ` → ${str(i.save_to)}` : ''}`;
+    case SHOW_IMAGE_TOOL: {
+      const paths = Array.isArray(i.paths) ? i.paths.filter((p): p is string => typeof p === 'string') : [];
+      return str(i.caption) || paths.map((p) => baseName(p)).join(', ');
+    }
   }
   if (isBrowserTool(name)) {
     return describeBrowserAction(name, input);
@@ -2274,16 +2511,33 @@ function createTool(id: string, name: string, container: HTMLElement = log): Too
   // No log principal a linha de ferramenta é discreta: o detalhe continua a um clique.
   const el = h('details', { class: `${container === log ? 'tool slim' : 'tool'}${browser ? ' browser' : ''}` }, head, body);
   el.dataset.tool = name;
-  const view = { el, head, body };
+  const view: ToolView = { el, head, body };
   toolsIn(container).set(id, view);
-  append(el, container);
+  if (isFoldable(name)) {
+    // A linha entra no grupo da sequência atual; o grupo é que aparece no log.
+    const group = groupFor(container);
+    group.model.start(id, name, toolLabel(name));
+    group.list.append(el);
+    view.group = group;
+    paintGroup(group);
+    if (container === log && group.el.open) {
+      scrollDown();
+    }
+  } else {
+    append(el, container);
+  }
   return view;
 }
 
 function onToolUse(id: string, name: string, input: unknown, container: HTMLElement = log): void {
   const view = toolsIn(container).get(id) ?? createTool(id, name, container);
-  (view.head.querySelector('.tsum') as HTMLElement).textContent = summarize(name, input);
+  const summary = summarize(name, input);
+  (view.head.querySelector('.tsum') as HTMLElement).textContent = summary;
   view.body.replaceChildren(toolDetail(name, input));
+  if (view.group) {
+    view.group.model.describe(id, summary);
+    paintGroup(view.group);
+  }
 }
 
 function onToolResult(id: string, text: string, isError: boolean, container: HTMLElement = log, images?: string[]): void {
@@ -2291,23 +2545,33 @@ function onToolResult(id: string, text: string, isError: boolean, container: HTM
   if (!view) {
     return;
   }
-  if (images?.length && !view.el.nextElementSibling?.classList.contains('shots')) {
-    view.el.after(shotRow(images));
+  if (images?.length && !view.shots) {
+    view.shots = true;
+    // Capturas ficam fora do grupo: entram depois dele (e depois das de outras chamadas do mesmo grupo).
+    let at: Element = view.group?.el ?? view.el;
+    while (view.group && at.nextElementSibling?.classList.contains('shots')) {
+      at = at.nextElementSibling;
+    }
+    at.after(shotRow(images));
     if (container === log) {
       scrollDown();
     }
   }
   const dot = view.head.querySelector('.dot') as HTMLElement;
   dot.className = `dot ${isError ? 'failed' : 'completed'}`;
+  if (view.group) {
+    view.group.model.finish(id, isError);
+    paintGroup(view.group);
+  }
   const clipped = text.length > 6000 ? `${text.slice(0, 6000)}\n… (${text.length - 6000} caracteres omitidos)` : text;
   if (clipped.trim()) {
     view.body.append(h('div', { class: 'tlabel' }, isError ? 'Erro' : 'Resultado'), h('pre', { class: `code out ${isError ? 'err' : ''}` }, clipped));
   }
   const tool = view.el.dataset.tool;
-  if (isError || (tool !== RESEARCH_TOOL && tool !== IMAGE_TOOL) || view.el.nextElementSibling?.classList.contains('ext-block')) {
+  if (isError || (tool !== RESEARCH_TOOL && tool !== IMAGE_TOOL && tool !== SHOW_IMAGE_TOOL) || view.el.nextElementSibling?.matches('.ext-block, .img-bubble')) {
     return;
   }
-  const block = tool === RESEARCH_TOOL ? researchBlock(text) : imageBlock(text);
+  const block = tool === RESEARCH_TOOL ? researchBlock(text) : tool === SHOW_IMAGE_TOOL ? showImageBubble(text, container) : imageBlock(text);
   if (block) {
     view.el.after(block);
     if (container === log) {
@@ -2316,33 +2580,53 @@ function onToolResult(id: string, text: string, isError: boolean, container: HTM
   }
 }
 
-/** Miniaturas das imagens de um resultado (capturas do navegador). O clique amplia na própria página. */
+/** Miniaturas das imagens de um resultado (capturas do navegador). O clique abre o visualizador com todas. */
 function shotRow(images: string[]): HTMLElement {
+  const items: ViewerItem[] = images.map((src, i) => ({ src, name: `Captura ${i + 1}` }));
   return h(
     'div',
     { class: 'shots' },
     ...images.map((src, i) =>
       h(
         'button',
-        { class: 'shot', type: 'button', title: 'Ampliar a captura', 'aria-label': `Ampliar a captura ${i + 1}`, onclick: () => openShot(src) },
+        { class: 'shot', type: 'button', title: 'Ampliar a captura', 'aria-label': `Ampliar a captura ${i + 1}`, onclick: () => openImageViewer(items, i) },
         h('img', { src, alt: `Captura ${i + 1}`, loading: 'lazy' }),
       ),
     ),
   );
 }
 
-function openShot(src: string): void {
-  shotView.replaceChildren(h('img', { src, alt: 'Captura de tela' }), h('div', { class: 'shot-hint' }, 'Clique ou Esc para fechar'));
-  shotView.classList.remove('hidden');
-}
+/** Pedidos resolveImages esperando o host: id → quem preenche a bolha. */
+const imageRequests = new Map<string, (resolved: { path: string; src?: string; error?: string }[]) => void>();
+let imageRequestSeq = 0;
 
-function closeShot(): boolean {
-  if (shotView.classList.contains('hidden')) {
-    return false;
+/**
+ * Bolha do show_image: grade de miniaturas com a legenda embaixo, como imagem mandada num chat. Os caminhos vêm da
+ * linha marcada do resultado; o host devolve o endereço de cada um (URI do webview ou data URL) em imagesResolved.
+ */
+function showImageBubble(text: string, container: HTMLElement): HTMLElement | null {
+  const shown = parseShowImage(text);
+  if (!shown) {
+    return null;
   }
-  shotView.classList.add('hidden');
-  shotView.replaceChildren();
-  return true;
+  const items: ViewerItem[] = shown.paths.map((p) => ({ path: p, name: baseName(p), caption: shown.caption }));
+  const label = shown.paths.length > 1 ? 'imagens' : 'imagem';
+  const bubble = h('div', { class: 'msg img-bubble' }, imageGrid(items, label), shown.caption ? h('div', { class: 'img-caption' }, shown.caption) : null);
+  const requestId = `img${++imageRequestSeq}`;
+  imageRequests.set(requestId, (resolved) => {
+    resolved.forEach((r, i) => {
+      if (items[i]) {
+        items[i].src = r.src;
+        items[i].error = r.src ? undefined : (r.error ?? 'não carregou');
+      }
+    });
+    bubble.firstElementChild?.replaceWith(imageGrid(items, label));
+    if (container === log) {
+      scrollDown();
+    }
+  });
+  send({ type: 'resolveImages', requestId, paths: shown.paths });
+  return bubble;
 }
 
 /**
@@ -2396,13 +2680,15 @@ function hostName(url: string): string {
   }
 }
 
-/** Resultado do generate_image: miniatura de cada arquivo salvo; o clique abre o arquivo no editor. */
+/** Resultado do generate_image: miniatura de cada arquivo salvo; o clique abre o visualizador, que tem "Abrir no editor". */
 function imageBlock(text: string): HTMLElement | null {
   const files = [...text.matchAll(/^- (.+?\.(?:png|jpe?g|webp))(?: \((\d+x\d+)\))?$/gim)].map((m) => ({ rel: m[1], size: m[2] }));
   if (!files.length) {
     return null;
   }
   const who = /pelo (\w+) \(/.exec(text);
+  const srcOf = (rel: string) => (state.cwdUri ? `${state.cwdUri.replace(/\/$/, '')}/${rel.split('/').map(encodeURIComponent).join('/')}` : undefined);
+  const items: ViewerItem[] = files.map((f) => ({ src: srcOf(f.rel), name: f.rel, path: state.cwd ? `${state.cwd.replace(/[\\/]$/, '')}/${f.rel}` : undefined }));
   return h(
     'div',
     { class: 'msg ext-block ext-images' },
@@ -2410,11 +2696,16 @@ function imageBlock(text: string): HTMLElement | null {
     h(
       'div',
       { class: 'ext-thumbs' },
-      ...files.map((f) =>
+      ...files.map((f, i) =>
         h(
           'button',
-          { class: 'ext-thumb', type: 'button', title: `Abrir ${f.rel} no editor`, onclick: () => send({ type: 'openFile', path: f.rel }) },
-          state.cwdUri ? h('img', { src: `${state.cwdUri.replace(/\/$/, '')}/${f.rel.split('/').map(encodeURIComponent).join('/')}`, alt: f.rel, loading: 'lazy' }) : null,
+          {
+            class: 'ext-thumb',
+            type: 'button',
+            title: `Ampliar ${f.rel}`,
+            onclick: () => (items[i].src ? openImageViewer(items, i) : send({ type: 'openFile', path: f.rel })),
+          },
+          items[i].src ? h('img', { src: items[i].src!, alt: f.rel, loading: 'lazy' }) : null,
           h('span', { class: 'ext-path' }, f.rel, f.size ? h('span', { class: 'ext-dim' }, ` · ${f.size}`) : null),
         ),
       ),
@@ -2470,10 +2761,16 @@ function addResult(msg: Extract<HostMessage, { type: 'result' }>): void {
   append(h('div', { class: `result ${msg.isError ? 'error' : ''}` }, parts.join(' · ')));
 }
 
+/** Cabeçalho de um relatório entregue ao main, no texto que o hub manda (pode vir depois das novidades do cérebro). */
+const REPORT_IN_HISTORY = /(?:^|\n)(?:Relatório final|Resposta) do agente (a\d+)\b|(?:^|\n)Novidade do vigia (a\d+)\b/;
+
 function renderHistory(items: HistoryItem[], container: HTMLElement = log): void {
+  // O transcrito não traz hora: as mensagens dele entram sem hora no cabeçalho.
+  slackLog.setReplaying(container === log);
   for (const item of items) {
     renderItem(item, container);
   }
+  slackLog.setReplaying(false);
   if (container === log) {
     scrollDown(true);
   }
@@ -2481,16 +2778,20 @@ function renderHistory(items: HistoryItem[], container: HTMLElement = log): void
 
 function renderItem(item: HistoryItem, container: HTMLElement): void {
   if (item.kind === 'user') {
-    addUser(item.text, undefined, container);
+    // Relatório entregue à conversa principal: no histórico vira a linha de relatório, que o post do agente ocupa.
+    const report = container === log && !state.companion ? REPORT_IN_HISTORY.exec(item.text) : null;
+    const agentId = report?.[1] ?? report?.[2];
+    addUser(item.text, agentId ? `agente ${agentId}` : undefined, container, [], agentId);
   } else if (item.kind === 'text') {
     const el = h('div', { class: 'msg assistant md' });
-    md(el, item.text);
     if (container === log) {
-      companionUi?.markRaw(el, item.text);
+      companionUi?.markRaw(el, mainMd(el, item.text));
+    } else {
+      md(el, item.text);
     }
     append(el, container);
   } else if (item.kind === 'tool') {
-    if (container === log && isOrchestration(item.name)) {
+    if (container === log && hiddenInLog(item.name)) {
       hiddenTools.add(item.id);
       return;
     }
@@ -2514,6 +2815,9 @@ function clearLog(): void {
   agentItems.clear();
   taskProcs.clear();
   agentCards.clear();
+  slackLog.reset();
+  postEls.clear();
+  reportAnchors.clear();
   taskCards.clear();
   pendingDecisions.clear();
   renderPendingPill();
@@ -2731,6 +3035,33 @@ function setFold(boxId: string, collapsed: boolean): void {
     delete boxFold[k];
   }
   saveState();
+  sendMapLayout();
+}
+
+/** Nós arrastados nesta conversa; vão junto com as caixas recolhidas para a pasta da conversa no host. */
+let mapPinned: Record<string, { x: number; y: number }> = {};
+
+function sendMapLayout(): void {
+  if (!state.sessionId) {
+    return;
+  }
+  const prefix = `${state.sessionId}|`;
+  const folds: Record<string, boolean> = {};
+  for (const [k, v] of Object.entries(boxFold)) {
+    if (k.startsWith(prefix)) {
+      folds[k.slice(prefix.length)] = v;
+    }
+  }
+  send({ type: 'mapLayout', layout: { pinned: mapPinned, folds } });
+}
+
+/** Arrumação salva da conversa reaberta: vale também numa aba nova, que não tem o state do webview antigo. */
+function applyMapLayout(layout: { pinned: Record<string, { x: number; y: number }>; folds: Record<string, boolean> }): void {
+  for (const [id, collapsed] of Object.entries(layout.folds ?? {})) {
+    boxFold[foldKey(id)] = collapsed;
+  }
+  mapPinned = { ...(layout.pinned ?? {}) };
+  graph.setPinned(mapPinned);
 }
 
 /** Agente com decisão esperando o usuário: a caixa dele abre sozinha. */
@@ -2763,6 +3094,16 @@ const graph = createAgentGraph({
   rootLabel: 'Conversa principal',
   fill: true,
   onSelect: (id, rect, byKey) => {
+    if (isDoneNode(id)) {
+      // Nó-resumo dos concluídos: abre ou fecha os agentes daquele criador, sem popup.
+      const parent = doneNodeParent(id);
+      if (!expandedDone.delete(parent)) {
+        expandedDone.add(parent);
+      }
+      popup.close();
+      updateGraph();
+      return;
+    }
     popAnchor = undefined;
     popup.open(id, rect, { focus: byKey });
   },
@@ -2782,6 +3123,10 @@ const graph = createAgentGraph({
   needsAttention: hasPendingDecision,
   // Com o mapa na tela, caixa que termina não recolhe sozinha (a lista e o grafo pulariam); recolhe na próxima abertura.
   holdAutoFold: () => !overlay.classList.contains('hidden') && !detailId,
+  onPinnedChange: (pinned) => {
+    mapPinned = pinned;
+    sendMapLayout();
+  },
 });
 graph.setEdgeVisibility(edgeVisibility);
 const mapGraph = h('div', { class: 'map-graph' }, graph.element);
@@ -2852,6 +3197,14 @@ const popup = createNodePopup({
   },
   stop: (id) => send({ type: 'stopAgent', id }),
   resume: (id) => send({ type: 'resumeAgent', id }),
+  accountsFor: (a) => {
+    // Sem accountId o agente roteado usa a conta do chat.
+    const home = a.accountId ?? state.profileId;
+    return state.profiles
+      .filter((p) => p.provider !== 'codex')
+      .map((p) => ({ id: p.id, label: p.account ? `${p.name} · ${p.account}` : p.name, current: p.id === home }));
+  },
+  switchAccount: (id, profileId) => send({ type: 'agentSwitchAccount', id, profileId }),
   worktreeAction: (id, action) => send({ type: 'worktreeAction', id, action }),
   brainReady: () => brainReady,
   openBrainNote: (id) => send({ type: 'openBrain', agentId: id }),
@@ -2885,8 +3238,9 @@ const popup = createNodePopup({
   toggleBox: (boxId) => graph.toggleBox(boxId),
   askAbout: (id) => {
     popup.close();
-    send({ type: 'openCompanion', prefill: askAboutText(id) });
+    threadUi.openLatest(id);
   },
+  hasThread: (id) => threadUi.hasPosts(id),
   onClose: () => {
     popAnchor = undefined;
     if (!detailId) {
@@ -2933,6 +3287,19 @@ document.addEventListener(
   { capture: true, passive: true },
 );
 
+/** Agentes que o grafo desenha: os concluídos recolhidos em quem os criou, a menos que o usuário peça todos. */
+function graphAgents(): AgentInfo[] {
+  const list = [...agents.values()];
+  if (showDone) {
+    return list;
+  }
+  const now = Date.now();
+  return foldDone(list, {
+    expanded: expandedDone,
+    keep: (a) => a.id === detailId || hasPendingDecision(a.id) || now - (finishedAt.get(a.id) ?? 0) < DONE_GRACE_MS,
+  });
+}
+
 /**
  * O grafo muda de altura quando entra ou sai um agente, e isso encurtaria o conteúdo debaixo do
  * scroll do usuário. Guardar e devolver o scrollTop em volta do update mantém a lista onde estava.
@@ -2940,7 +3307,7 @@ document.addEventListener(
 function updateGraph(): void {
   const keep = mapScroll.scrollTop;
   graph.setBoxes(boxes);
-  graph.update([...agents.values()]);
+  graph.update(graphAgents());
   labView.setAgents([...agents.values()]);
   if (mapScroll.scrollTop !== keep) {
     mapScroll.scrollTop = keep;
@@ -3161,10 +3528,133 @@ function cardLine(a: AgentInfo): string {
 }
 
 /**
+ * Linha de baixo do cartão no chat principal, como numa conversa: o que o agente faz agora (a nota do
+ * report_progress, senão a ferramenta em uso) e, quando termina, a conclusão em uma frase.
+ */
+function chatLine(a: AgentInfo): { icon: string; text: string; tone: string } {
+  if (a.repeatEveryMinutes && a.status !== 'running') {
+    return { icon: 'sync', text: cardLine(a) || 'vigiando', tone: 'wait' };
+  }
+  switch (a.status) {
+    case 'running': {
+      // A nota do report_progress; o que ele faz agora vai na linha "Agora", logo abaixo.
+      const note = a.progress && !a.progress.stale ? a.progress.text : '';
+      return { icon: 'typing', text: note || 'digitando', tone: 'live' };
+    }
+    case 'waiting':
+      return { icon: 'watch', text: pendingText(a) || 'aguardando', tone: 'wait' };
+    case 'completed':
+      return { icon: 'check', text: reportHeadline(a.report) || (sameText(a.summary, a.description) ? '' : (a.summary?.trim() ?? '')) || 'concluído', tone: 'done' };
+    case 'failed':
+      return { icon: 'error', text: `falhou${a.limit ? ': limite de uso' : ''}${reportHeadline(a.report) ? ` · ${reportHeadline(a.report)}` : ''}`, tone: 'fail' };
+    default:
+      return { icon: 'debug-stop', text: `${STATUS_LABEL[a.status]}${reportHeadline(a.report) ? ` · ${reportHeadline(a.report)}` : ''}`, tone: 'stop' };
+  }
+}
+
+/** Partes do lugar do agente no chat que ficam vivas entre repinturas: os pontinhos e o ponto do "Agora" não reiniciam. */
+interface ChatSlot {
+  av: HTMLElement;
+  top: HTMLElement;
+  line: HTMLElement;
+  now: HTMLElement;
+}
+const chatSlots = new WeakMap<HTMLElement, ChatSlot>();
+
+/** Linha de baixo: ícone do estado (pontinhos de "digitando" enquanto roda) e a nota. Troca o ícone só quando o estado muda. */
+function paintChatLine(line: HTMLElement, a: AgentInfo): void {
+  const l = chatLine(a);
+  const sig = `${l.icon}|${l.tone}`;
+  if (line.dataset.sig !== sig) {
+    line.dataset.sig = sig;
+    line.className = `ag-line2 ag-chat ${l.tone}`;
+    let mark: HTMLElement;
+    if (l.icon === 'typing') {
+      mark = typingDots();
+      mark.style.setProperty('--lb-color', 'var(--agm-color)');
+    } else {
+      mark = icon(l.icon);
+    }
+    line.replaceChildren(mark, h('span', { class: 'ag-chat-text' }, l.text));
+    return;
+  }
+  const text = line.querySelector<HTMLElement>('.ag-chat-text');
+  if (text && text.textContent !== l.text) {
+    text.textContent = l.text;
+  }
+}
+
+/** Linha "Agora", a mesma do popup: ferramenta em uso com o resumo, o texto que escreve, ou a última ferramenta. */
+function paintNowLine(now: HTMLElement, a: AgentInfo): void {
+  const running = a.status === 'running' && !a.restored;
+  now.hidden = !running;
+  if (!running) {
+    now.dataset.sig = '';
+    return;
+  }
+  const n = agentNow(agentItems.get(a.id) ?? [], a.lastTool, summarize, 160);
+  const sig = `${n.tag}|${n.name}|${n.sum}`;
+  if (now.dataset.sig === sig) {
+    return;
+  }
+  now.dataset.sig = sig;
+  let pulse = now.querySelector<HTMLElement>('.ag-now-live');
+  if (!pulse) {
+    pulse = h('span', { class: 'ag-now-live', 'aria-hidden': 'true' });
+  }
+  const sum = n.sum ? h('span', { class: 'ag-now-sum' }, n.sum) : null;
+  if (sum) {
+    sum.title = n.sum;
+  }
+  // O ponto pulsando é o mesmo nó: sai e volta no lugar sem ser recriado.
+  now.replaceChildren(pulse, h('span', { class: 'ag-now-tag' }, 'Agora'), h('span', { class: 'ag-now-what' }, n.tag), n.name ? h('span', { class: 'ag-now-name' }, n.name) : '', sum ?? '');
+}
+
+/** Linha de cima do cartão: estado, título, marcas, destino fora do padrão, tempo, tokens e o botão de parar. */
+function cardTop(a: AgentInfo): Child[] {
+  const canStop = (a.status === 'running' && (a.kind === 'routed' || (a.kind === 'subagent' && !!a.taskId))) || watching(a);
+  const dest = cardDest(a);
+  const stop = canStop
+    ? h(
+        'button',
+        {
+          class: 'ag-stop icon-btn',
+          title: a.repeatEveryMinutes ? 'Parar vigia' : 'Parar agente',
+          'aria-label': `Parar ${a.description || a.id}`,
+          onclick: (e: Event) => {
+            e.stopPropagation();
+            send({ type: 'stopAgent', id: a.id });
+          },
+        },
+        icon('debug-stop'),
+      )
+    : null;
+  return [
+    agentDot(a),
+    a.repeatEveryMinutes ? h('span', { class: 'ag-watch-ico', title: `Vigia ${repeatLabel(a.repeatEveryMinutes)}` }, icon('sync')) : null,
+    a.browserActive ? h('span', { class: 'ag-browser', title: 'Está com o navegador (Claude in Chrome)' }, icon('browser')) : null,
+    a.worktree ? h('span', { class: 'ag-branch', title: `Isolado na branch ${a.worktree.branch}` }, icon('git-branch')) : null,
+    h('span', { class: 'ag-title' }, a.description || 'Agente'),
+    a.provider === 'codex' ? h('span', { class: 'ag-prov', title: `Roda no Codex, conta ${a.profileName ?? '?'}` }, 'Codex') : null,
+    onOtherAccount(a) ? h('span', { class: 'ag-prov', title: `Roda na conta Claude ${a.profileName ?? a.accountId}, não na deste chat` }, shortAccountName(a.profileName ?? a.accountId ?? '')) : null,
+    dest ? h('span', { class: 'ag-dest' }, dest) : null,
+    h('div', { class: 'spacer' }),
+    a.repeatEveryMinutes ? watchCell(a, 'ag-watch') : null,
+    h(
+      'span',
+      { class: 'ag-nums' },
+      a.durationMs || a.status === 'running' ? clockCell(a, 'ag-time') : null,
+      a.totalTokens ? h('span', { class: 'ag-tok' }, shortTokens(a.totalTokens)) : null,
+    ),
+    stop,
+  ];
+}
+
+/**
  * Cartão de um agente, numa linha (mais uma opcional): ponto de estado, título, destino fora do
  * padrão, tempo e tokens. Rota completa, métricas, relatório e botões ficam no popup, que o clique
  * abre ancorado no cartão. `into` reaproveita o nó que já está na tela: atualizar no lugar mantém o
- * scroll do container e a posição cronológica no log. `compact` é a versão do chat principal.
+ * scroll do container e a posição cronológica no log. `compact` é o lugar do agente no chat principal.
  */
 function agentCard(a: AgentInfo, compact: boolean, into?: HTMLElement): HTMLElement {
   const card = into ?? h('div', { class: 'ag-card', role: 'button', tabindex: '0' });
@@ -3183,64 +3673,51 @@ function agentCard(a: AgentInfo, compact: boolean, into?: HTMLElement): HTMLElem
       }
     });
   }
-  card.className = `ag-card slim ${a.status}${compact ? ' compact' : ''}${a.restored ? ' restored' : ''}`;
+  card.className = `ag-card slim ${a.status}${compact ? ' compact chat-slot' : ''}${a.restored ? ' restored' : ''}`;
   card.title = `${a.description || 'Agente'}: clique para ver ${a.status === 'running' ? 'o que está fazendo' : 'o relatório'}`;
   paintAgent(card, a);
-
-  const canStop = (a.status === 'running' && (a.kind === 'routed' || (a.kind === 'subagent' && !!a.taskId))) || watching(a);
-  const dest = cardDest(a);
+  if (compact) {
+    chatSlot(card, a);
+    return card;
+  }
   const line = cardLine(a);
-  const stop = canStop
-    ? h(
-        'button',
-        {
-          class: 'ag-stop icon-btn',
-          title: a.repeatEveryMinutes ? 'Parar vigia' : 'Parar agente',
-          'aria-label': `Parar ${a.description || a.id}`,
-          onclick: (e: Event) => {
-            e.stopPropagation();
-            send({ type: 'stopAgent', id: a.id });
-          },
-        },
-        icon('debug-stop'),
-      )
-    : null;
-
-  fill(
-    card,
-    h(
-      'div',
-      { class: 'ag-top' },
-      agentDot(a),
-      a.repeatEveryMinutes ? h('span', { class: 'ag-watch-ico', title: `Vigia ${repeatLabel(a.repeatEveryMinutes)}` }, icon('sync')) : null,
-      a.browserActive ? h('span', { class: 'ag-browser', title: 'Está com o navegador (Claude in Chrome)' }, icon('browser')) : null,
-      a.worktree ? h('span', { class: 'ag-branch', title: `Isolado na branch ${a.worktree.branch}` }, icon('git-branch')) : null,
-      h('span', { class: 'ag-title' }, a.description || 'Agente'),
-      a.provider === 'codex' ? h('span', { class: 'ag-prov', title: `Roda no Codex, conta ${a.profileName ?? '?'}` }, 'Codex') : null,
-      onOtherAccount(a) ? h('span', { class: 'ag-prov', title: `Roda na conta Claude ${a.profileName ?? a.accountId}, não na deste chat` }, shortAccountName(a.profileName ?? a.accountId ?? '')) : null,
-      dest ? h('span', { class: 'ag-dest' }, dest) : null,
-      h('div', { class: 'spacer' }),
-      a.repeatEveryMinutes ? watchCell(a, 'ag-watch') : null,
-      h(
-        'span',
-        { class: 'ag-nums' },
-        a.durationMs || a.status === 'running' ? clockCell(a, 'ag-time') : null,
-        a.totalTokens ? h('span', { class: 'ag-tok' }, shortTokens(a.totalTokens)) : null,
-      ),
-      stop,
-    ),
-    // No log principal o cartão fica numa linha: a atividade já está na faixa de cima do composer e o
-    // relatório chega como linha própria. O popup do clique tem o resto.
-    line && !compact ? h('div', { class: 'ag-line2' }, line) : null,
-  );
+  fill(card, h('div', { class: 'ag-top' }, ...cardTop(a)), line ? h('div', { class: 'ag-line2' }, line) : null);
   return card;
 }
 
-/** Log novo de um agente rodando: só a segunda linha dos cartões dele muda, no texto. */
+/**
+ * Lugar do agente no chat principal, como uma pessoa num canal: avatar, nome e, enquanto roda, os pontinhos de
+ * "digitando" com a nota de progresso e a linha "Agora". O relatório inteiro e os botões ficam no popup do clique.
+ */
+function chatSlot(card: HTMLElement, a: AgentInfo): void {
+  let slot = chatSlots.get(card);
+  if (!slot) {
+    slot = {
+      av: h('span', { class: 'thread-av agent post-av', 'aria-hidden': 'true' }),
+      top: h('div', { class: 'ag-top' }),
+      line: h('div', { class: 'ag-line2 ag-chat' }),
+      now: h('div', { class: 'ag-now' }),
+    };
+    chatSlots.set(card, slot);
+    card.replaceChildren(slot.av, h('div', { class: 'ag-main' }, slot.top, slot.line, slot.now));
+  }
+  slot.av.textContent = a.id.slice(0, 3);
+  fill(slot.top, ...cardTop(a));
+  paintChatLine(slot.line, a);
+  paintNowLine(slot.now, a);
+}
+
+/** Log novo de um agente rodando: só as linhas de baixo dos cartões dele mudam, no lugar. */
 function paintCardActivity(id: string): void {
   const a = agents.get(id);
   if (!a || a.status !== 'running') {
     return;
+  }
+  const chat = agentCards.get(id);
+  const slot = chat ? chatSlots.get(chat) : undefined;
+  if (slot) {
+    paintChatLine(slot.line, a);
+    paintNowLine(slot.now, a);
   }
   const text = cardLine(a);
   for (const [card, compact] of [[mapCards.get(id), false]] as const) {
@@ -3254,6 +3731,89 @@ function paintCardActivity(id: string): void {
       }
     } else if (!!el !== !!text) {
       agentCard(a, compact, card);
+    }
+  }
+}
+
+// ---------- Posts dos agentes no chat ----------
+
+/** O agente precisa de lugar ao vivo no chat: ainda não entregou nada, ou voltou a trabalhar depois do último post. */
+function needsSlot(a: AgentInfo): boolean {
+  return !threadUi.hasPosts(a.id) || a.status === 'running' || a.status === 'waiting';
+}
+
+const flatText = (t: string) => t.replace(/\s+/g, ' ').trim();
+
+/** Linha de relatório do histórico que é deste post (mesmo agente, mesmo começo de texto). */
+function takeAnchor(p: AgentPost): HTMLElement | undefined {
+  const head = flatText(p.report).slice(0, 160);
+  for (const [el, info] of reportAnchors) {
+    if (info.agentId === p.agentId && el.isConnected && flatText(info.text).includes(head)) {
+      reportAnchors.delete(el);
+      return el;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Põe um post no log. Já na tela: repinta no lugar. Novo: entra onde estava o relatório no histórico (conversa
+ * reaberta), senão no lugar ao vivo do agente (o "digitando" vira o post), senão no fim do log.
+ */
+function placePost(p: AgentPost): void {
+  if (state.companion) {
+    return;
+  }
+  const shown = postEls.get(p.id);
+  if (shown) {
+    threadUi.renderPost(p, shown);
+    return;
+  }
+  const el = threadUi.renderPost(p);
+  postEls.set(p.id, el);
+  const a = agents.get(p.agentId);
+  const card = agentCards.get(p.agentId);
+  const latest = threadUi.postsOf(p.agentId).at(-1)?.id === p.id;
+  const anchor = takeAnchor(p);
+  if (anchor) {
+    anchor.replaceWith(el);
+  } else if (card && latest) {
+    card.replaceWith(el);
+    agentCards.delete(p.agentId);
+  } else if (card) {
+    card.before(el);
+  } else {
+    append(el);
+    scrollDown();
+    return;
+  }
+  // Post que entrou no lugar do relatório do histórico: o lugar ao vivo de um agente parado sobra.
+  if (card?.isConnected && latest && a && !needsSlot(a)) {
+    card.remove();
+    agentCards.delete(p.agentId);
+  }
+}
+
+/** Lista inteira (conversa aberta ou trocada): tira o que saiu e põe cada post, na ordem da entrega. */
+function placeAllPosts(list: AgentPost[]): void {
+  if (state.companion) {
+    return;
+  }
+  const keep = new Set(list.map((p) => p.id));
+  for (const [id, el] of postEls) {
+    if (!keep.has(id)) {
+      el.remove();
+      postEls.delete(id);
+    }
+  }
+  for (const p of list) {
+    placePost(p);
+  }
+  for (const [id, card] of agentCards) {
+    const a = agents.get(id);
+    if (a && !needsSlot(a)) {
+      card.remove();
+      agentCards.delete(id);
     }
   }
 }
@@ -3288,8 +3848,30 @@ function renderMapHead(): void {
     subLine(running ? `${running} de ${list.length} trabalhando` : `${list.length} ${list.length === 1 ? 'agente' : 'agentes'}`),
     shownBoxes ? h('div', { class: 'map-sub map-sub-boxes' }, `${shownBoxes} ${shownBoxes === 1 ? 'caixa' : 'caixas'}`) : null,
   );
+  const doneCount = list.filter((a) => isFinal(a.status)).length;
   fill(
     mapBrain,
+    doneCount
+      ? h(
+          'button',
+          {
+            class: 'map-organize map-brain',
+            type: 'button',
+            'aria-pressed': String(showDone),
+            title: showDone
+              ? 'Recolhe no grafo os agentes concluídos: viram um nó "N concluídos" ligado a quem os criou, e o clique nele mostra de novo'
+              : `Mostra no grafo os ${doneCount} agentes concluídos, cada um no seu nó`,
+            onclick: () => {
+              showDone = !showDone;
+              saveState();
+              renderMapHead();
+              updateGraph();
+            },
+          },
+          icon(showDone ? 'eye' : 'eye-closed'),
+          h('span', { class: 'map-brain-label' }, showDone ? 'Recolher concluídos' : `Mostrar concluídos (${doneCount})`),
+        )
+      : null,
     h(
       'button',
       {
@@ -3357,7 +3939,7 @@ function renderMap(): void {
   const keep = mapScroll.scrollTop;
   const list = [...agents.values()];
   graph.setBoxes(boxes);
-  graph.update(list);
+  graph.update(graphAgents());
   labView.setAgents(list);
   mapShape = mapSignature();
   for (const id of [...mapCards.keys()]) {
@@ -3611,6 +4193,7 @@ function agentComposer(a: AgentInfo): HTMLElement {
         : 'Abre um chat próprio com a conta, o modelo e o raciocínio escolhidos, já com a tarefa e o que o agente fez até agora.';
     stopLabel.classList.toggle('hidden', direct() || restored() || current().status !== 'running');
     go.textContent = restored() ? 'Retomar e enviar' : direct() ? 'Enviar' : 'Continuar em chat próprio';
+    moveBtn.classList.toggle('hidden', !canMoveAgent());
     hint.classList.toggle('warn-hint', restored());
   };
   modelSel2.addEventListener('change', () => {
@@ -3633,6 +4216,13 @@ function agentComposer(a: AgentInfo): HTMLElement {
     refreshHint();
   });
 
+  // Agente roteado do Claude indo para outra conta Claude: dá para levar o próprio agente, em vez de abrir um chat à parte.
+  const canMoveAgent = () => current().kind === 'routed' && current().provider !== 'codex' && !sameAccount() && !targetIsCodex();
+  const moveBtn = h('button', {
+    class: 'hidden',
+    title: 'Passa este agente para a conta escolhida: mesmo nó no mapa, mesma sessão. A próxima mensagem já roda na conta nova.',
+    onclick: () => send({ type: 'agentSwitchAccount', id: a.id, profileId: profileSel.value }),
+  }, 'Trocar conta do agente');
   const go = h('button', {
     class: 'send',
     onclick: () => {
@@ -3665,14 +4255,24 @@ function agentComposer(a: AgentInfo): HTMLElement {
     }
   });
   const stopLabel = h('label', { class: 'check' }, stopOriginal, ' parar o original');
-  const box = h('div', { class: 'composer agent' }, text, h('div', { class: 'row' }, profileSel, modelSel2, effortSel2, stopLabel, h('div', { class: 'spacer' }), go), hint);
+  const box = h('div', { class: 'composer agent' }, text, h('div', { class: 'row' }, profileSel, modelSel2, effortSel2, stopLabel, h('div', { class: 'spacer' }), moveBtn, go), hint);
   refreshHint();
   return box;
 }
 
 function onAgent(agent: AgentInfo): void {
   const isNew = !agents.has(agent.id);
+  const before = agents.get(agent.id);
+  if (before && !isFinal(before.status) && isFinal(agent.status)) {
+    // Terminou agora: fica um minuto no grafo e depois recolhe. Agente que já chega terminado (conversa reaberta) recolhe direto.
+    finishedAt.set(agent.id, Date.now());
+    window.setTimeout(() => refreshMap(), DONE_GRACE_MS + 500);
+  } else if (!isFinal(agent.status)) {
+    finishedAt.delete(agent.id);
+  }
   agents.set(agent.id, agent);
+  // Só agente de verdade (não tarefa de shell, busca ou job) com status "rodando" ganha balão na faixa.
+  live.setWorking(agent.id, isWorking(agent) && !agent.infra && !agent.search && agent.kind !== 'fork' && agent.taskType !== 'local_bash');
   rebaseClock(agent);
   if (!agentItems.has(agent.id)) {
     agentItems.set(agent.id, []);
@@ -3682,7 +4282,7 @@ function onAgent(agent: AgentInfo): void {
     const card = agentCards.get(agent.id);
     if (card) {
       agentCard(agent, true, card);
-    } else {
+    } else if (needsSlot(agent)) {
       const made = agentCard(agent, true);
       agentCards.set(agent.id, made);
       append(made);
@@ -3696,6 +4296,7 @@ function onAgent(agent: AgentInfo): void {
   }
   // Popup aberto nesse agente (ou na raiz, que resume todos) repinta no lugar.
   popup.refresh(agent.id);
+  threadUi.refreshAgent(agent.id);
 }
 
 function onAgentItem(id: string, item: HistoryItem): void {
@@ -3703,6 +4304,11 @@ function onAgentItem(id: string, item: HistoryItem): void {
     agentItems.set(id, []);
   }
   agentItems.get(id)!.push(item);
+  if (item.kind === 'tool') {
+    live.tool(id, item.name, item.input);
+  } else if (item.kind === 'text') {
+    live.message(id);
+  }
   if (detailId === id && detailLog) {
     const stick = detailLog.scrollHeight - detailLog.scrollTop - detailLog.clientHeight < 120;
     renderItem(item, detailLog);
@@ -3859,6 +4465,7 @@ function saveState(): void {
     sessionId: state.sessionId || prev.sessionId || undefined,
     edges: edgeVisibility,
     boxFold,
+    showDone,
   });
 }
 
@@ -3936,17 +4543,13 @@ function onTaskProposal(p: TaskProposal): void {
 
 // ---------- Chat lateral de consulta ----------
 
-/** Pergunta que o "Perguntar sobre este agente" do popup põe na caixa do chat lateral (sem enviar). */
-function askAboutText(id: string): string {
-  const a = agents.get(id);
-  const who = a ? `o agente ${id} ("${a.description}")` : `o agente ${id}`;
-  if (a?.status === 'failed') {
-    return `Por que ${who} falhou?`;
+/** Pergunta que a thread de um post traz na caixa quando abre vazia (sem enviar), feita direto ao agente. */
+function suggestFor(post: AgentPost): string {
+  const a = agents.get(post.agentId);
+  if (a?.status === 'failed' && threadUi.postsOf(post.agentId).at(-1)?.id === post.id) {
+    return 'O que deu errado?';
   }
-  if (a?.status === 'running') {
-    return `O que ${who} está fazendo agora?`;
-  }
-  return `O que ${who} fez? Resuma o relatório dele.`;
+  return 'O que ficou de fora ou sem verificar neste relatório?';
 }
 
 /** Só existe no chat lateral. No principal fica indefinido e as chamadas `companionUi?.` não fazem nada. */
@@ -3990,6 +4593,8 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
   const msg = event.data;
   switch (msg.type) {
     case 'init':
+      live.setEnabled(msg.liveBubbles !== false);
+      toolsExpanded = msg.toolsExpanded === true;
       Object.assign(state, {
         profileId: msg.profileId,
         profileName: msg.profileName,
@@ -4008,6 +4613,7 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       if (msg.companion) {
         enterCompanionMode(msg.companion);
       }
+      slackLog.setEnabled(!msg.companion);
       applyBrand();
       renderControls();
       renderForkBanner();
@@ -4038,12 +4644,32 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       if (!msg.value) {
         state.thinking = false;
       }
+      live.setWorking('main', msg.value);
       renderControls();
       refreshMap();
       break;
     case 'thinking':
       state.thinking = msg.value;
+      if (msg.value) {
+        live.thinking('main');
+      }
       renderActivity();
+      break;
+    case 'live':
+      if (msg.phase === 'typing') {
+        live.typing(msg.id);
+      } else {
+        live.thinking(msg.id, msg.text);
+      }
+      break;
+    case 'liveConfig':
+      live.setEnabled(msg.enabled);
+      repaintGroups();
+      renderActivity();
+      break;
+    case 'toolsConfig':
+      toolsExpanded = msg.expanded;
+      applyToolsExpanded();
       break;
     case 'contextTokens':
       state.contextTokens = msg.value;
@@ -4051,21 +4677,24 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       refreshMap();
       break;
     case 'textDelta':
+      live.typing('main');
       onTextDelta(msg.msgId, msg.index, msg.text);
       break;
     case 'assistantText':
+      live.message('main');
       onAssistantText(msg.msgId, msg.text);
       break;
     // spawn_agent, send_to_agent e companhia não viram linha: quem conta essa história é o cartão do agente.
     case 'toolStart':
-      if (isOrchestration(msg.name)) {
+      if (hiddenInLog(msg.name)) {
         hiddenTools.add(msg.id);
       } else if (!toolsIn(log).has(msg.id)) {
         createTool(msg.id, msg.name);
       }
       break;
     case 'toolUse':
-      if (isOrchestration(msg.name)) {
+      live.tool('main', msg.name, msg.input);
+      if (hiddenInLog(msg.name)) {
         hiddenTools.add(msg.id);
       } else {
         onToolUse(msg.id, msg.name, msg.input);
@@ -4075,6 +4704,10 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       if (!hiddenTools.has(msg.id)) {
         onToolResult(msg.id, msg.text, msg.isError, log, msg.images);
       }
+      break;
+    case 'imagesResolved':
+      imageRequests.get(msg.requestId)?.(msg.items);
+      imageRequests.delete(msg.requestId);
       break;
     case 'permission':
       onPermission(msg);
@@ -4099,15 +4732,36 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
     case 'companionExamples':
       companionUi?.setExamples(msg.examples);
       break;
+    case 'threads':
+      threadUi.setAll(msg.posts, msg.list);
+      break;
+    case 'post':
+      threadUi.upsertPost(msg.post);
+      break;
+    case 'thread':
+      threadUi.upsertThread(msg.thread);
+      break;
+    case 'threadStatus':
+      threadUi.setStatus(msg.postId, msg.text);
+      break;
     case 'notice':
       addNotice(msg.text, msg.level, msg.action);
       break;
     case 'history':
+      live.pauseEntrance();
       renderHistory(msg.items);
       companionUi?.decorate(log);
       break;
     case 'clear':
+      live.reset();
+      if (state.busy) {
+        live.setWorking('main', true);
+      }
+      threadUi.close();
       clearLog();
+      // Posições arrastadas são da conversa que saiu: a próxima traz as dela (mapLayout) ou começa sem nenhuma.
+      mapPinned = {};
+      graph.setPinned({});
       break;
     case 'userEcho':
       addUser(msg.text, msg.from, log, [], msg.fromId, msg.origin);
@@ -4132,6 +4786,10 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       refreshMap();
       popup.refresh();
       break;
+    case 'mapLayout':
+      applyMapLayout(msg.layout);
+      refreshMap();
+      break;
     case 'agentItem':
       onAgentItem(msg.id, msg.item);
       break;
@@ -4142,6 +4800,9 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       break;
     case 'usage':
       renderUsage(msg.usage);
+      break;
+    case 'accountsUsage':
+      showAccountsUsage(msg.list);
       break;
     case 'sessions':
       showSessions(msg.list, msg.error);

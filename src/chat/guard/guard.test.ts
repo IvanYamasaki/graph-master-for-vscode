@@ -414,6 +414,57 @@ test('caixa parada continua fechada até o usuário reabrir', async () => {
   guard3.dispose();
 });
 
+test('orçamento: quem criou libera mais sem o usuário', async () => {
+  const agents = new Map<string, AgentInfo>();
+  agents.set('a5', { id: 'a5', kind: 'routed', description: 'treino', status: 'running', creator: 'a1', budget: { maxTokens: 100 }, totalTokens: 0, durationMs: 0, toolUses: 0 } as AgentInfo);
+  const alerts: GuardAlert[] = [];
+  const told: string[] = [];
+  const continued: string[] = [];
+  const guard = new AgentGuard({
+    cwd: os.tmpdir(),
+    info: (id) => agents.get(id),
+    update: (id, patch) => {
+      const a = agents.get(id);
+      if (a) {
+        agents.set(id, { ...a, ...patch });
+      }
+    },
+    post: (msg: HostMessage) => {
+      if (msg.type === 'guardAlert') {
+        alerts.push({ ...msg.alert });
+      }
+    },
+    isBusy: (id) => agents.get(id)?.status === 'running',
+    interrupt: async () => undefined,
+    continueAgent: (id) => continued.push(id),
+    stopForGood: async () => undefined,
+    sendFromUser: () => undefined,
+    stop: async () => undefined,
+    log: () => undefined,
+    budgetExhausted: (_id, text) => told.push(text),
+  });
+  guard.onUsage('a5', { messageId: 'm1', tokens: 150 });
+  const card = alerts.find((a) => a.agentId === 'a5' && a.status === 'pending');
+  assert.ok(card, 'o usuário continua vendo o cartão');
+  assert.equal(told.length, 1, 'quem criou é avisado');
+  assert.match(told[0], /extend_budget/);
+  const low = guard.extendBy('a5', 'a1', 'falta pouco', { max_tokens: 120 });
+  assert.equal(low.ok, false, 'limite abaixo do já gasto é recusado');
+  assert.equal(agents.get('a5')!.budget?.maxTokens, 100);
+  const r = guard.extendBy('a5', 'a1', 'falta só o relatório', {});
+  assert.equal(r.ok, true);
+  assert.ok((agents.get('a5')!.budget?.maxTokens ?? 0) > 150, 'passa do já gasto');
+  assert.equal(alerts.at(-1)?.status, 'extended', 'o cartão fecha como liberado');
+  assert.match(alerts.at(-1)?.note ?? '', /a1/);
+  assert.deepEqual(continued, ['a5'], 'o turno interrompido continua');
+  const fixed = guard.extendBy('a5', 'a1', 'mais folga', { max_tokens: 1000, max_minutes: 30 });
+  assert.equal(fixed.ok, true);
+  assert.deepEqual(agents.get('a5')!.budget, { maxTokens: 1000, maxMinutes: 30, maxUsd: undefined });
+  assert.equal(continued.length, 1, 'sem turno parado, não manda continuar de novo');
+  assert.equal(guard.extendBy('zz', 'a1', 'x', {}).ok, false);
+  guard.dispose();
+});
+
 test('cofre: grava, soma padrões e conta tentativas', () => {
   resetLockboxCacheForTest();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agm-lockbox-'));
