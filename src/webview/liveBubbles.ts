@@ -1,9 +1,10 @@
-// Sinais de vida do chat: balão "digitando", balão de pensamento e a faixa dos agentes que estão trabalhando.
+// Sinais de vida do chat: balão "digitando", balão de pensamento e a faixa dos agentes que estão trabalhando. Agente
+// com post rodando no log mostra o pensamento no próprio post e não entra na faixa.
 // Tudo nasce de eventos reais (turno do chat principal, status "rodando" de um agente, deltas de texto, thinking e
 // chamadas de ferramenta). Sem trabalho em andamento não há balão, timer nem animação. A faixa fica fora do log:
 // só mexe na rolagem de quem já estava colado no fim.
 
-import { LiveModel, fmtElapsed, type ActorView, type BubbleKind } from './liveLogic';
+import { LiveModel, fmtElapsed, splitTray, type ActorView, type BubbleKind } from './liveLogic';
 
 export interface LiveBubblesDeps {
   /** O log do chat: a faixa só o reajusta (colado no fim) quando muda de altura. */
@@ -14,6 +15,11 @@ export interface LiveBubblesDeps {
   labelOf: (id: string) => string;
   /** Clique numa linha de agente (abrir o cartão dele). */
   onOpen?: (id: string, anchor: HTMLElement) => void;
+  /**
+   * Lugar do agente no log principal (o post que está rodando), se estiver à vista: o balão de pensamento vai para
+   * ele, e o agente sai da faixa. O tempo correndo o lugar já mostra ao lado do nome.
+   */
+  chatSpot?: (id: string) => HTMLElement | undefined;
 }
 
 /** Linhas visíveis ao mesmo tempo; o resto vira "+N". */
@@ -69,6 +75,8 @@ export function createLiveBubbles(deps: LiveBubblesDeps) {
   const more = node('div', 'lb-more hidden');
   tray.append(more);
   let enabled = true;
+  /** Lugares do chat que estão com balão, para limpar quando o agente para ou some do log. */
+  const spots = new Map<string, HTMLElement>();
   let wake: number | undefined;
   let tick: number | undefined;
 
@@ -123,11 +131,35 @@ export function createLiveBubbles(deps: LiveBubblesDeps) {
     row.slot.replaceChildren(...(bubble ? [bubble] : [node('span', 'lb-idle', 'trabalhando')]));
   }
 
+  /** Balão no lugar do agente no chat: só o pensamento (o "digitando" o lugar já tem). */
+  function paintSpot(el: HTMLElement, v: ActorView | undefined): void {
+    const text = enabled && v?.kind === 'thought' ? v.text : '';
+    if (el.dataset.lb === text) {
+      return;
+    }
+    el.dataset.lb = text;
+    const bubble = text ? bubbleFor('thought', text) : undefined;
+    el.replaceChildren(...(bubble ? [bubble] : []));
+    el.title = text;
+  }
+
   /** Reconstrói as linhas que mudaram. Chamado só quando um evento muda o conjunto ou o texto de alguém. */
   function render(): void {
     const now = Date.now();
+    const split = splitTray(model.ids(), (id) => !!deps.chatSpot?.(id));
+    for (const [id, el] of spots) {
+      if (!split.chat.includes(id) || deps.chatSpot?.(id) !== el) {
+        paintSpot(el, undefined);
+        spots.delete(id);
+      }
+    }
+    for (const id of split.chat) {
+      const el = deps.chatSpot!(id)!;
+      spots.set(id, el);
+      paintSpot(el, model.view(id, now));
+    }
     relayout(() => {
-      const ids = model.ids();
+      const ids = split.tray;
       const shown = ids.slice(0, MAX_ROWS);
       for (const [id, row] of rows) {
         if (!shown.includes(id)) {
@@ -241,6 +273,11 @@ export function createLiveBubbles(deps: LiveBubblesDeps) {
 
     isTyping(id: string): boolean {
       return model.view(id, Date.now())?.kind === 'typing';
+    },
+
+    /** Um lugar de agente entrou ou saiu do log: refaz a divisão entre a faixa e o chat. */
+    refresh(): void {
+      render();
     },
 
     /** Chat trocado ou limpo: ninguém está trabalhando. */

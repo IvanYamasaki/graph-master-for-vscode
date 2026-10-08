@@ -152,3 +152,68 @@ export class FoldGroup {
     return foldLabel(this.tools, opts);
   }
 }
+
+/**
+ * Peça de um turno do orquestrador no log principal, na ordem da tela: fala com texto visível, bloco de ações
+ * (um grupo recolhido) ou outra coisa (pergunta, imagem, cartão de agente, aviso).
+ */
+export type TurnPart = 'text' | 'actions' | 'other';
+
+/**
+ * A que fala cada bloco de ações se liga: à próxima fala com texto do mesmo turno; se o turno acabou sem fala
+ * depois, à anterior. Devolve, para cada índice, o índice da fala dona (só nos blocos de ações), -1 quando o bloco
+ * fica sem dono (turno ainda rodando, ou turno sem nenhuma fala) e undefined nas outras peças.
+ */
+export function actionOwners(parts: readonly TurnPart[], turnOver: boolean): (number | undefined)[] {
+  const out: (number | undefined)[] = new Array(parts.length).fill(undefined);
+  let next = -1;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i] === 'text') {
+      next = i;
+    } else if (parts[i] === 'actions') {
+      out[i] = next;
+    }
+  }
+  if (turnOver) {
+    let prev = -1;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === 'text') {
+        prev = i;
+      } else if (parts[i] === 'actions' && out[i] === -1) {
+        out[i] = prev;
+      }
+    }
+  }
+  return out;
+}
+
+/** O que pode aparecer no turno do orquestrador, para decidir o que vai para os detalhes da fala. */
+export type TurnItem =
+  | { kind: 'tool'; name: string }
+  | { kind: 'result'; isError: boolean }
+  | { kind: 'permission' }
+  | { kind: 'image' }
+  | { kind: 'notice'; level: 'info' | 'error' };
+
+/**
+ * Vai para os detalhes da fala (escondido até o clique)? Só as ações comuns e a estatística do turno. Pergunta,
+ * plano, pesquisa, imagens, pedido de permissão, aviso e turno que terminou em erro ficam sempre à vista.
+ */
+export function foldsIntoMessage(item: TurnItem): boolean {
+  if (item.kind === 'tool') {
+    return isFoldable(item.name);
+  }
+  if (item.kind === 'result') {
+    return !item.isError;
+  }
+  return false;
+}
+
+/** Marca discreta de que a fala tem detalhes: "2 ações", "2 ações · 1 com erro" ou "detalhes" (só a estatística). */
+export function detailsLabel(tools: readonly Pick<FoldTool, 'state'>[]): string {
+  if (!tools.length) {
+    return 'detalhes';
+  }
+  const failed = tools.filter((t) => t.state === 'failed').length;
+  return failed ? `${countLabel(tools.length)} · ${failed} com erro` : countLabel(tools.length);
+}

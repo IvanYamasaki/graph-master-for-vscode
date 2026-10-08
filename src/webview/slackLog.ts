@@ -5,6 +5,7 @@
  * se põe o cabeçalho antes do primeiro de cada sequência e se marca o resto como continuação.
  */
 
+import type { AgentInfo } from '../chat/protocol';
 import { clockLabel } from '../chat/threadModel';
 
 /** Quem fala: o usuário, o orquestrador, um agente (post e lugar ao vivo têm cabeçalho próprio) ou nota do sistema. */
@@ -43,6 +44,15 @@ export function authorOf(cls: { contains(c: string): boolean }): Author {
     return 'claude';
   }
   return 'meta';
+}
+
+/**
+ * O agente ganha lugar no log principal (digitando, depois o post)? Só os do spawn_agent. Tarefa do SDK (Bash em
+ * segundo plano, subagente nativo), continuação, job e busca ficam no mapa e no popup: no chat eram um cartão com as
+ * iniciais do id da chamada ("too", de toolu_...).
+ */
+export function showsInChat(a: Pick<AgentInfo, 'kind' | 'taskType' | 'infra' | 'search'>): boolean {
+  return a.kind === 'routed' && !a.taskType && !a.infra && !a.search;
 }
 
 function dayKey(at: number): string {
@@ -231,6 +241,11 @@ export function createSlackLog(deps: SlackLogDeps) {
     stamp,
     refresh,
     reset,
+    /** Cabeçalho à vista logo antes desta fala, se ela abre a sequência. */
+    headOf(el: HTMLElement): HTMLElement | undefined {
+      const head = heads.get(el);
+      return head && !head.hidden && head.nextElementSibling === el ? head : undefined;
+    },
     setEnabled(on: boolean) {
       enabled = on;
       log.classList.toggle('slack', on);
