@@ -3,7 +3,7 @@
  *   npx esbuild src/webview/liveBubbles.test.ts --bundle --platform=node --outfile=$TEMP/liveBubbles.test.js && node $TEMP/liveBubbles.test.js
  */
 import * as assert from 'node:assert/strict';
-import { LiveModel, TextPacer, agentNow, clip, describeTool, flatLine, fmtElapsed, mcpToolLabel, openTool, tail } from './liveLogic';
+import { LiveModel, TextPacer, agentNow, clip, describeTool, flatLine, fmtElapsed, mcpToolLabel, openTool, splitTray, tail } from './liveLogic';
 
 let failed = 0;
 function test(name: string, fn: () => void): void {
@@ -185,6 +185,13 @@ test('linha "Agora": ferramenta aberta, texto, última ferramenta ou começando'
   assert.deepEqual(agentNow([], undefined, describe), { tag: 'começando', name: '', sum: '' });
   assert.equal(mcpToolLabel('Bash'), 'Bash');
   assert.equal(flatLine('a'.repeat(10), 5), 'aaaa…');
+});
+
+test('faixa: agente com post rodando no chat sai dela; chat principal e quem não tem lugar ficam', () => {
+  const inChat = (id: string) => id === 'a2';
+  assert.deepEqual(splitTray(['main', 'a2', 'a3'], inChat), { tray: ['main', 'a3'], chat: ['a2'] });
+  assert.deepEqual(splitTray(['a2'], inChat), { tray: [], chat: ['a2'] });
+  assert.deepEqual(splitTray([], inChat), { tray: [], chat: [] });
 });
 
 if (failed) {

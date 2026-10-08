@@ -20,9 +20,9 @@ import { createOrphansView } from './orphansUi';
 import { createLiveBubbles, typingDots } from './liveBubbles';
 import { agentNow } from './liveLogic';
 import { createThreadUi } from './threadUi';
-import { createSlackLog } from './slackLog';
+import { createSlackLog, showsInChat } from './slackLog';
 import { splitPostBlocks, type AgentPost } from '../chat/threadModel';
-import { FoldGroup, isAgentSpawn, isFoldable } from './toolFold';
+import { FoldGroup, actionOwners, detailsLabel, isAgentSpawn, isFoldable, type TurnPart } from './toolFold';
 import { closeImageViewer, imageGrid, openImageViewer, setImageViewerActions, type ViewerItem } from './imageViewer';
 import { SHOW_IMAGE_TOOL, baseName, parseShowImage } from '../chat/imageShare';
 import type { BoxInfo } from '../chat/protocol';
@@ -279,6 +279,10 @@ const live = createLiveBubbles({
   colorOf: (id) => (id === 'main' ? 'var(--accent)' : agentColor(agents.get(id)?.color, id)),
   labelOf: (id) => (id === 'main' ? brand() : agents.get(id)?.description || id),
   onOpen: (id, anchor) => openCardPopup(anchor, id, false),
+  chatSpot: (id) => {
+    const card = agentCards.get(id);
+    return card?.isConnected && !card.hidden ? chatSlots.get(card)?.think : undefined;
+  },
 });
 const runBar = h('div', {
   class: 'runbar hidden',
@@ -345,7 +349,16 @@ const sendBtn = h('button', { class: 'go', title: 'Enviar', 'aria-label': 'Envia
 /** Lista de sugestões acima do composer: comandos de barra ("/") e arquivos ("@"). */
 const scPop = h('div', { class: 'sc-pop hidden', role: 'listbox', onmousedown: (e: Event) => e.preventDefault() });
 /** Rodapé fino: contexto à esquerda, barrinhas de 5h e semana à direita. Clique abre os limites de todas as contas. */
-const usageBar = h('div', { class: 'usage-bar', role: 'button', tabindex: '0', onclick: () => openAccountsMenu(usageBar) });
+// A barra ocupa a largura toda: o menu abre acima do ponto clicado, não na ponta esquerda dela.
+const usageBar = h('div', {
+  class: 'usage-bar',
+  role: 'button',
+  tabindex: '0',
+  onclick: (e: Event) => {
+    usageBar.dataset.menuX = (e as MouseEvent).detail ? String((e as MouseEvent).clientX) : '';
+    openAccountsMenu(usageBar);
+  },
+});
 
 const composer = h(
   'footer',
@@ -1250,7 +1263,10 @@ function placeMenu(panel: HTMLElement, anchor: HTMLElement, below: boolean): voi
   panel.style.maxHeight = `${Math.max(140, goUp ? roomAbove : roomBelow)}px`;
   const w = panel.offsetWidth;
   const hh = panel.offsetHeight;
-  const left = Math.min(Math.max(edge, r.left), Math.max(edge, window.innerWidth - edge - w));
+  // Âncora larga com o ponto do clique guardado: o menu centra nele.
+  const clickX = anchor.dataset.menuX ? Number(anchor.dataset.menuX) : NaN;
+  const x = Number.isFinite(clickX) ? clickX - w / 2 : r.left;
+  const left = Math.min(Math.max(edge, x), Math.max(edge, window.innerWidth - edge - w));
   const top = goUp ? Math.max(edge, r.top - gap - hh) : Math.min(r.bottom + gap, Math.max(edge, window.innerHeight - edge - hh));
   panel.style.left = `${Math.round(left)}px`;
   panel.style.top = `${Math.round(top)}px`;
@@ -2035,9 +2051,185 @@ function append(el: HTMLElement, container: HTMLElement = log): void {
   container.append(el);
   if (container === log) {
     slackLog.stamp(el);
+    if (isTurnEdge(el)) {
+      bindTurn(el, true);
+    } else {
+      bindTurn(null, false);
+    }
     scrollDown();
   }
 }
+
+// ---------- Ações presas à fala do orquestrador ----------
+
+/**
+ * No log principal as ações do orquestrador não têm mensagem própria: cada grupo se liga à próxima fala com texto
+ * do mesmo turno (ou à anterior, se o turno acabou sem fala depois) e fica escondido. O clique na fala abre os
+ * detalhes dela, logo abaixo: as listas dos grupos ligados e a estatística do turno. O grupo continua no log, oculto,
+ * marcando o lugar da sequência; só a lista dele muda de casa.
+ */
+interface MsgDetails {
+  /** "2 ações" pequeno e cinza ao lado da hora (ou no canto da fala, sem cabeçalho): abre os detalhes. */
+  tag: HTMLElement;
+  panel: HTMLElement;
+  lists: HTMLElement;
+  stats: HTMLElement;
+  groups: ToolGroupView[];
+  open: boolean;
+}
+const msgDetails = new WeakMap<HTMLElement, MsgDetails>();
+const groupOwner = new WeakMap<ToolGroupView, HTMLElement>();
+/** O chat lateral de consulta não usa o visual do Slack: lá as ações continuam como linha própria. */
+const foldsTurns = () => !state.companion;
+/** Começo e fim de turno: pedido do usuário (ou relatório que chega como pedido) e a estatística do fim. */
+const isTurnEdge = (el: Element) => el.matches('.msg.user, .result');
+/** Fala que pode receber ações: tem texto à vista (não é só o bloco <post>, nem bolha que ainda não pintou). */
+const canOwn = (el: HTMLElement) => el.matches('.msg.assistant:not(.hidden)') && !!rawTexts.get(el)?.trim();
+
+function detailsFor(owner: HTMLElement): MsgDetails {
+  let d = msgDetails.get(owner);
+  if (!d) {
+    const lists = h('div', { class: 'msgd-lists' });
+    const stats = h('div', { class: 'msgd-stats' });
+    const tag = h('button', { class: 'sl-details-tag', type: 'button' });
+    tag.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleDetails(owner);
+    });
+    d = { tag, panel: h('div', { class: 'msg-details' }, lists, stats), lists, stats, groups: [], open: toolsExpanded };
+    msgDetails.set(owner, d);
+  }
+  return d;
+}
+
+/** Repinta os detalhes de uma fala: painel logo abaixo dela, aberto ou fechado, e a marca "N ações". */
+function paintDetails(owner: HTMLElement): void {
+  const d = msgDetails.get(owner);
+  if (!d) {
+    return;
+  }
+  if (!d.groups.length && !d.stats.textContent) {
+    d.panel.remove();
+    d.tag.remove();
+    msgDetails.delete(owner);
+    owner.classList.remove('has-details', 'details-open');
+    return;
+  }
+  d.groups.sort((a, b) => (a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+  const lists = d.groups.map((g) => g.list);
+  if (lists.length !== d.lists.childElementCount || lists.some((l, i) => d.lists.children[i] !== l)) {
+    d.lists.replaceChildren(...lists);
+  }
+  d.stats.hidden = !d.stats.textContent;
+  if (owner.nextElementSibling !== d.panel) {
+    owner.after(d.panel);
+  }
+  d.panel.hidden = !d.open;
+  const label = detailsLabel(d.groups.flatMap((g) => g.model.tools));
+  if (d.tag.textContent !== label) {
+    d.tag.textContent = label;
+  }
+  d.tag.title = d.open ? 'Esconder as ações deste turno' : 'Ver as ações deste turno';
+  d.tag.setAttribute('aria-expanded', String(d.open));
+  // Fala com cabeçalho: ao lado da hora. Continuação: no canto direito da própria fala, sem linha própria.
+  const head = slackLog.headOf(owner);
+  const home = head ?? owner;
+  d.tag.classList.toggle('in-msg', !head);
+  if (d.tag.parentElement !== home) {
+    if (head) {
+      head.append(d.tag);
+    } else {
+      owner.prepend(d.tag);
+    }
+  }
+  owner.classList.add('has-details');
+  owner.classList.toggle('details-open', d.open);
+}
+
+function toggleDetails(owner: HTMLElement): void {
+  const d = msgDetails.get(owner);
+  if (d) {
+    d.open = !d.open;
+    paintDetails(owner);
+  }
+}
+
+/**
+ * Religa as ações de um turno às falas. `end` é o elemento que fecha o turno (pedido seguinte ou estatística); null
+ * é o turno em andamento, no fim do log. Idempotente: roda a cada elemento novo e a cada fala repintada.
+ */
+function bindTurn(end: Element | null, turnOver: boolean): void {
+  if (!foldsTurns()) {
+    return;
+  }
+  const seg: HTMLElement[] = [];
+  for (let el = end ? end.previousElementSibling : log.lastElementChild; el && !isTurnEdge(el); el = el.previousElementSibling) {
+    if (!el.classList.contains('msg-details')) {
+      seg.unshift(el as HTMLElement);
+    }
+  }
+  const parts: TurnPart[] = seg.map((el) => (toolGroups.has(el) ? 'actions' : canOwn(el) ? 'text' : 'other'));
+  const owners = actionOwners(parts, turnOver);
+  const touched = new Set<HTMLElement>();
+  seg.forEach((el, i) => {
+    const g = parts[i] === 'actions' ? toolGroups.get(el) : undefined;
+    if (!g) {
+      return;
+    }
+    const at = owners[i] ?? -1;
+    const owner = at >= 0 ? seg[at] : undefined;
+    const was = groupOwner.get(g);
+    if (was !== owner) {
+      if (was) {
+        const d = msgDetails.get(was);
+        if (d) {
+          d.groups = d.groups.filter((x) => x !== g);
+          touched.add(was);
+        }
+      }
+      if (owner) {
+        detailsFor(owner).groups.push(g);
+        groupOwner.set(g, owner);
+        touched.add(owner);
+      } else {
+        groupOwner.delete(g);
+        g.el.append(g.list);
+      }
+    }
+    // Sem dono só aparece quando o turno acabou sem nenhuma fala; rodando, espera a próxima fala escondido.
+    const hide = !!owner || !turnOver;
+    if (g.el.classList.contains('hidden') !== hide) {
+      g.el.classList.toggle('hidden', hide);
+      slackLog.refresh(g.el);
+    }
+  });
+  // Estatística do turno vai para os detalhes da última fala. Turno que terminou em erro fica à vista.
+  if (end?.matches('.result:not(.error)')) {
+    const last = [...seg].reverse().find(canOwn);
+    if (last) {
+      detailsFor(last).stats.textContent = end.textContent;
+      end.classList.add('hidden');
+      touched.add(last);
+    }
+  }
+  for (const owner of touched) {
+    paintDetails(owner);
+  }
+}
+
+// Clique no texto da fala abre e fecha os detalhes. Link, código, botão e seleção de texto seguem o caminho normal.
+log.addEventListener('click', (e) => {
+  const target = e.target as Element;
+  const msg = target.closest<HTMLElement>('.msg.assistant.has-details');
+  if (!foldsTurns() || !msg || msg.parentElement !== log || target.closest('a, button, pre, code, summary, input, textarea, img, .sl-actions')) {
+    return;
+  }
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && sel.anchorNode && msg.contains(sel.anchorNode)) {
+    return;
+  }
+  toggleDetails(msg);
+});
 
 
 // ---------- Decisões pendentes ----------
@@ -2277,6 +2469,14 @@ function mainMd(el: HTMLElement, text: string): string {
   el.classList.toggle('hidden', !shown.trim());
   rawTexts.set(el, shown);
   slackLog.refresh(el);
+  // O markdown repintado tirou a marca "N ações" de dentro da fala: volta para o lugar.
+  if (msgDetails.has(el)) {
+    paintDetails(el);
+  }
+  // Fala do turno em andamento que ganhou (ou perdeu) texto pode virar a dona das ações dele.
+  if (el.parentElement === log && !el.nextElementSibling?.matches('.msg.user, .result')) {
+    bindTurn(null, false);
+  }
   return shown;
 }
 
@@ -2324,6 +2524,8 @@ function groupFor(container: HTMLElement): ToolGroupView {
   // quem foi ver o agente quer ver o que ele faz, e o grupo continua recolhível.
   const el = h('details', { class: 'tool-group' }, h('summary', {}, dot, icon('tools'), head, tail), list);
   el.open = container === log ? toolsExpanded : true;
+  // No log principal o grupo nasce escondido: bindTurn liga a lista dele à fala do orquestrador.
+  el.classList.toggle('hidden', container === log && foldsTurns());
   const group: ToolGroupView = { el, dot, head, tail, list, model: new FoldGroup(), container };
   toolGroups.set(el, group);
   lastGroup.set(container, group);
@@ -2340,6 +2542,10 @@ function paintGroup(g: ToolGroupView): void {
   g.tail.textContent = label.tail;
   g.el.dataset.state = label.state;
   g.el.querySelector('summary')!.title = `${label.title}. Clique para ${g.el.open ? 'recolher' : 'ver'} as ações.`;
+  const owner = groupOwner.get(g);
+  if (owner) {
+    paintDetails(owner);
+  }
 }
 
 function repaintGroups(): void {
@@ -2355,6 +2561,13 @@ function repaintGroups(): void {
 function applyToolsExpanded(): void {
   for (const el of log.querySelectorAll<HTMLDetailsElement>(':scope > .tool-group')) {
     el.open = toolsExpanded;
+  }
+  for (const el of log.querySelectorAll<HTMLElement>(':scope > .msg.assistant.has-details')) {
+    const d = msgDetails.get(el);
+    if (d) {
+      d.open = toolsExpanded;
+      paintDetails(el);
+    }
   }
 }
 // Um mapa por container: a conversa principal e cada painel de agente renderizam as próprias linhas de ferramenta.
@@ -2772,6 +2985,8 @@ function renderHistory(items: HistoryItem[], container: HTMLElement = log): void
   }
   slackLog.setReplaying(false);
   if (container === log) {
+    // O último turno do histórico já terminou: ações sem fala depois vão para a fala anterior.
+    bindTurn(null, true);
     scrollDown(true);
   }
 }
@@ -3558,11 +3773,13 @@ interface ChatSlot {
   top: HTMLElement;
   line: HTMLElement;
   now: HTMLElement;
+  /** Balão de pensamento ("compilando o projeto"), pintado pelo liveBubbles no lugar da faixa de baixo. */
+  think: HTMLElement;
 }
 const chatSlots = new WeakMap<HTMLElement, ChatSlot>();
 
 /** Linha de baixo: ícone do estado (pontinhos de "digitando" enquanto roda) e a nota. Troca o ícone só quando o estado muda. */
-function paintChatLine(line: HTMLElement, a: AgentInfo): void {
+function paintChatLine(line: HTMLElement, a: AgentInfo, think?: HTMLElement): void {
   const l = chatLine(a);
   const sig = `${l.icon}|${l.tone}`;
   if (line.dataset.sig !== sig) {
@@ -3575,7 +3792,7 @@ function paintChatLine(line: HTMLElement, a: AgentInfo): void {
     } else {
       mark = icon(l.icon);
     }
-    line.replaceChildren(mark, h('span', { class: 'ag-chat-text' }, l.text));
+    line.replaceChildren(mark, think ?? '', h('span', { class: 'ag-chat-text' }, l.text));
     return;
   }
   const text = line.querySelector<HTMLElement>('.ag-chat-text');
@@ -3697,13 +3914,14 @@ function chatSlot(card: HTMLElement, a: AgentInfo): void {
       top: h('div', { class: 'ag-top' }),
       line: h('div', { class: 'ag-line2 ag-chat' }),
       now: h('div', { class: 'ag-now' }),
+      think: h('span', { class: 'ag-think' }),
     };
     chatSlots.set(card, slot);
     card.replaceChildren(slot.av, h('div', { class: 'ag-main' }, slot.top, slot.line, slot.now));
   }
   slot.av.textContent = a.id.slice(0, 3);
   fill(slot.top, ...cardTop(a));
-  paintChatLine(slot.line, a);
+  paintChatLine(slot.line, a, slot.think);
   paintNowLine(slot.now, a);
 }
 
@@ -3716,7 +3934,7 @@ function paintCardActivity(id: string): void {
   const chat = agentCards.get(id);
   const slot = chat ? chatSlots.get(chat) : undefined;
   if (slot) {
-    paintChatLine(slot.line, a);
+    paintChatLine(slot.line, a, slot.think);
     paintNowLine(slot.now, a);
   }
   const text = cardLine(a);
@@ -4277,8 +4495,9 @@ function onAgent(agent: AgentInfo): void {
   if (!agentItems.has(agent.id)) {
     agentItems.set(agent.id, []);
   }
-  // Continuação vive só no mapa: no log principal ela seria o eco de algo que o usuário acabou de pedir.
-  if (agent.kind !== 'fork') {
+  // Continuação, tarefa de shell, subagente nativo, job e busca vivem só no mapa e no popup: no log principal seriam
+  // um cartão a mais entre as falas. Só os agentes do spawn_agent ganham lugar e post.
+  if (showsInChat(agent)) {
     const card = agentCards.get(agent.id);
     if (card) {
       agentCard(agent, true, card);
@@ -4288,6 +4507,8 @@ function onAgent(agent: AgentInfo): void {
       append(made);
     }
   }
+  // O lugar no chat pode ter entrado agora: o balão sai da faixa e vai para ele.
+  live.refresh();
   renderAgents();
   if (detailId === agent.id) {
     renderDetailHeader();

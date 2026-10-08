@@ -3,7 +3,7 @@
  *   npx esbuild src/webview/toolFold.test.ts --bundle --platform=node --outfile=$TEMP/toolFold.test.js && node $TEMP/toolFold.test.js
  */
 import * as assert from 'node:assert/strict';
-import { FoldGroup, FoldTool, countLabel, foldLabel, groupState, isAgentSpawn, isFoldable, uniqueLabels } from './toolFold';
+import { FoldGroup, FoldTool, TurnPart, actionOwners, countLabel, detailsLabel, foldLabel, foldsIntoMessage, groupState, isAgentSpawn, isFoldable, uniqueLabels } from './toolFold';
 
 let failed = 0;
 function test(name: string, fn: () => void): void {
@@ -108,6 +108,46 @@ test('FoldGroup: start é idempotente, describe e finish mudam o estado', () => 
   assert.equal(g.label(show).title, '2 ações · 1 com erro · Bash, Read');
   g.finish('nao-existe', true);
   assert.equal(g.size, 2);
+});
+
+const parts = (s: string): TurnPart[] => s.split(' ').map((w) => (w === 'T' ? 'text' : w === 'A' ? 'actions' : 'other'));
+
+test('ações se ligam à próxima fala com texto do turno', () => {
+  // Bash antes de escrever: o bloco vai para a fala logo abaixo, não ganha mensagem própria.
+  assert.deepEqual(actionOwners(parts('A T'), false), [1, undefined]);
+  assert.deepEqual(actionOwners(parts('A A o T A T'), true), [3, 3, undefined, undefined, 5, undefined]);
+});
+
+test('turno rodando: ações depois da última fala esperam a próxima (sem dono)', () => {
+  assert.deepEqual(actionOwners(parts('T A'), false), [undefined, -1]);
+});
+
+test('turno acabou sem fala depois: as ações vão para a fala anterior', () => {
+  assert.deepEqual(actionOwners(parts('T A o A'), true), [undefined, 0, undefined, 0]);
+});
+
+test('turno sem nenhuma fala: o bloco fica sem dono (e à vista)', () => {
+  assert.deepEqual(actionOwners(parts('A o A'), true), [-1, undefined, -1]);
+  assert.deepEqual(actionOwners([], true), []);
+});
+
+test('ficam sempre à vista: pergunta, plano, imagens, permissão, avisos e turno com erro', () => {
+  assert.equal(foldsIntoMessage({ kind: 'tool', name: 'Bash' }), true);
+  assert.equal(foldsIntoMessage({ kind: 'tool', name: 'Read' }), true);
+  assert.equal(foldsIntoMessage({ kind: 'result', isError: false }), true);
+  for (const name of ['AskUserQuestion', 'ExitPlanMode', 'mcp__agents__web_research', 'mcp__agents__generate_image', 'mcp__agents__show_image']) {
+    assert.equal(foldsIntoMessage({ kind: 'tool', name }), false, name);
+  }
+  assert.equal(foldsIntoMessage({ kind: 'result', isError: true }), false);
+  assert.equal(foldsIntoMessage({ kind: 'permission' }), false);
+  assert.equal(foldsIntoMessage({ kind: 'image' }), false);
+  assert.equal(foldsIntoMessage({ kind: 'notice', level: 'error' }), false);
+});
+
+test('marca de detalhes: contagem, erros, ou só "detalhes"', () => {
+  assert.equal(detailsLabel([tool('Bash'), tool('Read')]), '2 ações');
+  assert.equal(detailsLabel([tool('Bash', 'failed'), tool('Read')]), '2 ações · 1 com erro');
+  assert.equal(detailsLabel([]), 'detalhes');
 });
 
 if (failed) {

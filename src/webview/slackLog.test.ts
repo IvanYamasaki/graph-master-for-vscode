@@ -3,7 +3,7 @@
  *   npx esbuild src/webview/slackLog.test.ts --bundle --platform=node --outfile=$TEMP/slackLog.test.js && node $TEMP/slackLog.test.js
  */
 import * as assert from 'node:assert/strict';
-import { GROUP_MS, authorOf, continuesRun, dayLabel } from './slackLog';
+import { GROUP_MS, authorOf, continuesRun, dayLabel, showsInChat } from './slackLog';
 
 let failed = 0;
 function test(name: string, fn: () => void): void {
@@ -46,6 +46,16 @@ test('divisor de dia: Hoje, Ontem e a data por extenso', () => {
   assert.equal(dayLabel(T, T + 60_000), 'Hoje');
   assert.equal(dayLabel(new Date(2026, 9, 7, 23, 59).getTime(), T), 'Ontem');
   assert.match(dayLabel(new Date(2026, 9, 1, 12, 0).getTime(), T), /outubro/);
+});
+
+test('só agente do spawn_agent tem lugar no chat; tarefa de shell e subagente nativo ficam no mapa', () => {
+  assert.equal(showsInChat({ kind: 'routed' }), true);
+  assert.equal(showsInChat({ kind: 'subagent', taskType: 'local_bash' }), false);
+  assert.equal(showsInChat({ kind: 'subagent', taskType: 'local_agent' }), false);
+  assert.equal(showsInChat({ kind: 'subagent' }), false);
+  assert.equal(showsInChat({ kind: 'fork' }), false);
+  assert.equal(showsInChat({ kind: 'routed', infra: { kind: 'job' } as never }), false);
+  assert.equal(showsInChat({ kind: 'routed', search: {} as never }), false);
 });
 
 if (failed) {

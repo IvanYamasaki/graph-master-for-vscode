@@ -395,3 +395,16 @@ export function agentNow(items: readonly NowItem[], lastTool: string | undefined
   }
   return { tag: 'começando', name: '', sum: '' };
 }
+
+/**
+ * Quem aparece na faixa de baixo e quem no próprio lugar do chat. Agente com lugar visível no log (o post que roda)
+ * mostra o balão lá; a faixa fica com o chat principal e com quem não tem lugar no log. Faixa vazia some.
+ */
+export function splitTray(ids: readonly string[], inChat: (id: string) => boolean): { tray: string[]; chat: string[] } {
+  const tray: string[] = [];
+  const chat: string[] = [];
+  for (const id of ids) {
+    (inChat(id) ? chat : tray).push(id);
+  }
+  return { tray, chat };
+}

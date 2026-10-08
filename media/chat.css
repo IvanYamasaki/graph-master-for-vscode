@@ -3979,6 +3979,71 @@ button.empty-ex:focus-visible {
   background: color-mix(in srgb, var(--vscode-foreground) 6%, transparent);
 }
 
+/* Detalhes da fala (ações e estatística do turno): escondidos até o clique no texto, logo abaixo dele. */
+.log.slack > .msg.assistant.has-details {
+  cursor: pointer;
+}
+
+.log.slack > .msg.assistant.has-details :is(a, pre, code) {
+  cursor: auto;
+}
+
+.log.slack > .msg-details {
+  margin: 2px 0 4px var(--sl-gutter);
+  font-size: 0.92em;
+}
+
+.msg-details .tg-list {
+  margin: 0 0 2px 2px;
+}
+
+.msgd-stats {
+  margin: 2px 0 0 2px;
+  font-size: 0.78em;
+  color: var(--muted);
+}
+
+/* Marca "2 ações": pequena e cinza ao lado da hora; na continuação, no canto direito da fala. */
+.sl-details-tag {
+  align-self: center;
+  padding: 0 5px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.75em;
+  cursor: pointer;
+}
+
+.sl-details-tag:hover,
+.msg.assistant.details-open .sl-details-tag,
+.sl-head:has(+ .msg.assistant.details-open) .sl-details-tag {
+  color: var(--fg, var(--vscode-foreground));
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+}
+
+.sl-details-tag.in-msg {
+  float: right;
+  margin: 1px 0 0 8px;
+}
+
+/* Pensamento do agente no próprio post, no lugar dos pontinhos de digitando. */
+.ag-chat .ag-think:empty {
+  display: none;
+}
+
+.ag-chat .ag-think {
+  --lb-color: var(--agm-color);
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+}
+
+.ag-chat:has(.ag-think:not(:empty)) .lb-typing {
+  display: none;
+}
+
 /* Estatística do turno: pequena e cinza, mais visível no hover. */
 .log.slack > .result {
   text-align: left;
