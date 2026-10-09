@@ -20,7 +20,8 @@ import { handleImageMessage } from './imageFiles';
 import { probeBrowsers } from './browserProbe';
 import { resolveClaudeExecutable } from '../claudePath';
 import { CompanionLink, CompanionPanel } from './companion/panel';
-import { AgentThreads } from './threadHost';
+import { ChatThreads } from './threadHost';
+import { parseThreadMessage, splitBlocks } from './threadModel';
 import { FolderThreadStore } from './threadStore';
 import { RECONCILE_EVERY_MS } from './taskLiveness';
 import { StampedKill, killSnapshot, killSummary, orphanDetail, scanOrphans, snapFromView } from './taskProcs';
@@ -105,8 +106,8 @@ export class ChatPanel {
   /** Claude ou Codex, conforme o fornecedor da conta. As duas têm a mesma superfície. */
   readonly session: AnySession;
   private readonly hub: AgentHub;
-  /** Posts dos agentes (um por relatório entregue) e a thread de cada um, dentro deste chat. */
-  private readonly threads: AgentThreads;
+  /** Posts dos agentes (um por relatório entregue) e as threads de qualquer mensagem deste chat. */
+  private readonly threads: ChatThreads;
   private ready = false;
   private usageTimer?: ReturnType<typeof setInterval>;
   private usageInFlight = false;
@@ -244,13 +245,13 @@ export class ChatPanel {
         }
       }, RECONCILE_EVERY_MS);
     }
-    this.threads = new AgentThreads({
-      profile: () => this.link().profile,
-      cwd,
+    this.threads = new ChatThreads({
       persistence: new FolderThreadStore(cwd),
       mainSessionId: () => this.session.sessionId,
-      source: () => this.companionSource(),
+      agents: () => this.companionSource().agents().map((a) => a.info),
       post: (msg) => this.post(msg),
+      // Mensagem de thread vai ao orquestrador como a do composer, com as novidades do cérebro na frente.
+      toMain: (text) => void this.session.send(this.hub.brain.withNews(MAIN_ID, text)),
       startPaused: !!options.resumeId,
     });
     this.files = FileIndex.acquire(cwd);
@@ -298,7 +299,8 @@ export class ChatPanel {
         this.hub.noteMainTurnStart();
       }
     };
-    this.session.onTurnEnd = (turn) => this.hub.onMainTurnEnd(this.session.lastTurnText, turn.queued);
+    // Sem os blocos <post> e <thread>: o que vai ao agente que perguntou é o texto do chat.
+    this.session.onTurnEnd = (turn) => this.hub.onMainTurnEnd(splitBlocks(this.session.lastTurnText).text, turn.queued);
     if (options.fork) {
       const { parent, forkId } = options.fork;
       const ownBusy = this.session.onBusyChange;
@@ -336,11 +338,14 @@ export class ChatPanel {
       this.outbox.push(msg);
     }
     // Depois da mensagem do agente: relatório novo vira post. Texto completo do orquestrador: os blocos <post>
-    // viram o texto do post do agente (o webview tira os blocos do que mostra).
+    // viram o texto do post do agente e os <thread>, respostas nas threads (o webview tira os blocos do que mostra).
+    // Orquestrador parado: nenhuma thread espera mais resposta.
     if (msg.type === 'agent') {
       this.threads?.noteAgent(msg.agent);
     } else if (msg.type === 'assistantText') {
-      this.threads?.takeSummaries(msg.text);
+      this.threads?.takeText(msg.text);
+    } else if (msg.type === 'busy' && !msg.value) {
+      this.threads?.mainIdle();
     }
   }
 
@@ -373,11 +378,20 @@ export class ChatPanel {
         // /remote-control (ou /rc) digitado no chat liga e desliga, como na extensão oficial; o CLI não o trata fora do terminal.
         if (/^\/(remote-control|rc)\s*$/i.test(msg.text.trim()) && this.session instanceof ChatSession && !msg.attachments?.length) {
           const s = this.session;
+          if (msg.clientId) {
+            this.post({ type: 'userId', clientId: msg.clientId });
+          }
           await this.setRemoteControl(!(s.remote.mayReceive || s.remote.state.status === 'connected'));
           return;
         }
-        // Novidades do cérebro guardadas para o orquestrador vão na frente da mensagem (sem abrir turno à parte).
-        this.session.send(this.hub.brain.withNews(MAIN_ID, msg.text), msg.attachments);
+        {
+          // Novidades do cérebro guardadas para o orquestrador vão na frente da mensagem (sem abrir turno à parte).
+          const uuid = this.session.send(this.hub.brain.withNews(MAIN_ID, msg.text), msg.attachments);
+          // O uuid é o id da mensagem no transcrito: a bolha dela ganha thread que sobrevive ao recarregar.
+          if (msg.clientId) {
+            this.post({ type: 'userId', clientId: msg.clientId, id: typeof uuid === 'string' ? uuid : undefined });
+          }
+        }
         return;
       case 'resolveUris':
         await this.resolveUris(msg.uris);
@@ -389,8 +403,6 @@ export class ChatPanel {
         const { requestId, type: _type, ...answer } = msg;
         if (this.hub.ownsPermission(requestId)) {
           this.hub.respondPermission(requestId, answer);
-        } else if (this.threads.ownsPermission(requestId)) {
-          this.threads.respondPermission(requestId, answer);
         } else {
           this.session.respondPermission(requestId, answer);
         }
@@ -457,10 +469,7 @@ export class ChatPanel {
         this.hub.sendFromUser(msg.id, msg.text);
         return;
       case 'threadSend':
-        this.threads.send(msg.postId, msg.text);
-        return;
-      case 'threadInterrupt':
-        await this.threads.interrupt(msg.postId);
+        this.threads.send(msg.threadId, msg.text, msg.parent);
         return;
       case 'agentSetModel':
         await this.hub.setModel(msg.id, msg.value);
@@ -587,8 +596,8 @@ export class ChatPanel {
       this.postMapLayout(this.options.resumeId);
     }
     if (this.options.seed) {
-      this.post({ type: 'userEcho', text: this.options.seed.display });
-      this.session.send(this.options.seed.prompt);
+      const uuid = this.session.send(this.options.seed.prompt);
+      this.post({ type: 'userEcho', text: this.options.seed.display, msgId: typeof uuid === 'string' ? uuid : undefined });
     }
     this.startUsagePolling();
     // Remote Control ao abrir o chat só com a configuração ligada; em bypass passa pela mesma confirmação do interruptor.
@@ -961,8 +970,6 @@ export class ChatPanel {
     }
     this.hub.pinOwnAccount();
     this.hub.flush();
-    // As sessões das threads são da conta que sai: a aba nova começa sessões novas na outra conta.
-    this.threads.resetSessions();
     const env = this.env;
     const options: ChatOptions = { resumeId: sessionId, model: session.model, effort: session.effort, permissionMode: session.permissionMode, viewColumn: this.panel.viewColumn };
     // Fecha esta aba antes: o navegador e o Remote Control ficam livres para a aba nova.
@@ -1055,8 +1062,8 @@ export class ChatPanel {
     void this.refreshTitle(sessionId);
   }
 
-  /** Manda o histórico ao webview e devolve os textos do orquestrador (os blocos <post> deles completam os posts). */
-  private async loadHistory(sessionId: string): Promise<string[]> {
+  /** Manda o histórico ao webview e devolve os itens (os blocos <post> e <thread> deles completam posts e threads). */
+  private async loadHistory(sessionId: string): Promise<HistoryItem[]> {
     let items: HistoryItem[];
     try {
       items =
@@ -1069,7 +1076,7 @@ export class ChatPanel {
       return [];
     }
     this.post({ type: 'history', items, title: '' });
-    return items.flatMap((i) => (i.kind === 'text' ? [i.text] : []));
+    return items;
   }
 
   // ---------- Subagentes ----------
@@ -1238,8 +1245,8 @@ export class ChatPanel {
 
   /** "Enviar ao principal" do chat lateral: entra como mensagem do usuário, marcada como vinda da consulta. */
   private receiveFromCompanion(text: string): void {
-    this.post({ type: 'userEcho', text, origin: 'companion' });
-    this.session.send(`${COMPANION_MARK}\n\n${text}`);
+    const uuid = this.session.send(`${COMPANION_MARK}\n\n${text}`);
+    this.post({ type: 'userEcho', text, origin: 'companion', msgId: typeof uuid === 'string' ? uuid : undefined });
   }
 
   private sendToParent(): void {
@@ -1449,7 +1456,9 @@ function toMainMessages(items: HistoryItem[]): MainMessage[] {
   for (const item of items) {
     if (item.kind === 'user') {
       const report = REPORT_HEAD.exec(item.text);
-      out.push(report ? { from: 'report', label: `agente ${report[2] ?? report[3]}`, text: item.text } : { from: 'user', text: item.text });
+      // Mensagem de thread: o que o usuário escreveu, sem o embrulho.
+      const thread = report ? undefined : parseThreadMessage(item.text);
+      out.push(report ? { from: 'report', label: `agente ${report[2] ?? report[3]}`, text: item.text } : { from: 'user', text: thread ? `(numa thread) ${thread.text}` : item.text });
     } else if (item.kind === 'text' && item.text.trim()) {
       const prev = out.at(-1);
       if (prev?.from === 'assistant') {
@@ -1468,21 +1477,24 @@ function toHistory(messages: SessionMessage[]): HistoryItem[] {
     if (m.parent_tool_use_id || m.type === 'system') {
       continue;
     }
-    const content = (m.message as { content?: string | RawBlock[] } | undefined)?.content;
+    const message = m.message as { content?: string | RawBlock[]; id?: string } | undefined;
+    const content = message?.content;
+    // Id da thread de cada mensagem: o uuid na do usuário, o id da mensagem da API na do orquestrador.
+    const id = m.type === 'assistant' ? (typeof message?.id === 'string' ? message.id : undefined) : m.uuid || undefined;
     if (typeof content === 'string') {
       if (m.type === 'user' && !isInternalPrompt(content)) {
-        items.push({ kind: 'user', text: content });
+        items.push({ kind: 'user', text: content, id });
       } else if (m.type === 'assistant') {
-        items.push({ kind: 'text', text: content });
+        items.push({ kind: 'text', text: content, id });
       }
       continue;
     }
     for (const block of content ?? []) {
       if (block.type === 'text' && block.text) {
         if (m.type === 'assistant') {
-          items.push({ kind: 'text', text: block.text });
+          items.push({ kind: 'text', text: block.text, id });
         } else if (!isInternalPrompt(block.text)) {
-          items.push({ kind: 'user', text: block.text });
+          items.push({ kind: 'user', text: block.text, id });
         }
       } else if (block.type === 'tool_use') {
         items.push({ kind: 'tool', id: block.id ?? '', name: block.name ?? '', input: block.input });

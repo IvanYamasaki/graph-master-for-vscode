@@ -2,7 +2,7 @@
   "name": "agent-graph-master",
   "displayName": "Agent Graph Master",
   "description": "Contas do Claude Code e do Codex, chat próprio por conta e mapa de agentes com roteamento de relatórios.",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "publisher": "local",
   "license": "MIT",
   "engines": {

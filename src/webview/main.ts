@@ -19,9 +19,11 @@ import type { TaskProcs } from '../chat/protocol';
 import { createOrphansView } from './orphansUi';
 import { createLiveBubbles, typingDots } from './liveBubbles';
 import { agentNow } from './liveLogic';
+import { LiveTexts } from './liveText';
 import { createThreadUi } from './threadUi';
 import { createSlackLog, showsInChat } from './slackLog';
-import { splitPostBlocks, type AgentPost } from '../chat/threadModel';
+import { freshSurge, step as refireStep, type SurgeState } from './refireFold';
+import { claudeThreadId, excerpt, parseThreadMessage, splitBlocks, userThreadId, type AgentPost, type ThreadBlock } from '../chat/threadModel';
 import { FoldGroup, actionOwners, detailsLabel, isAgentSpawn, isFoldable, type TurnPart } from './toolFold';
 import { closeImageViewer, imageGrid, openImageViewer, setImageViewerActions, type ViewerItem } from './imageViewer';
 import { SHOW_IMAGE_TOOL, baseName, parseShowImage } from '../chat/imageShare';
@@ -227,13 +229,98 @@ const forkBanner = h('div', { class: 'fork-banner hidden' });
 const log = h('main', { class: 'log' });
 /** Texto cru das falas do orquestrador no log principal, para o "Copiar" da barra de ações. */
 const rawTexts = new WeakMap<HTMLElement, string>();
+/** Fala do Claude ou mensagem do usuário com id de thread estável, pelo id ("c:...", "u:..."). */
+const threadEls = new Map<string, HTMLElement>();
+/** Blocos de texto com algo escrito já vistos por mensagem da API: o segundo da mesma mensagem ganha ".1" no id. */
+const textOrdinals = new Map<string, number>();
+/** Bolhas do composer esperando o uuid que o host devolve (userId), pela marca que foi junto no `send`. */
+const awaitingIds = new Map<string, HTMLElement>();
+let clientSeq = 0;
+
 
 /** Log principal como canal do Slack: cabeçalho por sequência de mensagens do mesmo autor, hora e barra de ações. */
 const slackLog = createSlackLog({
   log,
   brand,
   rawText: (el) => rawTexts.get(el) ?? el.querySelector('.plain')?.textContent ?? el.textContent ?? '',
+  onReply: (el) => el.dataset.thread && threadUi.open(el.dataset.thread),
 });
+
+// ---------- Dobra de re-disparos vazios do Claude ----------
+// Um Stop hook de sessão (o /goal do Claude Code) re-dispara o Claude a cada fim de turno até uma condição fechar.
+// Quando ela não fecha, ele responde falas curtas e repetidas ("nada a acrescentar", "nothing further"). A primeira
+// fala de verdade e a primeira fala vazia aparecem normais; da segunda vazia seguida em diante elas somem dentro de
+// uma linha discreta "Claude não tinha nada a acrescentar · N vezes", que abre no clique e mostra cada fala dobrada.
+let refireEnabled = false;
+let surge: SurgeState = freshSurge();
+let foldLine: { el: HTMLElement; list: HTMLElement; label: HTMLElement; count: number } | undefined;
+
+function foldLabel(n: number): string {
+  return `${brand()} não tinha nada a acrescentar · ${n} ${n === 1 ? 'vez' : 'vezes'}`;
+}
+
+function makeFoldLine(): NonNullable<typeof foldLine> {
+  const list = h('div', { class: 'refire-list', hidden: true });
+  const label = h('span', { class: 'refire-label' });
+  const chevron = icon('chevron-right');
+  const head = h('button', { class: 'refire-head', type: 'button', 'aria-expanded': 'false', title: 'Ver as falas repetidas' }, chevron, label);
+  const el = h('div', { class: 'refire-fold' }, head, list);
+  head.addEventListener('click', () => {
+    const open = list.hidden;
+    list.hidden = !open;
+    head.setAttribute('aria-expanded', String(open));
+    el.classList.toggle('open', open);
+    chevron.className = `codicon codicon-chevron-${open ? 'down' : 'right'}`;
+  });
+  return { el, list, label, count: 0 };
+}
+
+/** Põe uma fala dobrada dentro da linha recolhida (com a hora, ao vivo) e atualiza o contador no lugar. */
+function pushFolded(line: NonNullable<typeof foldLine>, speech: HTMLElement, at: number | undefined): void {
+  line.count++;
+  const item = h('div', { class: 'refire-item' });
+  if (at !== undefined) {
+    item.append(h('span', { class: 'refire-time' }, new Date(at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })));
+  }
+  // A fala já veio com o Markdown pintado: entra como está, sem cabeçalho de autor nem thread.
+  speech.classList.add('refire-folded');
+  item.append(speech);
+  line.list.append(item);
+  line.label.textContent = foldLabel(line.count);
+}
+
+/**
+ * Decide se esta fala do Claude some dentro da linha recolhida. Devolve true quando dobrou (quem chamou não a mostra
+ * nem lhe dá thread). Falas escondidas (só post) e "respondeu numa thread" não entram: encerram o surto.
+ */
+function foldClaude(el: HTMLElement, text: string, at: number | undefined): boolean {
+  if (!refireEnabled || el.classList.contains('hidden') || el.classList.contains('thread-note')) {
+    breakSurge();
+    return false;
+  }
+  const r = refireStep(surge, text);
+  surge = r.state;
+  if (!r.fold) {
+    // Fala com novidade (ou a primeira vazia): aparece e fecha a linha recolhida atual; a próxima vazia abre outra.
+    foldLine = undefined;
+    return false;
+  }
+  if (!foldLine) {
+    foldLine = makeFoldLine();
+    append(foldLine.el);
+  }
+  // No streaming a bolha já pode estar no log: tira de lá antes de dobrar.
+  el.remove();
+  pushFolded(foldLine, el, at);
+  scrollDown();
+  return true;
+}
+
+/** Input do usuário, permissão, pergunta, post de agente, erro ou thread encerram o surto de re-disparos. */
+function breakSurge(): void {
+  surge = freshSurge();
+  foldLine = undefined;
+}
 /** Pedidos de exemplo do chat novo: o clique só preenche a caixa, para o usuário ajustar antes de enviar. */
 const EXAMPLES: [string, string][] = [
   ['beaker', 'Registre a hipótese: warmup de 5 épocas melhora val_acc no CIFAR-100. Rode 5 seeds por braço e declare o veredito.'],
@@ -378,19 +465,21 @@ const menuLayer = h('div', { class: 'menu-layer hidden' });
 const overlay = h('div', { class: 'overlay hidden' });
 document.getElementById('app')!.append(top, forkBanner, log, activity, live.el, runBar, composer, dropZone, menuLayer, overlay);
 
-/** Posts dos agentes no log e a thread de cada post, no painel à direita. */
+/** Posts dos agentes no log e as threads de qualquer mensagem, no painel à direita. */
 const threadUi = createThreadUi({
   send,
   agent: (id) => agents.get(id),
-  paintAgent,
   colorOf: (id) => agentColor(agents.get(id)?.color, id),
   md,
   statusLabel: (a) => [statusLabel(a.status), agentMeta(a)].filter(Boolean).join(' · '),
+  brand,
   suggest: suggestFor,
   openImage: (src, caption) => openImageViewer([{ src, caption: caption || undefined }], 0),
   openAgent: (anchor, id) => openCardPopup(anchor, id, false),
+  parentOf: threadParentOf,
   onPost: placePost,
   onPosts: placeAllPosts,
+  onThread: (id) => (id ? paintThreadFoot(threadEls.get(id)) : threadEls.forEach((el) => paintThreadFoot(el))),
 });
 document.getElementById('app')!.append(threadUi.drawer);
 // Botões do visualizador de imagens que precisam do host. "Abrir" só com caminho absoluto; salvar copia o arquivo ou grava o data URL.
@@ -923,8 +1012,13 @@ function submit(): void {
   input.value = '';
   autosize(input);
   closeSuggest();
-  addUser(text, undefined, log, atts);
-  send({ type: 'send', text, attachments: atts.length ? atts : undefined });
+  const bubble = addUser(text, undefined, log, atts);
+  // O host responde com o uuid da mensagem (userId): é o id da thread desta bolha.
+  const clientId = `m${++clientSeq}`;
+  if (bubble) {
+    awaitingIds.set(clientId, bubble);
+  }
+  send({ type: 'send', text, attachments: atts.length ? atts : undefined, clientId });
 }
 
 // ---------- Anexos ----------
@@ -2320,7 +2414,12 @@ const guardCards = createGuardCards({
   onPending: (id, el, label, detail, agentId) => setPending(`guard:${id}`, el ? { el, label, detail, icon: 'warning', agentId } : null),
 });
 
-function addUser(text: string, from?: string, container: HTMLElement = log, atts: Attachment[] = [], fromId?: string, origin?: 'companion' | 'remote'): void {
+/** Põe a mensagem no log. Devolve a bolha da mensagem do usuário (relatório de agente não tem). */
+function addUser(text: string, from?: string, container: HTMLElement = log, atts: Attachment[] = [], fromId?: string, origin?: 'companion' | 'remote'): HTMLElement | undefined {
+  // Input do usuário ou relatório de agente entre as falas encerra o surto de re-disparos.
+  if (container === log) {
+    breakSurge();
+  }
   // No histórico, a mensagem do "Enviar ao principal" chega com a marca na primeira linha.
   if (!from && text.startsWith(COMPANION_MARK)) {
     text = text.slice(COMPANION_MARK.length).trim();
@@ -2328,7 +2427,7 @@ function addUser(text: string, from?: string, container: HTMLElement = log, atts
   }
   // Relatório de um agente que já tem lugar ou post no chat: o post mostra o texto e guarda o relatório inteiro.
   if (from && fromId && container === log && (agentCards.has(fromId) || threadUi.hasPosts(fromId))) {
-    return;
+    return undefined;
   }
   // Relatório entregue por um agente: uma linha só, que abre quando o usuário quer ler.
   if (from) {
@@ -2377,7 +2476,7 @@ function addUser(text: string, from?: string, container: HTMLElement = log, atts
       }
       scrollDown(true);
     }
-    return;
+    return undefined;
   }
   const bubble = h('div', { class: 'msg user' });
   if (origin === 'companion') {
@@ -2412,63 +2511,142 @@ function addUser(text: string, from?: string, container: HTMLElement = log, atts
   if (container === log) {
     scrollDown(true);
   }
+  return bubble;
 }
 
-// Blocos de texto em streaming: chave msgId:index. O texto final (assistantText) substitui o parcial.
-const liveBlocks = new Map<string, { el: HTMLElement; text: string; msgId: string; final: boolean }>();
+// ---------- Threads das mensagens do log ----------
+
+/**
+ * Id da thread de um bloco de texto do orquestrador. Conta todo bloco com texto, mostrado ou não, igual ao vivo e
+ * no histórico: a ordem dos blocos da mesma mensagem é a mesma nos dois.
+ */
+function claudeIdFor(msgId: string, text: string): string | undefined {
+  if (!msgId || !text.trim()) {
+    return undefined;
+  }
+  const n = textOrdinals.get(msgId) ?? 0;
+  textOrdinals.set(msgId, n + 1);
+  return claudeThreadId(msgId, n);
+}
+
+/** A mensagem do log passa a ter thread: "Responder em thread" no hover e o rodapé, se já houver respostas. */
+function markThread(el: HTMLElement, id: string | undefined, at?: number): void {
+  if (!id || state.companion || el.parentElement !== log || threadEls.has(id)) {
+    return;
+  }
+  el.dataset.thread = id;
+  if (at) {
+    el.dataset.at = String(at);
+  }
+  threadEls.set(id, el);
+  paintThreadFoot(el);
+}
+
+/** Rodapé "3 respostas · Última resposta..." dentro da mensagem, no fim. O Markdown repintado o tira: volta aqui. */
+function paintThreadFoot(el: HTMLElement | undefined): void {
+  if (!el?.dataset.thread) {
+    return;
+  }
+  el.querySelector(':scope > .thread-foot')?.remove();
+  const foot = threadUi.footerFor(el.dataset.thread);
+  if (foot) {
+    el.append(foot);
+  }
+}
+
+/** Mãe de uma thread nova: o texto da fala ou da mensagem do usuário, como está na tela. */
+function threadParentOf(id: string): { text: string; at?: number } | undefined {
+  const el = threadEls.get(id);
+  if (!el?.isConnected) {
+    return undefined;
+  }
+  const text = rawTexts.get(el) ?? el.querySelector('.plain')?.textContent ?? '';
+  return { text: excerpt(text), at: Number(el.dataset.at) || undefined };
+}
+
+// Blocos de texto em streaming: chave msgId:index. O texto final (assistantText) substitui o parcial; resposta refeita
+// depois de um stream que caiu assume a bolha cortada (liveText.ts).
+const liveBlocks = new LiveTexts<HTMLElement>(
+  () => h('div', { class: 'msg assistant md' }),
+  () => state.provider !== 'codex',
+);
 let renderQueued = new Set<string>();
 
 function onTextDelta(msgId: string, index: number, text: string): void {
-  const key = `${msgId}:${index}`;
-  let block = liveBlocks.get(key);
-  if (!block) {
-    block = { el: h('div', { class: 'msg assistant md' }), text: '', msgId, final: false };
-    liveBlocks.set(key, block);
+  const { key, block, created } = liveBlocks.delta(msgId, index, text);
+  if (created) {
     append(block.el);
   }
-  block.text += text;
   renderQueued.add(key);
   if (renderQueued.size === 1) {
     requestAnimationFrame(() => {
-      for (const k of renderQueued) {
+      // Esvazia antes de pintar: um erro no meio não pode travar a pintura dos próximos deltas.
+      const keys = renderQueued;
+      renderQueued = new Set();
+      for (const k of keys) {
         const b = liveBlocks.get(k);
         if (b && !b.final) {
           mainMd(b.el, b.text);
         }
       }
-      renderQueued = new Set();
       scrollDown();
     });
   }
 }
 
 function onAssistantText(msgId: string, text: string): void {
-  for (const block of liveBlocks.values()) {
-    if (block.msgId === msgId && !block.final) {
-      block.final = true;
-      companionUi?.markRaw(block.el, mainMd(block.el, text));
-      scrollDown();
+  const id = claudeIdFor(msgId, text);
+  const block = liveBlocks.final(msgId);
+  if (block) {
+    // Fora do ?.: no chat principal companionUi não existe, e `a?.f(g())` nem avalia g().
+    const shown = mainMd(block.el, text);
+    companionUi?.markRaw(block.el, shown);
+    if (foldClaude(block.el, text, Date.now())) {
       return;
     }
+    markClaude(block.el, id, Date.now());
+    scrollDown();
+    return;
   }
   if (!text.trim()) {
     return;
   }
   const el = h('div', { class: 'msg assistant md' });
-  companionUi?.markRaw(el, mainMd(el, text));
+  const shown = mainMd(el, text);
+  companionUi?.markRaw(el, shown);
   append(el);
+  if (foldClaude(el, text, Date.now())) {
+    return;
+  }
+  markClaude(el, id, Date.now());
+}
+
+/** Fala com texto à vista ganha thread; a linha "respondeu numa thread" e a fala escondida, não. */
+function markClaude(el: HTMLElement, id: string | undefined, at?: number): void {
+  if (!el.classList.contains('hidden') && !el.classList.contains('thread-note')) {
+    markThread(el, id, at);
+  }
 }
 
 /**
- * Texto do orquestrador sem os blocos <post agent="aN"> (o host põe o conteúdo no post do agente). Em streaming o
- * bloco pela metade também some. Fala que era só o bloco esconde a bolha. Devolve o texto mostrado.
+ * Texto do orquestrador sem os blocos <post agent="aN"> e <thread id="..."> (o host põe o conteúdo no post do agente
+ * e na thread). Em streaming o bloco pela metade também some. Fala que era só o bloco <post> esconde a bolha; fala que
+ * só respondeu em thread vira uma linha discreta que abre a thread. Devolve o texto mostrado.
  */
 function mainMd(el: HTMLElement, text: string): string {
-  const shown = state.companion ? text : splitPostBlocks(text).text;
-  md(el, shown);
+  const split = state.companion ? undefined : splitBlocks(text);
+  let shown = split ? split.text : text;
+  const onlyThreads = !shown.trim() && !!split?.threads.length;
+  el.classList.toggle('thread-note', onlyThreads);
+  if (onlyThreads) {
+    shown = threadNote(el, split!.threads);
+  } else {
+    md(el, shown);
+  }
   el.classList.toggle('hidden', !shown.trim());
   rawTexts.set(el, shown);
   slackLog.refresh(el);
+  paintThreadFoot(el);
   // O markdown repintado tirou a marca "N ações" de dentro da fala: volta para o lugar.
   if (msgDetails.has(el)) {
     paintDetails(el);
@@ -2478,6 +2656,39 @@ function mainMd(el: HTMLElement, text: string): string {
     bindTurn(null, false);
   }
   return shown;
+}
+
+/**
+ * Turno que só respondeu em thread: no lugar da fala, uma linha por thread, "Claude respondeu numa thread: ...", que
+ * abre a thread. As ações do turno continuam nos detalhes dela. Devolve o texto da linha (o do "Copiar").
+ */
+function threadNote(el: HTMLElement, blocks: ThreadBlock[]): string {
+  const lines = blocks.map((b) => {
+    const who = b.as ? agents.get(b.as)?.description || `Agente ${b.as}` : brand();
+    const label = `${who} respondeu numa thread: `;
+    const snippet = excerpt(b.text, 140);
+    // Resolve no clique: a thread que o Claude abriu por conta própria chega do host logo depois deste texto.
+    const line = h(
+      'button',
+      {
+        class: 'thread-note-line',
+        type: 'button',
+        title: 'Abrir a thread',
+        onclick: () => {
+          const target = threadUi.resolve(b.id);
+          if (target) {
+            threadUi.open(target);
+          }
+        },
+      },
+      icon('comment-discussion'),
+      h('span', { class: 'thread-note-who' }, label),
+      h('span', { class: 'thread-note-text' }, snippet),
+    );
+    return { line, text: `${label}${snippet}` };
+  });
+  el.replaceChildren(...lines.map((l) => l.line));
+  return lines.map((l) => l.text).join('\n');
 }
 
 // ---------- Ferramentas ----------
@@ -2969,7 +3180,9 @@ function pushSysLine(group: HTMLDetailsElement, text: string): void {
 function addResult(msg: Extract<HostMessage, { type: 'result' }>): void {
   const parts = [fmtDuration(msg.durationMs), `${fmtTokens(msg.inputTokens)} entrada`, `${fmtTokens(msg.outputTokens)} saída`];
   if (msg.isError) {
+    // Erro do turno (ex.: limite de sessão) fica à vista e encerra o surto; a estatística comum não quebra nada.
     parts.unshift(`erro${msg.text ? `: ${msg.text}` : ''}`);
+    breakSurge();
   }
   append(h('div', { class: `result ${msg.isError ? 'error' : ''}` }, parts.join(' · ')));
 }
@@ -2992,19 +3205,34 @@ function renderHistory(items: HistoryItem[], container: HTMLElement = log): void
 }
 
 function renderItem(item: HistoryItem, container: HTMLElement): void {
+  const main = container === log && !state.companion;
   if (item.kind === 'user') {
+    // Mensagem escrita numa thread: está na thread (threads.json), não no chat.
+    if (main && parseThreadMessage(item.text)) {
+      return;
+    }
     // Relatório entregue à conversa principal: no histórico vira a linha de relatório, que o post do agente ocupa.
-    const report = container === log && !state.companion ? REPORT_IN_HISTORY.exec(item.text) : null;
+    const report = main ? REPORT_IN_HISTORY.exec(item.text) : null;
     const agentId = report?.[1] ?? report?.[2];
-    addUser(item.text, agentId ? `agente ${agentId}` : undefined, container, [], agentId);
+    const bubble = addUser(item.text, agentId ? `agente ${agentId}` : undefined, container, [], agentId);
+    if (bubble && main && item.id) {
+      markThread(bubble, userThreadId(item.id));
+    }
   } else if (item.kind === 'text') {
     const el = h('div', { class: 'msg assistant md' });
+    const id = main && item.id ? claudeIdFor(item.id, item.text) : undefined;
     if (container === log) {
-      companionUi?.markRaw(el, mainMd(el, item.text));
+      const shown = mainMd(el, item.text);
+      companionUi?.markRaw(el, shown);
     } else {
       md(el, item.text);
     }
     append(el, container);
+    // No replay o transcrito não traz hora: a fala dobra sem hora. Só no log principal.
+    if (container === log && foldClaude(el, item.text, undefined)) {
+      return;
+    }
+    markClaude(el, id);
   } else if (item.kind === 'tool') {
     if (container === log && hiddenInLog(item.name)) {
       hiddenTools.add(item.id);
@@ -3023,6 +3251,7 @@ function clearLog(): void {
   popup.close();
   log.replaceChildren(empty);
   liveBlocks.clear();
+  renderQueued = new Set();
   toolsIn(log).clear();
   permissions.clear();
   agents.clear();
@@ -3031,7 +3260,11 @@ function clearLog(): void {
   taskProcs.clear();
   agentCards.clear();
   slackLog.reset();
+  breakSurge();
   postEls.clear();
+  threadEls.clear();
+  textOrdinals.clear();
+  awaitingIds.clear();
   reportAnchors.clear();
   taskCards.clear();
   pendingDecisions.clear();
@@ -3053,6 +3286,8 @@ function clearLog(): void {
 const permissions = new Map<string, HTMLElement>();
 
 function onPermission(msg: Extract<HostMessage, { type: 'permission' }>): void {
+  // Permissão ou pergunta no meio encerra o surto de re-disparos.
+  breakSurge();
   const { requestId, toolName, input } = msg;
   const answer = (decision: WebviewMessage) => send(decision);
   const card = h('div', { class: `perm decision${isBrowserTool(toolName) ? ' browser' : ''}`, role: 'group' });
@@ -4764,7 +4999,7 @@ function onTaskProposal(p: TaskProposal): void {
 
 // ---------- Chat lateral de consulta ----------
 
-/** Pergunta que a thread de um post traz na caixa quando abre vazia (sem enviar), feita direto ao agente. */
+/** Pergunta que a thread de um post traz na caixa quando abre vazia (sem enviar); quem responde é o Claude. */
 function suggestFor(post: AgentPost): string {
   const a = agents.get(post.agentId);
   if (a?.status === 'failed' && threadUi.postsOf(post.agentId).at(-1)?.id === post.id) {
@@ -4835,6 +5070,7 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
         enterCompanionMode(msg.companion);
       }
       slackLog.setEnabled(!msg.companion);
+      refireEnabled = !msg.companion;
       applyBrand();
       renderControls();
       renderForkBanner();
@@ -4864,6 +5100,7 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       state.busy = msg.value;
       if (!msg.value) {
         state.thinking = false;
+        liveBlocks.settle();
       }
       live.setWorking('main', msg.value);
       renderControls();
@@ -4957,13 +5194,12 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       threadUi.setAll(msg.posts, msg.list);
       break;
     case 'post':
+      // Post de agente no log encerra o surto de re-disparos.
+      breakSurge();
       threadUi.upsertPost(msg.post);
       break;
     case 'thread':
       threadUi.upsertThread(msg.thread);
-      break;
-    case 'threadStatus':
-      threadUi.setStatus(msg.postId, msg.text);
       break;
     case 'notice':
       addNotice(msg.text, msg.level, msg.action);
@@ -4984,9 +5220,21 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       mapPinned = {};
       graph.setPinned({});
       break;
-    case 'userEcho':
-      addUser(msg.text, msg.from, log, [], msg.fromId, msg.origin);
+    case 'userEcho': {
+      const bubble = addUser(msg.text, msg.from, log, [], msg.fromId, msg.origin);
+      if (bubble && msg.msgId) {
+        markThread(bubble, userThreadId(msg.msgId), Date.now());
+      }
       break;
+    }
+    case 'userId': {
+      const bubble = awaitingIds.get(msg.clientId);
+      awaitingIds.delete(msg.clientId);
+      if (bubble && msg.id) {
+        markThread(bubble, userThreadId(msg.id), Date.now());
+      }
+      break;
+    }
     case 'insertText':
       input.value += (input.value && !input.value.endsWith(' ') ? ' ' : '') + msg.text;
       autosize(input);

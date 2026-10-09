@@ -2,7 +2,7 @@
 
 import type { BrowserStatus } from './browser';
 import type { CompanionInit } from './companion/types';
-import type { AgentPost, PostThread } from './threadModel';
+import type { AgentPost, ChatThread } from './threadModel';
 
 /** Primeira linha do texto que o "Enviar ao principal" do chat lateral manda à conversa principal. */
 export const COMPANION_MARK = '[Da consulta lateral, enviado pelo usuário]';
@@ -41,9 +41,13 @@ export interface Attachment {
   error?: string;
 }
 
+/**
+ * `id` dá a mensagem a que uma thread se pendura e sobrevive ao recarregar: na mensagem do usuário, o uuid dela no
+ * transcrito; na fala do orquestrador, o id da mensagem da API (o mesmo do `assistantText` ao vivo).
+ */
 export type HistoryItem =
-  | { kind: 'user'; text: string }
-  | { kind: 'text'; text: string }
+  | { kind: 'user'; text: string; id?: string }
+  | { kind: 'text'; text: string; id?: string }
   | { kind: 'tool'; id: string; name: string; input: unknown }
   | { kind: 'toolResult'; id: string; text: string; isError: boolean; images?: string[] };
 
@@ -602,7 +606,10 @@ export type HostMessage =
   /** `fromId`: agente que entregou o relatório, para a linha usar a cor e o título dele. */
   /** `origin: 'companion'`: o usuário mandou pelo botão "Enviar ao principal" do chat lateral. */
   /** `origin: 'remote'`: a mensagem chegou pelo Remote Control (claude.ai/code ou app do celular). */
-  | { type: 'userEcho'; text: string; from?: string; fromId?: string; origin?: 'companion' | 'remote' }
+  /** `msgId`: uuid da mensagem que saiu para o CLI, para a thread dela (ausente quando não se sabe). */
+  | { type: 'userEcho'; text: string; from?: string; fromId?: string; origin?: 'companion' | 'remote'; msgId?: string }
+  /** Uuid da mensagem que o composer mandou (`send` com `clientId`): a bolha dela ganha thread. Sem `id`, não saiu. */
+  | { type: 'userId'; clientId: string; id?: string }
   /** Remote Control desta conversa mudou de estado (ou é o estado inicial). */
   | { type: 'remoteControl'; state: RemoteControlState }
   /** Nome da sessão mudou (gerado pelo Claude Code ou /rename): o cabeçalho acompanha. */
@@ -612,13 +619,11 @@ export type HostMessage =
   /** Chat lateral: perguntas de exemplo atualizadas (o último agente ativo muda). */
   | { type: 'companionExamples'; examples: string[] }
   /** Posts dos agentes e threads da conversa (todos, ao abrir, retomar ou trocar de conversa). */
-  | { type: 'threads'; posts: AgentPost[]; list: PostThread[] }
+  | { type: 'threads'; posts: AgentPost[]; list: ChatThread[] }
   /** Post novo (relatório entregue) ou que ganhou o texto do orquestrador. */
   | { type: 'post'; post: AgentPost }
   /** Uma thread mudou (mensagem nova, começou ou parou de esperar resposta). */
-  | { type: 'thread'; thread: PostThread }
-  /** O que o agente está fazendo na thread do post agora; sem `text`, parou. */
-  | { type: 'threadStatus'; postId: string; text?: string }
+  | { type: 'thread'; thread: ChatThread }
   | { type: 'insertText'; text: string }
   /** Resposta a `resolveUris`: anexos prontos (com caminho relativo) para o webview mostrar no preview. */
   | { type: 'attachments'; list: Attachment[] }
@@ -741,7 +746,8 @@ export type PermissionDecision =
 
 export type WebviewMessage =
   | { type: 'ready' }
-  | { type: 'send'; text: string; attachments?: Attachment[] }
+  /** `clientId`: marca da bolha no webview; o host responde com `userId` e o uuid da mensagem. */
+  | { type: 'send'; text: string; attachments?: Attachment[]; clientId?: string }
   /** Arquivos arrastados do explorer do VS Code; o host resolve as URIs em caminhos. */
   | { type: 'resolveUris'; uris: string[] }
   | { type: 'interrupt' }
@@ -817,10 +823,11 @@ export type WebviewMessage =
   | { type: 'openBrain'; agentId?: string }
   /** Chat lateral: clique em "Enviar ao principal" numa resposta. Só o clique do usuário gera esta mensagem. */
   | { type: 'companionToMain'; text: string }
-  /** Pergunta escrita na thread de um post ("a3#2"): responde a persona só leitura do agente. */
-  | { type: 'threadSend'; postId: string; text: string }
-  /** Botão de parar da thread: interrompe a resposta em andamento. */
-  | { type: 'threadInterrupt'; postId: string };
+  /**
+   * Mensagem escrita numa thread ("a3#2", "c:...", "u:..."): vai ao orquestrador embrulhada com o contexto. `parent`
+   * vem na thread que ainda não existe de uma fala ou mensagem do usuário: o trecho da mãe e a hora dela.
+   */
+  | { type: 'threadSend'; threadId: string; text: string; parent?: { text: string; at?: number } };
 
 // ---------- Laboratório (quadro de experimentos em .agm/lab/) ----------
 

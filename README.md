@@ -2,7 +2,7 @@
 
 Extensão local do VS Code que roda o Claude Code (e o Codex) num chat próprio, com várias contas, agentes em paralelo e um laboratório de experimentos de ML. O chat usa o Claude Code que você já tem instalado, com o mesmo CLAUDE.md, as mesmas skills e os mesmos servidores MCP. A extensão acrescenta um mapa dos agentes da conversa e ferramentas que registram, testam e verificam resultados de experimentos.
 
-Foi escrita para pesquisadores de ML e desenvolvedores que instalam a extensão na própria máquina. Versão atual: 1.2.1. Não há publicação no Marketplace.
+Foi escrita para pesquisadores de ML e desenvolvedores que instalam a extensão na própria máquina. Versão atual: 1.2.2. Não há publicação no Marketplace.
 
 ## Instalação
 
@@ -61,7 +61,7 @@ Por baixo roda o Claude Agent SDK com o `claude` instalado, o prompt de sistema 
 
 ### Consulta lateral
 
-O botão de balões no topo do chat abre outra aba, ao lado, para tirar dúvidas do projeto, depurar ou perguntar sobre vários agentes de uma vez. Pergunta sobre um agente só vai na thread dele (abaixo).
+O botão de balões no topo do chat abre outra aba, ao lado, para tirar dúvidas do projeto, depurar ou perguntar sobre vários agentes de uma vez. Pergunta sobre um relatório só cabe na thread do post dele (abaixo).
 
 - Sessão própria (Sonnet, raciocínio médio; `companion.model` e `companion.effort`). Nada do que se diz nela entra no contexto do orquestrador, e ela não interrompe nem espera o chat principal.
 - Só leitura. Lê arquivos e a web sem pedir; Write, Edit e subagentes estão bloqueados; Bash e PowerShell pedem aprovação a cada comando.
@@ -71,18 +71,20 @@ O botão de balões no topo do chat abre outra aba, ao lado, para tirar dúvidas
 
 ### Chat como canal do Slack
 
-O chat principal é desenhado como um canal: toda mensagem fica à esquerda, com avatar, nome em negrito e hora ("10h57"). Você aparece como "Você"; o orquestrador, como "Claude" com o selo APP. Mensagens seguidas do mesmo autor em até 5 minutos ficam sob o mesmo cabeçalho, e a hora delas aparece no hover, na margem. As ferramentas do orquestrador viram uma linha recolhida presa à fala dele ("4 ações · Bash, Read"), que abre no clique (ou já aberta, com `toolsExpanded`). A estatística do turno fica pequena e cinza. No hover de cada mensagem há "Copiar", no canto direito. Quando a conversa cruza a meia-noite, um divisor marca o dia. Mensagens que vêm do histórico (conversa reaberta) não têm hora: o transcrito não guarda.
+O chat principal é desenhado como um canal: toda mensagem fica à esquerda, com avatar, nome em negrito e hora ("10h57"). Você aparece como "Você"; o orquestrador, como "Claude" com o selo APP. Mensagens seguidas do mesmo autor em até 5 minutos ficam sob o mesmo cabeçalho, e a hora delas aparece no hover, na margem. As ferramentas do orquestrador viram uma linha recolhida presa à fala dele ("4 ações · Bash, Read"), que abre no clique (ou já aberta, com `toolsExpanded`). A estatística do turno fica pequena e cinza. No hover de cada mensagem há "Copiar" e "Responder em thread", no canto direito. Quando a conversa cruza a meia-noite, um divisor marca o dia. Mensagens que vêm do histórico (conversa reaberta) não têm hora: o transcrito não guarda.
 
-### Posts e threads dos agentes
+### Posts e threads
 
 Cada agente é uma pessoa no canal. Enquanto roda, o lugar dele no chat mostra o avatar, os pontinhos de digitando com a nota do `report_progress` e a linha "Agora" (a mesma do popup: ferramenta em uso, o texto que escreve ou a última ferramenta).
 
 - Cada relatório que o agente entrega vira um post no mesmo lugar: avatar na cor dele, nome, hora e um texto curto em primeira pessoa. O relatório inteiro fica recolhido embaixo ("Relatório completo"). Agente retomado que entrega outro relatório ganha um post novo, na ordem em que chegou.
 - O texto do post é escrito pelo orquestrador: ao receber o relatório ele abre a resposta com `<post agent="aN">...</post>`. O bloco sai da fala dele (inclusive durante o streaming) e vai para o post. Sem bloco, o post mostra a linha "Resumo:" do relatório.
-- Cada post tem a própria thread. "Responder em thread" aparece no hover; com conversa, o rodapé mostra os avatares, "12 respostas" e "Última resposta hoje às 14h24". O "Abrir thread" do popup do nó abre a thread do post mais recente do agente.
-- A thread abre num painel à direita (em janela estreita ocupa a tela, com "Voltar"). No topo fica o post com o relatório recolhido; embaixo, as respostas. Enter envia.
-- Quem responde é uma sessão só leitura (as ferramentas da consulta lateral, sem Bash nem PowerShell) que fala em primeira pessoa como o agente, pelo relatório daquele post e pelo log dele. Nada da thread chega ao agente de verdade nem à conversa principal.
-- Posts e threads ficam em `.agm/sessions/<conversa>/threads.json` e voltam ao recarregar a janela ou reabrir a conversa. O arquivo do formato antigo (uma thread por agente) abre sem erro: as mensagens vão para a thread do post mais recente do agente.
+- Qualquer mensagem do chat pode ter thread: post de agente, fala do Claude e mensagem sua. "Responder em thread" aparece no hover; com conversa, o rodapé mostra os avatares, "12 respostas" e "Última resposta hoje às 14h24". O "Abrir thread" do popup do nó abre a thread do post mais recente do agente.
+- A thread abre num painel à direita (em janela estreita ocupa a tela, com "Voltar"). No topo fica a mensagem-mãe (o post com o relatório recolhido, ou a fala); embaixo, as respostas. Enter envia.
+- O que você escreve na thread vai ao Claude da conversa principal, pelo mesmo caminho do composer (com ele ocupado, entra na fila). A mensagem aparece só na thread. Ela chega embrulhada com o contexto: `<thread-msg id="a3#2" mae="post do agente a3">`, um `<trecho>` da mãe e o seu texto.
+- O Claude decide onde responder. Texto dentro de `<thread id="...">...</thread>` vai para a thread; o resto vai ao chat. Na thread de um post ele pode falar na voz do agente, com avatar e nome dele (`<thread id="a3#2" as="a3">`), ou como ele mesmo. Também pode comentar um relatório na thread do post por conta própria (`<thread id="a3">` vai ao post mais recente do agente). O bloco some da fala, inclusive no streaming. Turno que só respondeu em thread deixa no chat só a linha "Claude respondeu numa thread: ...", que abre a thread e guarda as ações do turno.
+- Ids das mensagens-mãe: post é `aN#k`; fala do Claude é `c:` mais o id da mensagem da API (com `.1`, `.2` quando a mesma mensagem tem mais de um bloco de texto); mensagem sua é `u:` mais o uuid com que ela saiu para o CLI. Os dois últimos vêm iguais do transcrito ao reabrir a conversa. Mensagem que chegou pelo Remote Control não tem thread, e no Codex só as falas têm.
+- Posts e threads ficam em `.agm/sessions/<conversa>/threads.json` e voltam ao recarregar a janela ou reabrir a conversa. Thread que faltar no arquivo é refeita do transcrito (sem hora). Os formatos antigos abrem sem erro: uma thread por agente vai para o post mais recente dele, e as respostas da antiga sessão só leitura passam a aparecer como do agente.
 
 ### Modos de permissão
 
