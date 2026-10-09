@@ -80,6 +80,8 @@ export interface SlackLogDeps {
   brand: () => string;
   /** Texto cru de uma mensagem, para o "Copiar". */
   rawText: (el: HTMLElement) => string;
+  /** "Responder em thread" na mensagem: só aparece na que tem id de thread (`data-thread`). */
+  onReply: (el: HTMLElement) => void;
 }
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
@@ -197,8 +199,19 @@ export function createSlackLog(deps: SlackLogDeps) {
   copyBtn.title = 'Copiar o texto';
   copyBtn.setAttribute('aria-label', 'Copiar o texto');
   copyBtn.append(codicon('copy'));
+  const replyBtn = node('button', 'icon-btn sl-act');
+  replyBtn.type = 'button';
+  replyBtn.title = 'Responder em thread';
+  replyBtn.setAttribute('aria-label', 'Responder em thread');
+  replyBtn.append(codicon('comment-discussion'));
+  replyBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (barFor?.dataset.thread) {
+      deps.onReply(barFor);
+    }
+  });
   const bar = node('div', 'sl-actions');
-  bar.append(copyBtn);
+  bar.append(copyBtn, replyBtn);
   let barFor: HTMLElement | undefined;
   copyBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -221,6 +234,7 @@ export function createSlackLog(deps: SlackLogDeps) {
     const msg = (e.target as Element).closest<HTMLElement>('.msg.user, .msg.assistant');
     if (msg && msg.parentElement === log && bar.parentElement !== msg) {
       barFor = msg;
+      replyBtn.hidden = !msg.dataset.thread;
       msg.append(bar);
     }
   });

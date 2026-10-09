@@ -787,6 +787,79 @@ details.sys-group[open] .sys-last {
   border-color: var(--err);
 }
 
+/* Re-disparos vazios do Claude dobrados: uma linha discreta com o contador; o clique abre as falas repetidas. */
+.refire-fold {
+  font-size: 0.9em;
+  color: var(--muted);
+}
+
+.refire-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  padding: 2px 4px;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.refire-head:hover {
+  color: var(--fg);
+  background: var(--vscode-list-hoverBackground);
+}
+
+.refire-head:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+.refire-head .codicon {
+  font-size: 13px;
+  flex: none;
+  opacity: 0.8;
+}
+
+.refire-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.refire-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 2px 18px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+}
+
+.refire-item {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.refire-time {
+  flex: none;
+  font-size: 0.85em;
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A fala dobrada já veio pintada: aqui ela fica compacta e sem o balão da coluna normal. */
+.refire-item .refire-folded {
+  margin: 0;
+  min-width: 0;
+  opacity: 0.85;
+}
+
 .result {
   font-size: 0.85em;
   color: var(--muted);
@@ -3799,6 +3872,70 @@ button.empty-ex:focus-visible {
 
 .thread-last {
   color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Avatar do Claude na thread e no rodapé: a cor de destaque com o ícone, como o do log. */
+.thread-av.claude {
+  background: var(--accent);
+}
+
+/* Nome sem popup (fala do Claude ou mensagem do usuário no topo da thread). */
+.post-name.static {
+  cursor: default;
+}
+
+.post-name.static:hover {
+  text-decoration: none;
+}
+
+/* Rodapé da thread dentro de uma fala ou mensagem do usuário no log. */
+.msg > .thread-foot {
+  margin-top: 2px;
+}
+
+/* Turno que só respondeu em thread: uma linha discreta por thread, que abre a thread. */
+.msg.assistant.thread-note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.thread-note-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 6px 2px 2px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.9em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.thread-note-line:hover {
+  background: var(--bg);
+  color: var(--fg, var(--vscode-foreground));
+}
+
+.thread-note-line .codicon {
+  flex: none;
+  font-size: 13px;
+  color: var(--vscode-textLink-foreground, var(--accent));
+}
+
+.thread-note-who {
+  flex: none;
+}
+
+.thread-note-text {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

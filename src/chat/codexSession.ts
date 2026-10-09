@@ -1129,7 +1129,8 @@ function historyOf(item: Item): HistoryItem[] {
       return text ? [{ kind: 'user', text }] : [];
     }
     case 'agentMessage':
-      return item.text ? [{ kind: 'text', text: item.text }] : [];
+      // O id do item é o mesmo do assistantText ao vivo: a thread da fala volta ao reabrir.
+      return item.text ? [{ kind: 'text', text: item.text, id: item.id }] : [];
     case 'reasoning':
     case 'plan':
     case 'hookPrompt':

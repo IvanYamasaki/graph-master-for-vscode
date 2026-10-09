@@ -1,9 +1,10 @@
 /**
- * Posts dos agentes no chat principal e a thread de cada um, como no Slack. Cada relatório entregue é um post
- * (avatar, nome, hora, o texto que o orquestrador escreveu em primeira pessoa e o relatório recolhido), com
- * "Responder em thread" no hover e o rodapé "12 respostas · Última resposta hoje às 14h24". A thread abre num
- * painel à direita; quem responde é uma leitura só leitura do agente, falando como ele. O host guarda posts e
- * threads; aqui só se desenha. Onde cada post fica no log é com o main.ts.
+ * Posts dos agentes no chat principal e as threads, como no Slack. Cada relatório entregue é um post (avatar, nome,
+ * hora, o texto que o orquestrador escreveu em primeira pessoa e o relatório recolhido), e qualquer mensagem do chat
+ * (post, fala do Claude, mensagem do usuário) pode ter thread: "Responder em thread" no hover e o rodapé
+ * "12 respostas · Última resposta hoje às 14h24". A thread abre num painel à direita; o que se escreve nela vai ao
+ * Claude da conversa principal, que responde na thread (ou no chat). O host guarda posts e threads; aqui só se
+ * desenha. Onde cada post fica no log, e o rodapé das outras mensagens, é com o main.ts.
  */
 
 import type { AgentInfo, WebviewMessage } from '../chat/protocol';
@@ -17,30 +18,44 @@ import {
   participants,
   postsOf,
   relativeTime,
+  resolveThreadId,
   threadFooter,
+  threadKind,
   type AgentPost,
-  type PostThread,
+  type ChatThread,
   type ThreadMessage,
+  type ThreadSpeaker,
 } from '../chat/threadModel';
+
+/** Mãe de uma thread que pende de uma fala ou de uma mensagem do usuário: o trecho e a hora, quando se sabe. */
+export interface ParentHint {
+  text: string;
+  at?: number;
+}
 
 export interface ThreadUiDeps {
   send: (msg: WebviewMessage) => void;
   agent: (id: string) => AgentInfo | undefined;
-  paintAgent: (el: HTMLElement, a: AgentInfo) => void;
   /** Cor do agente mesmo quando ele já saiu da lista (conversa trocada, agente apagado). */
   colorOf: (agentId: string) => string;
   md: (el: HTMLElement, text: string) => void;
   statusLabel: (a: AgentInfo) => string;
-  /** Pergunta sugerida na caixa quando a thread abre vazia (não é enviada). */
+  /** "Claude" ou "Codex". */
+  brand: () => string;
+  /** Pergunta sugerida na caixa quando a thread de um post abre vazia (não é enviada). */
   suggest: (post: AgentPost) => string;
   /** Clique numa imagem de uma resposta: abre no visualizador ampliável. */
   openImage?: (src: string, caption: string) => void;
   /** Clique no avatar ou no nome: o popup do agente, ancorado no post. */
   openAgent: (anchor: HTMLElement, agentId: string) => void;
+  /** Mensagem do log (fala ou mensagem do usuário) a que uma thread nova vai pender. */
+  parentOf: (id: string) => ParentHint | undefined;
   /** Um post mudou (novo, texto do orquestrador, rodapé da thread): o main.ts põe no lugar ou repinta. */
   onPost: (post: AgentPost) => void;
   /** Lista inteira trocou (conversa aberta ou trocada). */
   onPosts: (posts: AgentPost[]) => void;
+  /** A thread de uma fala ou mensagem do usuário mudou (ou todas, sem id): o main.ts repinta o rodapé no log. */
+  onThread: (id?: string) => void;
 }
 
 /** Abaixo desta largura a thread ocupa a tela inteira, com botão de voltar. */
@@ -64,21 +79,22 @@ function fullTime(at: number): string {
   return new Date(at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-/** Hora relativa que o tique de 30 s mantém em dia. */
-function timeEl(at: number, cls: string): HTMLElement {
-  return el('span', { class: `${cls} thread-rel`.trim(), title: fullTime(at), 'data-at': String(at) }, relativeTime(at, Date.now()));
+/** Hora relativa que o tique de 30 s mantém em dia. Sem hora (veio do transcrito), nada. */
+function timeEl(at: number, cls: string): HTMLElement | null {
+  return at ? el('span', { class: `${cls} thread-rel`.trim(), title: fullTime(at), 'data-at': String(at) }, relativeTime(at, Date.now())) : null;
 }
 
 /** "Última resposta hoje às 14h24": o tique também a mantém (vira "ontem às" na virada do dia). */
-function lastEl(at: number): HTMLElement {
-  return el('span', { class: 'thread-last thread-lastrel', title: fullTime(at), 'data-at': String(at) }, lastReplyLabel(at, Date.now()));
+function lastEl(at: number | undefined): HTMLElement | null {
+  return at ? el('span', { class: 'thread-last thread-lastrel', title: fullTime(at), 'data-at': String(at) }, lastReplyLabel(at, Date.now())) : null;
 }
 
 export function createThreadUi(deps: ThreadUiDeps) {
   let posts: AgentPost[] = [];
-  const threads = new Map<string, PostThread>();
-  const status = new Map<string, string>();
+  const threads = new Map<string, ChatThread>();
   let openId: string | undefined;
+  /** Mãe da thread aberta que ainda não existe no host (fala ou mensagem do usuário sem resposta nenhuma). */
+  let openHint: ParentHint | undefined;
 
   const head = el('div', { class: 'thread-head' });
   const parent = el('div', { class: 'thread-parent' });
@@ -87,22 +103,24 @@ export function createThreadUi(deps: ThreadUiDeps) {
   const scroller = el('div', { class: 'thread-scroll' }, parent, replies, live);
 
   const input = el('textarea', { class: 'input', rows: '2', 'aria-label': 'Mensagem da thread' });
-  const sendBtn = el('button', { class: 'send', type: 'button', title: 'Pergunta ao agente. Responde uma leitura só leitura dele, em primeira pessoa; nada chega ao agente nem à conversa principal.' }, 'Enviar');
-  const stopBtn = el('button', { class: 'icon-btn hidden', type: 'button', title: 'Parar a resposta' }, codicon('debug-stop'));
-  const hint = el('div', { class: 'hint' }, 'Só leitura: o agente responde pelo que fez, sem interferir na conversa principal.');
-  const composer = el('div', { class: 'composer thread-composer' }, input, el('div', { class: 'row' }, hint, el('div', { class: 'spacer' }), stopBtn, sendBtn));
+  const sendBtn = el('button', { class: 'send', type: 'button', title: 'Manda ao Claude da conversa principal, com o contexto desta thread. A resposta vem aqui ou no chat.' }, 'Enviar');
+  const hint = el('div', { class: 'hint' }, 'Vai ao Claude da conversa principal. Ele responde aqui ou no chat, se o assunto for da conversa toda.');
+  const composer = el('div', { class: 'composer thread-composer' }, input, el('div', { class: 'row' }, hint, el('div', { class: 'spacer' }), sendBtn));
 
-  const drawer = el('aside', { class: 'thread-drawer hidden', role: 'complementary', 'aria-label': 'Thread do post' }, head, scroller, composer);
+  const drawer = el('aside', { class: 'thread-drawer hidden', role: 'complementary', 'aria-label': 'Thread' }, head, scroller, composer);
 
   const postById = (id: string) => posts.find((p) => p.id === id);
   const nameOf = (agentId: string) => deps.agent(agentId)?.description || `Agente ${agentId}`;
+  const isPost = (id: string) => threadKind(id) === 'post';
 
   const submit = () => {
     const text = input.value.trim();
     if (!openId || !text) {
       return;
     }
-    deps.send({ type: 'threadSend', postId: openId, text });
+    // Thread que ainda não existe leva a mãe: o host guarda o trecho e o põe no embrulho.
+    const known = threads.has(openId) || isPost(openId);
+    deps.send({ type: 'threadSend', threadId: openId, text, parent: known ? undefined : openHint });
     input.value = '';
     autosize();
   };
@@ -111,7 +129,6 @@ export function createThreadUi(deps: ThreadUiDeps) {
     input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
   };
   sendBtn.addEventListener('click', submit);
-  stopBtn.addEventListener('click', () => openId && deps.send({ type: 'threadInterrupt', postId: openId }));
   input.addEventListener('input', autosize);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -126,14 +143,21 @@ export function createThreadUi(deps: ThreadUiDeps) {
     }
   });
 
-  /** Avatar quadrado como no Slack: o do agente na cor dele, com o id; o do usuário, "Eu". */
-  function avatar(from: ThreadMessage['from'], agentId: string, cls = ''): HTMLElement {
-    const av = el('span', { class: `thread-av ${from} ${cls}`.trim(), 'aria-hidden': 'true' }, authorInitials(from, agentId));
-    if (from === 'agent') {
-      av.style.setProperty('--agm-color', deps.colorOf(agentId));
+  /** Avatar quadrado como no Slack: o do agente na cor dele, com o id; o do usuário, "Eu"; o do Claude, o ícone. */
+  function avatar(who: ThreadSpeaker, cls = ''): HTMLElement {
+    const av = el('span', { class: `thread-av ${who.from} ${cls}`.trim(), 'aria-hidden': 'true' });
+    if (who.from === 'claude') {
+      av.append(codicon('sparkle'));
+    } else {
+      av.textContent = authorInitials(who);
+    }
+    if (who.from === 'agent' && who.agentId) {
+      av.style.setProperty('--agm-color', deps.colorOf(who.agentId));
     }
     return av;
   }
+
+  const speakerName = (who: ThreadSpeaker) => authorName(who, who.agentId ? deps.agent(who.agentId)?.description : undefined, deps.brand());
 
   /** Texto do post: o do orquestrador, senão a linha "Resumo:" do relatório. */
   function postText(p: AgentPost): string {
@@ -184,7 +208,7 @@ export function createThreadUi(deps: ThreadUiDeps) {
     card.dataset.agent = p.agentId;
     card.setAttribute('aria-label', `${nameOf(p.agentId)}, ${clockLabel(p.at)}`);
     card.style.setProperty('--agm-color', deps.colorOf(p.agentId));
-    const av = avatar('agent', p.agentId, 'post-av');
+    const av = avatar({ from: 'agent', agentId: p.agentId }, 'post-av');
     av.setAttribute('role', 'button');
     av.setAttribute('tabindex', '-1');
     av.title = `Abre o resumo de ${p.agentId}`;
@@ -194,7 +218,7 @@ export function createThreadUi(deps: ThreadUiDeps) {
     });
     const text = el('div', { class: 'md post-text' });
     deps.md(text, postText(p));
-    const reply = el('button', { class: 'thread-reply icon-btn', type: 'button', title: 'Abre a thread deste post ao lado do chat. O agente responde em primeira pessoa, só lendo o que fez.' }, codicon('comment'), el('span', {}, 'Responder em thread'));
+    const reply = el('button', { class: 'thread-reply icon-btn', type: 'button', title: 'Abre a thread deste post ao lado do chat. O Claude responde nela, como ele mesmo ou na voz do agente.' }, codicon('comment'), el('span', {}, 'Responder em thread'));
     reply.addEventListener('click', (e) => {
       e.stopPropagation();
       open(p.id);
@@ -212,15 +236,15 @@ export function createThreadUi(deps: ThreadUiDeps) {
     });
     card.replaceChildren(
       av,
-      el('div', { class: 'post-main' }, postHead(p, () => card), text, reportFold(p, 'Relatório completo'), footer(p)),
+      el('div', { class: 'post-main' }, postHead(p, () => card), text, reportFold(p, 'Relatório completo'), footerFor(p.id)),
       el('div', { class: 'post-actions sl-actions' }, copy, reply),
     );
     return card;
   }
 
-  /** Rodapé Slack: avatares de quem falou, "12 respostas" em azul e a hora da última. */
-  function footer(p: AgentPost): HTMLElement | null {
-    const t = threads.get(p.id);
+  /** Rodapé Slack de qualquer mensagem com thread: avatares de quem falou, "12 respostas" em azul e a hora da última. */
+  function footerFor(id: string): HTMLElement | null {
+    const t = threads.get(id);
     const summary = threadFooter(t, Date.now());
     if (!summary || !t) {
       return null;
@@ -228,81 +252,107 @@ export function createThreadUi(deps: ThreadUiDeps) {
     const b = el(
       'button',
       { class: 'thread-link', type: 'button', title: 'Abrir a thread' },
-      el('span', { class: 'thread-avs' }, ...participants(t).map((who) => avatar(who, p.agentId))),
+      el('span', { class: 'thread-avs' }, ...participants(t).map((who) => avatar(who))),
       el('span', { class: 'thread-count' }, summary.count),
-      lastEl(t.messages.at(-1)!.at),
+      lastEl(t.messages.at(-1)?.at),
       t.waiting ? codicon('loading', true) : null,
     );
     b.addEventListener('click', (e) => {
       e.stopPropagation();
-      open(p.id);
+      open(id);
     });
     return el('div', { class: 'thread-foot' }, b);
   }
 
-  function renderHead(p: AgentPost): void {
-    const a = deps.agent(p.agentId);
+  /** Mãe da thread aberta: o post, ou o trecho guardado da fala ou da mensagem do usuário. */
+  function parentHint(id: string): ParentHint | undefined {
+    const t = threads.get(id);
+    if (t && t.parent.text) {
+      return { text: t.parent.text, at: t.parent.at };
+    }
+    return deps.parentOf(id) ?? (t ? { text: '', at: t.parent.at } : undefined);
+  }
+
+  function renderHead(id: string): void {
+    const p = postById(id);
+    const a = p ? deps.agent(p.agentId) : undefined;
     const narrow = window.innerWidth < NARROW_PX;
     const back = el('button', { class: 'icon-btn thread-back', type: 'button', title: 'Voltar ao chat' }, codicon('arrow-left'), el('span', {}, 'Voltar'));
     back.addEventListener('click', close);
     const closeBtn = el('button', { class: 'icon-btn square', type: 'button', title: 'Fechar a thread', 'aria-label': 'Fechar a thread' }, codicon('close'));
     closeBtn.addEventListener('click', close);
-    const many = postsOf(posts, p.agentId).length > 1;
+    let who: string;
+    let sub: string;
+    if (p) {
+      who = nameOf(p.agentId);
+      sub = [postsOf(posts, p.agentId).length > 1 ? `relatório ${p.n} de ${p.agentId}` : p.agentId, a ? deps.statusLabel(a) : ''].filter(Boolean).join(' · ');
+    } else {
+      who = threadKind(id) === 'user' ? 'sua mensagem' : `fala do ${deps.brand()}`;
+      sub = 'conversa principal';
+    }
     const parts: (Node | null)[] = [
       narrow ? back : null,
-      el(
-        'div',
-        { class: 'thread-title' },
-        el('div', { class: 'thread-name' }, el('span', {}, 'Thread'), el('span', { class: 'thread-who' }, nameOf(p.agentId))),
-        el('div', { class: 'thread-sub' }, [many ? `relatório ${p.n} de ${p.agentId}` : p.agentId, a ? deps.statusLabel(a) : ''].filter(Boolean).join(' · ')),
-      ),
+      el('div', { class: 'thread-title' }, el('div', { class: 'thread-name' }, el('span', {}, 'Thread'), el('span', { class: 'thread-who' }, who)), el('div', { class: 'thread-sub' }, sub)),
       closeBtn,
     ];
     head.replaceChildren(...(parts.filter(Boolean) as Node[]));
-    drawer.style.setProperty('--agm-color', deps.colorOf(p.agentId));
+    if (p) {
+      drawer.style.setProperty('--agm-color', deps.colorOf(p.agentId));
+    } else {
+      drawer.style.removeProperty('--agm-color');
+    }
   }
 
-  /** Mensagem-mãe: o post, com o relatório recolhido. */
-  function renderParent(p: AgentPost): void {
+  /** Mensagem-mãe no topo da thread: o post com o relatório recolhido, ou a fala ou mensagem do usuário. */
+  function renderParent(id: string): void {
+    const p = postById(id);
     const text = el('div', { class: 'md post-text' });
-    deps.md(text, postText(p));
+    if (p) {
+      deps.md(text, postText(p));
+      parent.replaceChildren(avatar({ from: 'agent', agentId: p.agentId }, 'post-av'), el('div', { class: 'post-main' }, postHead(p, () => parent), text, reportFold(p, 'Relatório completo')));
+      return;
+    }
+    const hintNow = parentHint(id) ?? openHint;
+    const who: ThreadSpeaker = { from: threadKind(id) === 'user' ? 'user' : 'claude' };
+    deps.md(text, hintNow?.text || '(mensagem do chat)');
+    const at = hintNow?.at;
     parent.replaceChildren(
-      avatar('agent', p.agentId, 'post-av'),
-      el('div', { class: 'post-main' }, postHead(p, () => parent), text, reportFold(p, 'Relatório completo')),
+      avatar(who, 'post-av'),
+      el(
+        'div',
+        { class: 'post-main' },
+        el('div', { class: 'post-head' }, el('span', { class: 'post-name static' }, speakerName(who)), at ? el('span', { class: 'post-time', title: fullTime(at) }, clockLabel(at)) : null),
+        text,
+      ),
     );
   }
 
-  function messageEl(m: ThreadMessage, p: AgentPost): HTMLElement {
+  function messageEl(m: ThreadMessage): HTMLElement {
     const body = el('div', { class: 'md thread-body' });
     deps.md(body, m.text);
     body.querySelectorAll('img').forEach((img) => {
       img.classList.add('thread-img');
       img.addEventListener('click', () => deps.openImage?.(img.src, img.alt));
     });
+    const who: ThreadSpeaker = m.from === 'agent' ? { from: 'agent', agentId: m.agentId } : { from: m.from };
     return el(
       'div',
       { class: `thread-msg ${m.from}${m.error ? ' error' : ''}` },
-      avatar(m.from, p.agentId),
-      el(
-        'div',
-        { class: 'thread-msg-main' },
-        el('div', { class: 'thread-msg-head' }, el('span', { class: 'thread-author' }, authorName(m.from, p.agentId, deps.agent(p.agentId)?.description)), timeEl(m.at, 'thread-time')),
-        body,
-      ),
+      avatar(who),
+      el('div', { class: 'thread-msg-main' }, el('div', { class: 'thread-msg-head' }, el('span', { class: 'thread-author' }, speakerName(who)), timeEl(m.at, 'thread-time')), body),
     );
   }
 
   function renderReplies(): void {
-    const p = openId ? postById(openId) : undefined;
-    if (!p) {
+    if (!openId) {
       return;
     }
-    const t = threads.get(p.id);
+    const t = threads.get(openId);
     const stick = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
     const n = t?.messages.length ?? 0;
     replies.replaceChildren(
       el('div', { class: 'thread-divider' }, el('span', {}, n ? `${n} ${n === 1 ? 'resposta' : 'respostas'}` : 'Nenhuma resposta ainda')),
-      ...(t?.messages ?? []).map((m) => messageEl(m, p)),
+      ...(t?.messages ?? []).map(messageEl),
     );
     renderLive();
     if (stick) {
@@ -310,73 +360,69 @@ export function createThreadUi(deps: ThreadUiDeps) {
     }
   }
 
-  /** Linha de "digitando": os pontinhos na cor do agente e o que ele está relendo. */
+  /** Linha de "digitando" enquanto o orquestrador não respondeu (ele pode estar terminando outro turno antes). */
   function renderLive(): void {
-    const p = openId ? postById(openId) : undefined;
-    if (!p) {
-      return;
-    }
-    const waiting = !!threads.get(p.id)?.waiting;
-    stopBtn.classList.toggle('hidden', !waiting);
+    const waiting = !!(openId && threads.get(openId)?.waiting);
     if (!waiting) {
       live.classList.add('hidden');
       return;
     }
     const dots = typingDots();
-    dots.style.setProperty('--lb-color', 'var(--agm-color)');
-    live.replaceChildren(dots, el('span', {}, `${nameOf(p.agentId)} ${status.get(p.id) ?? 'digitando'}…`));
+    dots.style.setProperty('--lb-color', 'var(--agm-color, var(--accent))');
+    live.replaceChildren(dots, el('span', {}, `${deps.brand()} vai responder aqui ou no chat…`));
     live.classList.remove('hidden');
   }
 
-  function open(id: string): void {
-    const p = postById(id);
-    if (!p) {
-      return;
+  /** Abre a thread de uma mensagem. Falso quando não há mãe conhecida (post que sumiu, mensagem fora do log). */
+  function open(id: string): boolean {
+    const known = !!postById(id) || threads.has(id);
+    const hintNow = known ? undefined : deps.parentOf(id);
+    if (!known && !hintNow) {
+      return false;
     }
     const changed = openId !== id;
     openId = id;
-    renderHead(p);
-    renderParent(p);
-    input.placeholder = `Responda a ${nameOf(p.agentId)}. Enter envia, Shift+Enter quebra linha`;
+    openHint = hintNow ?? (changed ? undefined : openHint);
+    renderHead(id);
+    renderParent(id);
+    const p = postById(id);
+    input.placeholder = p ? `Responda na thread de ${nameOf(p.agentId)}. Enter envia, Shift+Enter quebra linha` : 'Responda na thread. Enter envia, Shift+Enter quebra linha';
     renderReplies();
     drawer.classList.remove('hidden');
     document.body.classList.add('thread-open');
     if (changed) {
-      input.value = threads.get(id)?.messages.length ? '' : deps.suggest(p);
+      input.value = p && !threads.get(id)?.messages.length ? deps.suggest(p) : '';
       autosize();
       scroller.scrollTop = 0;
     }
     input.focus();
+    return true;
   }
 
   /** Thread do post mais recente do agente. Falso se ele ainda não entregou relatório. */
   function openLatest(agentId: string): boolean {
     const p = postsOf(posts, agentId).at(-1);
-    if (p) {
-      open(p.id);
-    }
-    return !!p;
+    return p ? open(p.id) : false;
   }
 
   function close(): void {
     openId = undefined;
+    openHint = undefined;
     drawer.classList.add('hidden');
     document.body.classList.remove('thread-open');
   }
 
   /** Lista inteira (conversa aberta, retomada ou trocada). */
-  function setAll(list: AgentPost[], threadList: PostThread[]): void {
+  function setAll(list: AgentPost[], threadList: ChatThread[]): void {
     posts = [...list].sort((a, b) => a.at - b.at);
     threads.clear();
-    status.clear();
     for (const t of threadList) {
-      threads.set(t.postId, t);
+      threads.set(t.id, t);
     }
     deps.onPosts(posts);
-    if (openId && !postById(openId)) {
+    deps.onThread();
+    if (openId && !open(openId)) {
       close();
-    } else if (openId) {
-      open(openId);
     }
   }
 
@@ -390,33 +436,21 @@ export function createThreadUi(deps: ThreadUiDeps) {
       }
     }
     if (openId === p.id) {
-      renderHead(p);
-      renderParent(p);
+      renderHead(p.id);
+      renderParent(p.id);
     }
   }
 
-  function upsertThread(t: PostThread): void {
-    threads.set(t.postId, t);
-    if (!t.waiting) {
-      status.delete(t.postId);
-    }
-    const p = postById(t.postId);
+  function upsertThread(t: ChatThread): void {
+    threads.set(t.id, t);
+    const p = postById(t.id);
     if (p) {
       deps.onPost(p);
-    }
-    if (openId === t.postId) {
-      renderReplies();
-    }
-  }
-
-  function setStatus(postId: string, text?: string): void {
-    if (text) {
-      status.set(postId, text);
     } else {
-      status.delete(postId);
+      deps.onThread(t.id);
     }
-    if (openId === postId) {
-      renderLive();
+    if (openId === t.id) {
+      renderReplies();
     }
   }
 
@@ -424,7 +458,7 @@ export function createThreadUi(deps: ThreadUiDeps) {
   function refreshAgent(agentId: string): void {
     const p = openId ? postById(openId) : undefined;
     if (p?.agentId === agentId) {
-      renderHead(p);
+      renderHead(p.id);
     }
   }
 
@@ -447,9 +481,8 @@ export function createThreadUi(deps: ThreadUiDeps) {
   let wasNarrow = window.innerWidth < NARROW_PX;
   window.addEventListener('resize', () => {
     const narrow = window.innerWidth < NARROW_PX;
-    const p = openId ? postById(openId) : undefined;
-    if (narrow !== wasNarrow && p) {
-      renderHead(p);
+    if (narrow !== wasNarrow && openId) {
+      renderHead(openId);
     }
     wasNarrow = narrow;
   });
@@ -464,11 +497,13 @@ export function createThreadUi(deps: ThreadUiDeps) {
     },
     hasPosts: (agentId: string) => posts.some((p) => p.agentId === agentId),
     postsOf: (agentId: string) => postsOf(posts, agentId),
+    /** Thread de destino de um bloco <thread id="..."> do orquestrador (o id dele pode ser só o agente). */
+    resolve: (id: string) => resolveThreadId(id, posts, (x) => threads.has(x)),
     renderPost,
+    footerFor,
     setAll,
     upsertPost,
     upsertThread,
-    setStatus,
     refreshAgent,
   };
 }

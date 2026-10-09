@@ -445,7 +445,8 @@ export class ChatSession {
     }
   }
 
-  send(text: string, attachments?: Attachment[]): void {
+  /** Devolve o uuid da mensagem, que o transcrito guarda: é o id da thread da bolha no chat. */
+  send(text: string, attachments?: Attachment[]): string | undefined {
     const cmd = /^\/([\w:-]+)/.exec(text.trim())?.[1];
     if (cmd && terminalCommands.has(cmd)) {
       this.post({ type: 'notice', level: 'info', text: `/${cmd} é um comando do terminal do Claude Code; aqui ele pode não fazer nada ou se comportar diferente.` });
@@ -466,6 +467,7 @@ export class ChatSession {
     if (uuid) {
       this.noteOwn(uuid);
     }
+    return uuid;
   }
 
   private noteOwn(uuid: string): void {

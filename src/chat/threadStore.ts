@@ -1,5 +1,5 @@
 import { SessionStore } from './sessionStore';
-import { threadsFromStore, threadsToStore, type AgentPost, type PostThread, type StoredThreads } from './threadModel';
+import { threadsFromStore, threadsToStore, type AgentPost, type ChatThread, type StoredThreads } from './threadModel';
 
 /**
  * Onde os posts e as threads de uma conversa ficam guardados. Interface pequena de propósito: quem usa não sabe se
@@ -7,7 +7,7 @@ import { threadsFromStore, threadsToStore, type AgentPost, type PostThread, type
  */
 export interface ThreadPersistence {
   load(mainSessionId: string): StoredThreads;
-  save(mainSessionId: string, posts: AgentPost[], threads: PostThread[]): void;
+  save(mainSessionId: string, posts: AgentPost[], threads: ChatThread[]): void;
 }
 
 const KEY = 'threads';
@@ -24,7 +24,7 @@ export class FolderThreadStore implements ThreadPersistence {
     return threadsFromStore(this.store.read(mainSessionId, KEY));
   }
 
-  save(mainSessionId: string, posts: AgentPost[], threads: PostThread[]): void {
+  save(mainSessionId: string, posts: AgentPost[], threads: ChatThread[]): void {
     const kept = threadsToStore(posts, threads);
     if (kept.posts.length || kept.threads.length) {
       this.store.write(mainSessionId, KEY, kept);
