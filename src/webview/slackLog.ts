@@ -255,6 +255,8 @@ export function createSlackLog(deps: SlackLogDeps) {
     stamp,
     refresh,
     reset,
+    /** Cabeçalho avulso, igual ao das sequências, para quem monta um lugar fora do stamp (a fala do Claude que vai nascer). */
+    header,
     /** Cabeçalho à vista logo antes desta fala, se ela abre a sequência. */
     headOf(el: HTMLElement): HTMLElement | undefined {
       const head = heads.get(el);

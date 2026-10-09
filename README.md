@@ -2,7 +2,7 @@
 
 Extensão local do VS Code que roda o Claude Code (e o Codex) num chat próprio, com várias contas, agentes em paralelo e um laboratório de experimentos de ML. O chat usa o Claude Code que você já tem instalado, com o mesmo CLAUDE.md, as mesmas skills e os mesmos servidores MCP. A extensão acrescenta um mapa dos agentes da conversa e ferramentas que registram, testam e verificam resultados de experimentos.
 
-Foi escrita para pesquisadores de ML e desenvolvedores que instalam a extensão na própria máquina. Versão atual: 1.2.2. Não há publicação no Marketplace.
+Foi escrita para pesquisadores de ML e desenvolvedores que instalam a extensão na própria máquina. Versão atual: 1.2.3. Não há publicação no Marketplace.
 
 ## Instalação
 

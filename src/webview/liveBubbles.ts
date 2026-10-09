@@ -1,10 +1,11 @@
 // Sinais de vida do chat: balão "digitando", balão de pensamento e a faixa dos agentes que estão trabalhando. Agente
-// com post rodando no log mostra o pensamento no próprio post e não entra na faixa.
+// com post rodando no log mostra o pensamento no próprio post, e o Claude, sob o nome dele na fala do turno; quem
+// tem lugar no log não entra na faixa.
 // Tudo nasce de eventos reais (turno do chat principal, status "rodando" de um agente, deltas de texto, thinking e
 // chamadas de ferramenta). Sem trabalho em andamento não há balão, timer nem animação. A faixa fica fora do log:
 // só mexe na rolagem de quem já estava colado no fim.
 
-import { LiveModel, fmtElapsed, splitTray, type ActorView, type BubbleKind } from './liveLogic';
+import { LiveModel, fmtElapsed, splitTray, spotContent, type ActorView, type BubbleKind } from './liveLogic';
 
 export interface LiveBubblesDeps {
   /** O log do chat: a faixa só o reajusta (colado no fim) quando muda de altura. */
@@ -16,10 +17,12 @@ export interface LiveBubblesDeps {
   /** Clique numa linha de agente (abrir o cartão dele). */
   onOpen?: (id: string, anchor: HTMLElement) => void;
   /**
-   * Lugar do agente no log principal (o post que está rodando), se estiver à vista: o balão de pensamento vai para
-   * ele, e o agente sai da faixa. O tempo correndo o lugar já mostra ao lado do nome.
+   * Lugar do ator no log principal, se estiver à vista: o post do agente que está rodando, ou a fala do Claude no
+   * turno em andamento ("main"). O balão de pensamento vai para ele, e o ator sai da faixa.
    */
   chatSpot?: (id: string) => HTMLElement | undefined;
+  /** Onde escrever o tempo correndo de quem está no chat, quando o lugar não mostra o seu (o post do agente mostra). */
+  spotTime?: (id: string) => HTMLElement | undefined;
 }
 
 /** Linhas visíveis ao mesmo tempo; o resto vira "+N". */
@@ -131,34 +134,47 @@ export function createLiveBubbles(deps: LiveBubblesDeps) {
     row.slot.replaceChildren(...(bubble ? [bubble] : [node('span', 'lb-idle', 'trabalhando')]));
   }
 
-  /** Balão no lugar do agente no chat: só o pensamento (o "digitando" o lugar já tem). */
-  function paintSpot(el: HTMLElement, v: ActorView | undefined): void {
-    const text = enabled && v?.kind === 'thought' ? v.text : '';
-    if (el.dataset.lb === text) {
+  /** Balão no lugar do ator no chat (spotContent): o pensamento e, na fala do Claude, os pontinhos antes dele. */
+  function paintSpot(id: string, el: HTMLElement, v: ActorView | undefined): void {
+    const { dots, text } = spotContent(id, enabled ? v : undefined);
+    const sig = `${dots ? '1' : '0'}${text}`;
+    if (el.dataset.lb === sig) {
       return;
     }
-    el.dataset.lb = text;
+    el.dataset.lb = sig;
+    // Os pontinhos são o mesmo nó entre trocas de pensamento: a animação não reinicia.
+    const kept = dots ? el.querySelector<HTMLElement>(':scope > .lb-typing') : null;
     const bubble = text ? bubbleFor('thought', text) : undefined;
-    el.replaceChildren(...(bubble ? [bubble] : []));
+    el.replaceChildren(...(dots ? [kept ?? typingDots()] : []), ...(bubble ? [bubble] : []));
     el.title = text;
+  }
+
+  function paintSpotTime(id: string, now: number): void {
+    const time = deps.spotTime?.(id);
+    const v = model.view(id, now);
+    if (time && v) {
+      time.textContent = fmtElapsed(v.elapsedMs);
+    }
   }
 
   /** Reconstrói as linhas que mudaram. Chamado só quando um evento muda o conjunto ou o texto de alguém. */
   function render(): void {
     const now = Date.now();
     const split = splitTray(model.ids(), (id) => !!deps.chatSpot?.(id));
-    for (const [id, el] of spots) {
-      if (!split.chat.includes(id) || deps.chatSpot?.(id) !== el) {
-        paintSpot(el, undefined);
-        spots.delete(id);
-      }
-    }
-    for (const id of split.chat) {
-      const el = deps.chatSpot!(id)!;
-      spots.set(id, el);
-      paintSpot(el, model.view(id, now));
-    }
     relayout(() => {
+      // O lugar do Claude aparece e some com o balão: muda a altura do log como a faixa.
+      for (const [id, el] of spots) {
+        if (!split.chat.includes(id) || deps.chatSpot?.(id) !== el) {
+          paintSpot(id, el, undefined);
+          spots.delete(id);
+        }
+      }
+      for (const id of split.chat) {
+        const el = deps.chatSpot!(id)!;
+        spots.set(id, el);
+        paintSpot(id, el, model.view(id, now));
+        paintSpotTime(id, now);
+      }
       const ids = split.tray;
       const shown = ids.slice(0, MAX_ROWS);
       for (const [id, row] of rows) {
@@ -207,6 +223,9 @@ export function createLiveBubbles(deps: LiveBubblesDeps) {
           if (v) {
             row.time.textContent = fmtElapsed(v.elapsedMs);
           }
+        }
+        for (const id of spots.keys()) {
+          paintSpotTime(id, now);
         }
       }, 1000);
     }

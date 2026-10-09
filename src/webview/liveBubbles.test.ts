@@ -3,7 +3,7 @@
  *   npx esbuild src/webview/liveBubbles.test.ts --bundle --platform=node --outfile=$TEMP/liveBubbles.test.js && node $TEMP/liveBubbles.test.js
  */
 import * as assert from 'node:assert/strict';
-import { LiveModel, TextPacer, agentNow, clip, describeTool, flatLine, fmtElapsed, mcpToolLabel, openTool, splitTray, tail } from './liveLogic';
+import { LiveModel, TextPacer, agentNow, clip, describeTool, flatLine, fmtElapsed, mcpToolLabel, openTool, splitTray, spotContent, tail } from './liveLogic';
 
 let failed = 0;
 function test(name: string, fn: () => void): void {
@@ -187,11 +187,29 @@ test('linha "Agora": ferramenta aberta, texto, última ferramenta ou começando'
   assert.equal(flatLine('a'.repeat(10), 5), 'aaaa…');
 });
 
-test('faixa: agente com post rodando no chat sai dela; chat principal e quem não tem lugar ficam', () => {
+test('faixa: agente com post rodando no chat sai dela; quem não tem lugar fica', () => {
   const inChat = (id: string) => id === 'a2';
   assert.deepEqual(splitTray(['main', 'a2', 'a3'], inChat), { tray: ['main', 'a3'], chat: ['a2'] });
   assert.deepEqual(splitTray(['a2'], inChat), { tray: [], chat: ['a2'] });
   assert.deepEqual(splitTray([], inChat), { tray: [], chat: [] });
+});
+
+test('faixa: o Claude com lugar na fala do turno sai dela; sem mais ninguém a faixa fica vazia', () => {
+  const inChat = (id: string) => id === 'main' || id === 'a2';
+  assert.deepEqual(splitTray(['main', 'a2', 'a3'], inChat), { tray: ['a3'], chat: ['main', 'a2'] });
+  assert.deepEqual(splitTray(['main'], inChat), { tray: [], chat: ['main'] });
+  // Chat lateral de consulta: o Claude não tem lugar no log e continua na faixa.
+  assert.deepEqual(splitTray(['main'], () => false), { tray: ['main'], chat: [] });
+});
+
+test('lugar no chat: o Claude ganha pontinhos e pensamento; o agente só o pensamento', () => {
+  assert.deepEqual(spotContent('main', { kind: 'thought', text: 'lendo o índice' }), { dots: true, text: 'lendo o índice' });
+  assert.deepEqual(spotContent('main', { kind: 'none', text: '' }), { dots: true, text: '' });
+  // Texto chegando: o lugar fica vazio e some, a fala toma o lugar.
+  assert.deepEqual(spotContent('main', { kind: 'typing', text: '' }), { dots: false, text: '' });
+  assert.deepEqual(spotContent('main', undefined), { dots: false, text: '' });
+  assert.deepEqual(spotContent('a2', { kind: 'thought', text: 'compilando' }), { dots: false, text: 'compilando' });
+  assert.deepEqual(spotContent('a2', { kind: 'typing', text: '' }), { dots: false, text: '' });
 });
 
 if (failed) {
