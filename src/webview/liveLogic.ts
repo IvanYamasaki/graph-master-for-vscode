@@ -397,8 +397,9 @@ export function agentNow(items: readonly NowItem[], lastTool: string | undefined
 }
 
 /**
- * Quem aparece na faixa de baixo e quem no próprio lugar do chat. Agente com lugar visível no log (o post que roda)
- * mostra o balão lá; a faixa fica com o chat principal e com quem não tem lugar no log. Faixa vazia some.
+ * Quem aparece na faixa de baixo e quem no próprio lugar do chat. Ator com lugar visível no log (o post do agente que
+ * roda, a fala do Claude no turno em andamento) mostra o balão lá; a faixa fica com quem não tem lugar no log. Faixa
+ * vazia some.
  */
 export function splitTray(ids: readonly string[], inChat: (id: string) => boolean): { tray: string[]; chat: string[] } {
   const tray: string[] = [];
@@ -407,4 +408,17 @@ export function splitTray(ids: readonly string[], inChat: (id: string) => boolea
     (inChat(id) ? chat : tray).push(id);
   }
   return { tray, chat };
+}
+
+/**
+ * O que vai no lugar de um ator no log. O post do agente já tem os pontinhos e o tempo: lá entra só o pensamento. O
+ * lugar do chat principal ("main") fica sob o nome do Claude e traz os pontinhos com o pensamento; enquanto o texto
+ * chega ele fica vazio (e some), e a fala toma o lugar.
+ */
+export function spotContent(id: string, v: Pick<ActorView, 'kind' | 'text'> | undefined): { dots: boolean; text: string } {
+  const text = v?.kind === 'thought' ? v.text : '';
+  if (id !== 'main') {
+    return { dots: false, text };
+  }
+  return v && v.kind !== 'typing' ? { dots: true, text } : { dots: false, text: '' };
 }

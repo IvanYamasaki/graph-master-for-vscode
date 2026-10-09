@@ -21,7 +21,7 @@ import { createLiveBubbles, typingDots } from './liveBubbles';
 import { agentNow } from './liveLogic';
 import { LiveTexts } from './liveText';
 import { createThreadUi } from './threadUi';
-import { createSlackLog, showsInChat } from './slackLog';
+import { authorOf, createSlackLog, showsInChat } from './slackLog';
 import { freshSurge, step as refireStep, type SurgeState } from './refireFold';
 import { claudeThreadId, excerpt, parseThreadMessage, splitBlocks, userThreadId, type AgentPost, type ThreadBlock } from '../chat/threadModel';
 import { FoldGroup, actionOwners, detailsLabel, isAgentSpawn, isFoldable, type TurnPart } from './toolFold';
@@ -360,6 +360,19 @@ const empty = h(
 );
 log.append(empty);
 const activity = h('div', { class: 'activity hidden' });
+/**
+ * Enquanto o chat principal trabalha, o fim do log guarda o lugar da fala do Claude: o cabeçalho com o tempo correndo
+ * (quando a mensagem de cima não é dele) e, logo abaixo, os pontinhos e o balão de pensamento, que o liveBubbles
+ * pinta no lugar da faixa de baixo. O lugar some enquanto o texto chega (a fala nova entra antes dele, sob o mesmo
+ * cabeçalho) e sai do log quando o turno acaba. No chat lateral de consulta, sem o visual do Slack, fica a faixa.
+ */
+const mainSpot = (() => {
+  const slot = h('span', { class: 'live-spot-slot' });
+  const time = h('span', { class: 'lb-time' });
+  const body = h('div', { class: 'live-spot-body' }, slot);
+  return { el: h('div', { class: 'live-spot' }, body), body, slot, time, head: undefined as HTMLElement | undefined };
+})();
+
 /** Balões de digitando e pensamento e a faixa de quem trabalha, entre o log e a caixa de texto. */
 const live = createLiveBubbles({
   log,
@@ -367,9 +380,13 @@ const live = createLiveBubbles({
   labelOf: (id) => (id === 'main' ? brand() : agents.get(id)?.description || id),
   onOpen: (id, anchor) => openCardPopup(anchor, id, false),
   chatSpot: (id) => {
+    if (id === 'main') {
+      return mainSpot.el.parentElement === log ? mainSpot.slot : undefined;
+    }
     const card = agentCards.get(id);
     return card?.isConnected && !card.hidden ? chatSlots.get(card)?.think : undefined;
   },
+  spotTime: (id) => (id === 'main' ? mainSpot.time : undefined),
 });
 const runBar = h('div', {
   class: 'runbar hidden',
@@ -2142,7 +2159,12 @@ function scrollDown(force = false): void {
 
 function append(el: HTMLElement, container: HTMLElement = log): void {
   empty.remove();
-  container.append(el);
+  // O lugar do Claude no turno em andamento fica sempre no fim do log: o que chega entra antes dele.
+  if (container === log && mainSpot.el.parentElement === log) {
+    log.insertBefore(el, mainSpot.el);
+  } else {
+    container.append(el);
+  }
   if (container === log) {
     slackLog.stamp(el);
     if (isTurnEdge(el)) {
@@ -2150,7 +2172,54 @@ function append(el: HTMLElement, container: HTMLElement = log): void {
     } else {
       bindTurn(null, false);
     }
+    syncMainSpot();
     scrollDown();
+  }
+}
+
+// ---------- Lugar do Claude no turno em andamento ----------
+
+/**
+ * A mensagem à vista logo acima do elemento é do Claude (fala, ações dela, imagem)? Nota do sistema (permissão, aviso)
+ * fica entre as falas sem quebrar a sequência, como no slackLog.
+ */
+function afterClaude(el: Element): boolean {
+  for (let p = el.previousElementSibling as HTMLElement | null; p; p = p.previousElementSibling as HTMLElement | null) {
+    if (p.hidden || p.classList.contains('hidden') || p.classList.contains('sl-meta')) {
+      continue;
+    }
+    return p.classList.contains('msg-details') || authorOf(p.classList) === 'claude';
+  }
+  return false;
+}
+
+/** Põe, ajusta ou tira o lugar do Claude conforme o turno. Idempotente: roda a cada elemento novo no log. */
+function syncMainSpot(): void {
+  const spot = mainSpot;
+  if (!state.busy || state.companion) {
+    if (spot.el.isConnected) {
+      spot.el.remove();
+      live.refresh();
+    }
+    return;
+  }
+  const placed = spot.el.parentElement !== log;
+  if (placed) {
+    empty.remove();
+    spot.head?.remove();
+    spot.head = slackLog.header('claude', Date.now());
+    spot.el.prepend(spot.head);
+    log.append(spot.el);
+  }
+  // Logo abaixo de uma fala do Claude o balão é a continuação dela: sem cabeçalho, o tempo vai para o fim da linha.
+  const cont = afterClaude(spot.el);
+  spot.head!.hidden = cont;
+  const home = cont ? spot.body : spot.head!;
+  if (spot.time.parentElement !== home) {
+    home.append(spot.time);
+  }
+  if (placed) {
+    live.refresh();
   }
 }
 
@@ -2258,7 +2327,7 @@ function bindTurn(end: Element | null, turnOver: boolean): void {
   }
   const seg: HTMLElement[] = [];
   for (let el = end ? end.previousElementSibling : log.lastElementChild; el && !isTurnEdge(el); el = el.previousElementSibling) {
-    if (!el.classList.contains('msg-details')) {
+    if (!el.classList.contains('msg-details') && el !== mainSpot.el) {
       seg.unshift(el as HTMLElement);
     }
   }
@@ -2654,6 +2723,7 @@ function mainMd(el: HTMLElement, text: string): string {
   // Fala do turno em andamento que ganhou (ou perdeu) texto pode virar a dona das ações dele.
   if (el.parentElement === log && !el.nextElementSibling?.matches('.msg.user, .result')) {
     bindTurn(null, false);
+    syncMainSpot();
   }
   return shown;
 }
@@ -3142,7 +3212,8 @@ function imageBlock(text: string): HTMLElement | null {
  * à vista e um contador; o clique abre a lista inteira. Erro e aviso com botão ficam sempre sozinhos.
  */
 function addNotice(text: string, level: 'info' | 'error', action?: NoticeAction): void {
-  const last = log.lastElementChild as HTMLElement | null;
+  const end = log.lastElementChild;
+  const last = (end === mainSpot.el ? end.previousElementSibling : end) as HTMLElement | null;
   if (level === 'info' && !action && last) {
     if (last.classList.contains('sys-group')) {
       pushSysLine(last as HTMLDetailsElement, text);
@@ -3647,13 +3718,7 @@ const popup = createNodePopup({
   },
   stop: (id) => send({ type: 'stopAgent', id }),
   resume: (id) => send({ type: 'resumeAgent', id }),
-  accountsFor: (a) => {
-    // Sem accountId o agente roteado usa a conta do chat.
-    const home = a.accountId ?? state.profileId;
-    return state.profiles
-      .filter((p) => p.provider !== 'codex')
-      .map((p) => ({ id: p.id, label: p.account ? `${p.name} · ${p.account}` : p.name, current: p.id === home }));
-  },
+  accountsFor: claudeAccountsFor,
   switchAccount: (id, profileId) => send({ type: 'agentSwitchAccount', id, profileId }),
   worktreeAction: (id, action) => send({ type: 'worktreeAction', id, action }),
   brainReady: () => brainReady,
@@ -4010,8 +4075,67 @@ interface ChatSlot {
   now: HTMLElement;
   /** Balão de pensamento ("compilando o projeto"), pintado pelo liveBubbles no lugar da faixa de baixo. */
   think: HTMLElement;
+  /** Troca de conta e retomada, só enquanto o agente está parado por limite de uso. */
+  limit: HTMLElement;
 }
 const chatSlots = new WeakMap<HTMLElement, ChatSlot>();
+
+/** Contas Claude para onde o agente pode ir, com a atual marcada. Mesma lista do popup e do lugar no chat. */
+function claudeAccountsFor(a: AgentInfo): { id: string; label: string; current: boolean }[] {
+  // Sem accountId o agente roteado usa a conta do chat.
+  const home = a.accountId ?? state.profileId;
+  return state.profiles
+    .filter((p) => p.provider !== 'codex')
+    .map((p) => ({ id: p.id, label: p.account ? `${p.name} · ${p.account}` : p.name, current: p.id === home }));
+}
+
+/** Parado por limite de uso no lugar do chat: a troca de conta só vale para agente roteado do Claude, como no popup. */
+function limitStopped(a: AgentInfo): boolean {
+  return a.status === 'failed' && !!a.limit && !a.restored && a.kind === 'routed' && a.provider !== 'codex' && !a.search && !a.infra;
+}
+
+/**
+ * Ações no lugar do agente parado por limite de uso: trocar de conta (menu com as outras contas logadas) e tentar
+ * de novo. A troca é do usuário, por clique. Só repinta quando o conjunto muda, para não derrubar o menu aberto.
+ */
+function paintLimitActions(box: HTMLElement, a: AgentInfo): void {
+  const show = limitStopped(a);
+  box.hidden = !show;
+  const others = show ? claudeAccountsFor(a).filter((c) => !c.current) : [];
+  const sig = show ? `${a.id}|${a.sessionId ?? ''}|${others.map((c) => `${c.id}:${c.label}`).join(',')}` : '';
+  if (box.dataset.sig === sig) {
+    return;
+  }
+  box.dataset.sig = sig;
+  if (!show) {
+    box.replaceChildren();
+    return;
+  }
+  const stop = (fn: () => void) => (e: Event) => {
+    // O clique no cartão abre o popup; aqui ele só aciona o botão.
+    e.stopPropagation();
+    fn();
+  };
+  const parts: Child[] = [];
+  if (others.length) {
+    const sw = h('button', { class: 'ag-limit-btn', title: 'Passa este agente para outra conta Claude logada: mesmo nó no mapa, mesma sessão.' }, 'Trocar de conta');
+    sw.addEventListener('click', stop(() => {
+      openMenu(sw, [{
+        title: 'Passar o agente para',
+        items: others.map((c) => ({ label: c.label, onPick: () => send({ type: 'agentSwitchAccount', id: a.id, profileId: c.id }) })),
+      }]);
+    }));
+    parts.push(sw);
+  } else {
+    parts.push(h('span', { class: 'ag-limit-note' }, 'nenhuma outra conta logada'));
+  }
+  const resume = resumeButton(a, 'ag-limit-btn');
+  if (resume) {
+    resume.addEventListener('click', (e) => e.stopPropagation());
+    parts.push(resume);
+  }
+  fill(box, ...parts);
+}
 
 /** Linha de baixo: ícone do estado (pontinhos de "digitando" enquanto roda) e a nota. Troca o ícone só quando o estado muda. */
 function paintChatLine(line: HTMLElement, a: AgentInfo, think?: HTMLElement): void {
@@ -4150,14 +4274,16 @@ function chatSlot(card: HTMLElement, a: AgentInfo): void {
       line: h('div', { class: 'ag-line2 ag-chat' }),
       now: h('div', { class: 'ag-now' }),
       think: h('span', { class: 'ag-think' }),
+      limit: h('div', { class: 'ag-limit', hidden: '' }),
     };
     chatSlots.set(card, slot);
-    card.replaceChildren(slot.av, h('div', { class: 'ag-main' }, slot.top, slot.line, slot.now));
+    card.replaceChildren(slot.av, h('div', { class: 'ag-main' }, slot.top, slot.line, slot.now, slot.limit));
   }
   slot.av.textContent = a.id.slice(0, 3);
   fill(slot.top, ...cardTop(a));
   paintChatLine(slot.line, a, slot.think);
   paintNowLine(slot.now, a);
+  paintLimitActions(slot.limit, a);
 }
 
 /** Log novo de um agente rodando: só as linhas de baixo dos cartões dele mudam, no lugar. */
@@ -5102,7 +5228,14 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
         state.thinking = false;
         liveBlocks.settle();
       }
-      live.setWorking('main', msg.value);
+      // Começo: o lugar no log antes, e o liveBubbles já põe o Claude nele, não na faixa. Fim: o lugar sai depois.
+      if (msg.value) {
+        syncMainSpot();
+        live.setWorking('main', true);
+      } else {
+        live.setWorking('main', false);
+        syncMainSpot();
+      }
       renderControls();
       refreshMap();
       break;
@@ -5216,6 +5349,7 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       }
       threadUi.close();
       clearLog();
+      syncMainSpot();
       // Posições arrastadas são da conversa que saiu: a próxima traz as dela (mapLayout) ou começa sem nenhuma.
       mapPinned = {};
       graph.setPinned({});

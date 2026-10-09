@@ -4023,6 +4023,11 @@ button.empty-ex:focus-visible {
   margin-top: 4px;
 }
 
+/* Cabeçalho de fala escondida (só ações, só o bloco <post>): o display flex vencia o atributo hidden. */
+.sl-head[hidden] {
+  display: none;
+}
+
 .sl-av {
   position: absolute;
   left: 0;
@@ -4179,6 +4184,49 @@ button.empty-ex:focus-visible {
 
 .ag-chat:has(.ag-think:not(:empty)) .lb-typing {
   display: none;
+}
+
+/* Lugar do Claude no turno em andamento: cabeçalho igual ao das falas e, sob o nome, os pontinhos e o pensamento. */
+.log > .live-spot {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+}
+
+.live-spot:has(.live-spot-slot:empty) {
+  display: none;
+}
+
+.live-spot .sl-head .lb-time {
+  align-self: baseline;
+}
+
+.live-spot-body {
+  --lb-color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+  margin-left: var(--sl-gutter, 0);
+  padding: 1px 0;
+}
+
+.live-spot-slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  max-width: 80%;
+}
+
+.live-spot-slot .lb-thought {
+  min-width: 0;
+}
+
+.log.slack > .sl-body + .live-spot,
+.log.slack > .msg-details + .live-spot {
+  margin-top: 2px;
 }
 
 /* Estatística do turno: pequena e cinza, mais visível no hover. */
@@ -4423,6 +4471,38 @@ button.empty-ex:focus-visible {
   flex: none;
   transform: scale(0.8);
   transform-origin: left center;
+}
+
+/* Parado por limite de uso: trocar de conta e tentar de novo, sem abrir o popup. */
+.ag-limit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.ag-limit[hidden] {
+  display: none;
+}
+
+.ag-limit-btn {
+  padding: 2px 8px;
+  font-size: 0.86em;
+  color: var(--vscode-button-secondaryForeground, var(--fg));
+  background: var(--vscode-button-secondaryBackground, transparent);
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, transparent));
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ag-limit-btn:hover {
+  background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
+}
+
+.ag-limit-note {
+  font-size: 0.86em;
+  color: var(--muted);
 }
 
 .ag-now {
