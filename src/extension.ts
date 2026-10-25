@@ -18,6 +18,10 @@ import { resolveCodexExecutable } from './codexPath';
 import { CHAT_VIEW_TYPE, ChatEnv, ChatPanel } from './chat/panel';
 import { COMPANION_VIEW_TYPE, CompanionPanel } from './chat/companion/panel';
 import { ExternalProviders } from './chat/external';
+import { JevAccounts } from './chat/jevAccounts';
+import { registerJevView } from './jevView';
+import { registerChatSidebar } from './chatSidebar';
+import { JEV_AUTO_TIMEOUT_MS, latencyStats } from './chat/jevAuto';
 import { configureResearchPack, initResearchSecrets } from './chat/infra/researchPack';
 import { initMcpApprovals } from './chat/guard/mcpApproval';
 import { Lab } from './chat/lab/tools';
@@ -37,6 +41,7 @@ let lastEditor: vscode.TextEditor | undefined;
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   store = new ProfileStore(context.globalState);
   const external = ExternalProviders.init(context);
+  const jev = JevAccounts.init(context);
   // Tokens do pacote de pesquisa: carregados antes do primeiro chat para as sessões já saírem com eles no ambiente.
   await initResearchSecrets(context.secrets).catch(() => undefined);
   // Aprovações dos servidores do .mcp.json, por conteúdo de entrada: lidas antes de qualquer sessão subir.
@@ -60,7 +65,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         };
       }),
   };
-  const openChat = (profile: Profile) => ChatPanel.open(chatEnv, profile);
+  // Aba nova no grupo dos chats que já existem, como o + do chat (antes abria ao lado, dividindo o editor).
+  const openChat = (profile: Profile) => ChatPanel.open(chatEnv, profile, { viewColumn: ChatPanel.preferredColumn() });
 
   const tree = new ProfileTree();
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
@@ -110,8 +116,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
     vscode.window.registerTreeDataProvider('agentGraphMaster.view', tree),
-    // View vazia de propósito: o VS Code mostra no lugar os botões de viewsWelcome (Abrir chat).
-    vscode.window.registerTreeDataProvider('agentGraphMaster.chatLauncher', { getTreeItem: (i: vscode.TreeItem) => i, getChildren: () => [] }),
+    ...registerChatSidebar(chatEnv),
     store.onDidChange(() => {
       tree.refresh();
       updateStatusBar();
@@ -157,6 +162,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('agentGraphMaster.setOpenAIKey', () => external.promptKey('openai')),
     vscode.commands.registerCommand('agentGraphMaster.clearGeminiKey', () => external.clearKey('gemini')),
     vscode.commands.registerCommand('agentGraphMaster.clearOpenAIKey', () => external.clearKey('openai')),
+    // Contas do Jev: a chave fica no SecretStorage, a lista (nome, provedor, gasto) no globalState.
+    vscode.commands.registerCommand('agentGraphMaster.addJevAccount', () => jev.add()),
+    vscode.commands.registerCommand('agentGraphMaster.removeJevAccount', () => jev.remove()),
+    vscode.commands.registerCommand('agentGraphMaster.testJev', () => testJevLatency(jev)),
+    ...registerJevView(jev),
     vscode.commands.registerCommand('agentGraphMaster.configureResearchPack', () => configureResearchPack()),
     vscode.commands.registerCommand('agentGraphMaster.experimentReport', async () => {
       const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -586,7 +596,7 @@ function describeStatus(id: string): string {
     return 'verificando...';
   }
   if (!status.loggedIn) {
-    return status.error ? `erro: ${status.error}` : 'sem login';
+    return status.error ? `erro: ${status.error}` : status.expired ? 'sessão expirada, entre de novo' : 'sem login';
   }
   return [status.email, status.subscriptionType].filter(Boolean).join(' · ') || 'logado';
 }
@@ -634,4 +644,56 @@ class ProfileTree implements vscode.TreeDataProvider<ProfileItem> {
     const ordered = [...store.all().filter((p) => !isCodex(p)), ...store.all().filter(isCodex)];
     return ordered.map((profile) => new ProfileItem(profile, profile.id === activeId));
   }
+}
+
+/** Cinco consultas pequenas e reais ao Jev, para ver se a latência cabe no tempo dos usos automáticos. */
+async function testJevLatency(jev: JevAccounts): Promise<void> {
+  if (!jev.active()) {
+    void vscode.window.showWarningMessage('Nenhuma conta Jev ativa. Adicione uma com "Agent Graph Master: Adicionar conta Jev" (e confira agentGraphMaster.jev.enabled).');
+    return;
+  }
+  const RUNS = 5;
+  const state = 'Um agente de programação leu três arquivos do projeto e agora roda os testes unitários, que passaram.';
+  const questions = {
+    progressing: { type: 'noul' as const, instructions: 'O agente está avançando na tarefa.' },
+    next: { type: 'choice' as const, instructions: 'Qual é o próximo passo mais provável?', criteria: { commit: 'registrar a mudança', editar: 'editar mais código', parar: 'encerrar a tarefa' } },
+  };
+  const times: number[] = [];
+  let usd = 0;
+  let tokens = 0;
+  let failure = '';
+  await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Testando o Jev', cancellable: false }, async (progress) => {
+    for (let i = 0; i < RUNS; i++) {
+      progress.report({ message: `consulta ${i + 1} de ${RUNS}`, increment: 100 / RUNS });
+      const t0 = Date.now();
+      try {
+        const { decision } = await jev.decide(state, questions);
+        times.push(Date.now() - t0);
+        usd += decision.cost.usd;
+        tokens += decision.cost.tokens;
+      } catch (err) {
+        failure = err instanceof Error ? err.message : String(err);
+        break;
+      }
+    }
+  });
+  const st = latencyStats(times);
+  if (!st) {
+    void vscode.window.showErrorMessage(`O teste do Jev falhou na primeira consulta: ${failure}`);
+    return;
+  }
+  const s = (ms: number) => `${(ms / 1000).toFixed(2)} s`;
+  const lines = [
+    `Jev: ${st.n} consulta(s) · média ${s(st.meanMs)} · p50 ${s(st.p50Ms)} · p95 ${s(st.p95Ms)} · máx ${s(st.maxMs)}`,
+    `Custo total: US$ ${usd.toFixed(4)} (${tokens} tokens).`,
+  ];
+  if (failure) {
+    lines.push(`Parou depois de ${st.n} de ${RUNS}: ${failure}`);
+  }
+  const slow = st.p95Ms > JEV_AUTO_TIMEOUT_MS;
+  if (slow) {
+    lines.push(`Aviso: a p95 passa de ${s(JEV_AUTO_TIMEOUT_MS)}, então os usos automáticos vão cair no tempo limite e seguir sem o Jev.`);
+  }
+  const text = lines.join('\n');
+  void (slow || failure ? vscode.window.showWarningMessage(text) : vscode.window.showInformationMessage(text));
 }

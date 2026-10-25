@@ -37,6 +37,8 @@ export interface AuthStatus {
   subscriptionType?: string;
   authMethod?: string;
   error?: string;
+  /** Havia login, mas a sessão venceu: a conta precisa entrar de novo. */
+  expired?: boolean;
 }
 
 export function defaultProfile(): Profile {

@@ -1,6 +1,7 @@
 // Contas e textos do orçamento. Sem dependência de Node nem do VS Code: o webview importa daqui também.
 
 import type { AgentBudget, AgentInfo, AgentSpent } from '../protocol';
+import { fmtJevUsd } from '../jev';
 
 /** A partir daqui o mapa pinta a barra de âmbar. */
 export const BUDGET_WARN = 0.8;
@@ -54,6 +55,14 @@ export function budgetLines(a: Pick<AgentInfo, 'budget' | 'spent' | 'provider'>)
     lines.push(`${fmtUsd(s.usd ?? 0)}${b.maxUsd ? ` de ${fmtUsd(b.maxUsd)}` : ''} estimados`);
   } else if (a.provider === 'codex') {
     lines.push(b.maxUsd ? 'custo: o Codex não informa, max_usd não vale aqui' : 'custo: o Codex não informa');
+  }
+  // Parte do advisor tool, já somada acima: quanto das consultas ao modelo mais forte pesou no gasto.
+  if (s.advisor?.tokens) {
+    lines.push(`advisor: ${fmtTokensShort(s.advisor.tokens)} tokens${s.advisor.usd !== undefined ? `, ${fmtUsd(s.advisor.usd)}` : ''}`);
+  }
+  // Consultas ao Jev, também já somadas: custam frações de centavo, então o número que importa é quantas foram.
+  if (s.jev?.calls) {
+    lines.push(`Jev: ${s.jev.calls} ${s.jev.calls === 1 ? 'consulta' : 'consultas'}, ${fmtTokensShort(s.jev.tokens)} tokens, ${fmtJevUsd(s.jev.usd)}`);
   }
   return lines;
 }

@@ -465,6 +465,51 @@ test('orçamento: quem criou libera mais sem o usuário', async () => {
   guard.dispose();
 });
 
+test('advisor: tokens e US$ entram no gasto e no teto, com a parte dele separada e sem contar o mesmo uso duas vezes', () => {
+  const agents = new Map<string, AgentInfo>();
+  agents.set('a6', { id: 'a6', kind: 'routed', description: 'depuração', status: 'running', creator: 'main', budget: { maxUsd: 0.1 }, totalTokens: 0, durationMs: 0, toolUses: 0 } as AgentInfo);
+  const alerts: GuardAlert[] = [];
+  const guard = new AgentGuard({
+    cwd: os.tmpdir(),
+    info: (id) => agents.get(id),
+    update: (id, patch) => {
+      const a = agents.get(id);
+      if (a) {
+        agents.set(id, { ...a, ...patch });
+      }
+    },
+    post: (msg: HostMessage) => {
+      if (msg.type === 'guardAlert') {
+        alerts.push({ ...msg.alert });
+      }
+    },
+    isBusy: () => true,
+    interrupt: async () => undefined,
+    continueAgent: () => undefined,
+    stopForGood: async () => undefined,
+    sendFromUser: () => undefined,
+    stop: async () => undefined,
+    log: () => undefined,
+  });
+  guard.onUsage('a6', { messageId: 'm1', tokens: 1000, usdEstimate: 0.01 });
+  guard.onUsage('a6', { messageId: 'm1#advisor', tokens: 12_000, usdEstimate: 0.06, advisor: true });
+  // Mesmo uso repetido (bloco seguinte, message_delta): nada muda.
+  guard.onUsage('a6', { messageId: 'm1#advisor', tokens: 12_000, usdEstimate: 0.06, advisor: true });
+  let spent = agents.get('a6')!.spent!;
+  assert.equal(spent.tokens, 13_000);
+  assert.ok(Math.abs((spent.usd ?? 0) - 0.07) < 1e-9);
+  assert.equal(spent.advisor?.tokens, 12_000);
+  assert.ok(Math.abs((spent.advisor?.usd ?? 0) - 0.06) < 1e-9);
+  assert.equal(alerts.length, 0, 'abaixo do teto');
+  // Segunda consulta na mesma mensagem: o uso cresce e passa do teto de US$ 0,10.
+  guard.onUsage('a6', { messageId: 'm1#advisor', tokens: 20_000, usdEstimate: 0.1, advisor: true });
+  spent = agents.get('a6')!.spent!;
+  assert.equal(spent.advisor?.tokens, 20_000);
+  assert.ok(Math.abs((spent.advisor?.usd ?? 0) - 0.1) < 1e-9);
+  assert.ok(alerts.some((a) => a.agentId === 'a6' && a.kind === 'budget'), 'o advisor conta no max_usd');
+  guard.dispose();
+});
+
 test('cofre: grava, soma padrões e conta tentativas', () => {
   resetLockboxCacheForTest();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'agm-lockbox-'));
@@ -684,6 +729,96 @@ test('comando de subagente que cita caminho protegido é recusado', () => {
   assert.ok(commandBlocked(['eval.py'], [root], 'python eval.py --seed {seed}'));
   assert.equal(commandBlocked(['data/test/**'], [root], 'python train.py --data data/train --seed {seed}'), undefined);
   assert.equal(commandBlocked([], [root], 'qualquer coisa'), undefined);
+});
+
+function stuckFixture(jev: ConstructorParameters<typeof AgentGuard>[1]) {
+  const agents = new Map<string, AgentInfo>();
+  agents.set('a1', { id: 'a1', kind: 'routed', description: 'ler o repo', status: 'running', totalTokens: 0, durationMs: 0, toolUses: 0 } as AgentInfo);
+  const alerts: GuardAlert[] = [];
+  const logs: string[] = [];
+  const guard = new AgentGuard(
+    {
+      cwd: os.tmpdir(),
+      info: (id) => agents.get(id),
+      update: (id, patch) => {
+        const a = agents.get(id)!;
+        agents.set(id, { ...a, ...patch });
+      },
+      post: (msg: HostMessage) => {
+        if (msg.type === 'guardAlert') {
+          alerts.push(msg.alert);
+        }
+      },
+      isBusy: () => false,
+      interrupt: async () => undefined,
+      continueAgent: () => undefined,
+      stopForGood: async () => undefined,
+      sendFromUser: () => undefined,
+      stop: async () => undefined,
+      log: (_id, text) => logs.push(text),
+    },
+    jev,
+  );
+  const call = () => guard.onMessage('a1', { type: 'toolUse', name: 'Read', input: { file_path: 'src/a.ts' } } as HostMessage);
+  return { guard, alerts, logs, call };
+}
+
+test('stuckCheck: sem consulta (desligado) o cartão sai na hora', () => {
+  testConfig['stuckRepeatCount'] = 3;
+  const f = stuckFixture(() => undefined);
+  f.call();
+  f.call();
+  f.call();
+  assert.equal(f.alerts.filter((a) => a.kind === 'stuck').length, 1);
+  f.guard.dispose();
+});
+
+test('stuckCheck: "avançando" segura o cartão e não reconsulta logo; uma consulta por vez', async () => {
+  testConfig['stuckRepeatCount'] = 3;
+  testConfig['stuckMinutes'] = 10;
+  const seen: { recentCalls: string[]; reason: string }[] = [];
+  const f = stuckFixture((input) => {
+    seen.push(input);
+    return Promise.resolve({ verdict: 'progressing' as const, summary: 'Jev: avança' });
+  });
+  f.call();
+  f.call();
+  f.call();
+  f.call(); // consulta em andamento: não abre outra
+  assert.equal(seen.length, 1);
+  assert.match(seen[0].recentCalls[0], /^Read .*src\/a\.ts/);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(f.alerts.length, 0);
+  assert.ok(f.logs.some((l) => /Jev: avança/.test(l)));
+  f.call();
+  f.call();
+  assert.equal(seen.length, 1, 'em espera: poucas chamadas novas, sem reconsulta');
+  for (let i = 0; i < 8; i++) {
+    f.call();
+  }
+  assert.equal(seen.length, 2, 'depois de N chamadas novas reconsulta');
+  f.guard.dispose();
+});
+
+test('stuckCheck: "preso" e erro emitem o cartão uma vez, com o resumo no motivo', async () => {
+  testConfig['stuckRepeatCount'] = 3;
+  const f = stuckFixture(() => Promise.resolve({ verdict: 'stuck' as const, summary: 'Jev: parece preso (P = 5%)' }));
+  f.call();
+  f.call();
+  f.call();
+  f.call();
+  await new Promise((r) => setTimeout(r, 5));
+  const cards = f.alerts.filter((a) => a.kind === 'stuck');
+  assert.equal(cards.length, 1);
+  assert.match(cards[0].text, /Jev: parece preso/);
+  f.guard.dispose();
+  const g = stuckFixture(() => Promise.reject(new Error('rede')));
+  g.call();
+  g.call();
+  g.call();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(g.alerts.filter((a) => a.kind === 'stuck').length, 1, 'erro segue a regra antiga');
+  g.guard.dispose();
 });
 
 void (async () => {

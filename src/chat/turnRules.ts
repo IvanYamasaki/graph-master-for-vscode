@@ -3,11 +3,11 @@
  * o que ainda está pendente antes do relatório final, a janela de entregas automáticas (trava de laço),
  * o reconhecimento de erro de limite de uso e o corte de relatório longo.
  */
-import type { PendingInfo, PendingReason } from './protocol';
+import type { BackgroundTaskInfo, PendingInfo, PendingReason } from './protocol';
 
 export interface PendingInput {
   /** Tarefas em segundo plano abertas na sessão. */
-  background: { id: string; description: string }[];
+  background: BackgroundTaskInfo[];
   /** Filhos vivos que ainda vão reportar a este agente. */
   children: string[];
   /** A quem este agente perguntou (send_to_agent com resposta esperada) e ainda não ouviu de volta. */
@@ -35,7 +35,7 @@ export function pendingInfo(input: PendingInput, opts: { since?: string; note?: 
   const note = opts.note?.trim();
   return {
     reasons,
-    background: input.background.length ? input.background.map((t) => ({ id: t.id, description: t.description })) : undefined,
+    background: input.background.length ? input.background.map((t) => ({ ...t })) : undefined,
     children: input.children.length ? [...input.children] : undefined,
     asked: input.asked.length ? [...input.asked] : undefined,
     since: opts.since ?? (opts.now ?? new Date()).toISOString(),

@@ -8,27 +8,32 @@ import { createLabCards } from './labCards';
 import { createLabView } from './labTree';
 import { createGuardCards } from './guardCards';
 import { STUCK_RING } from './guardUi';
-import { COMPANION_MARK, isWorking, STATUS_LABEL, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, pendingText, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
+import { ADVISOR_REDACTED, ADVISOR_TOOL, COMPANION_MARK, JEV_TOOL, isWorking, STATUS_LABEL, STATUS_RING, agentColor, lastCheckLabel, onOtherAccount, pendingText, repeatLabel, shortAccountName, watchLabel } from '../chat/protocol';
 import { COMPANION_ICON, COMPANION_OPEN_TITLE, createCompanionUi } from './companionUi';
 import type { CompanionInit } from '../chat/companion/types';
 import { describeBrowserAction, isBrowserTool } from '../chat/browser';
 import type { BrowserStatus } from '../chat/browser';
 import type { ConnectedBrowser, RemoteControlState } from '../chat/protocol';
+import { appendCapped } from '../chat/itemCap';
 import { remoteStatusText, remoteTransitionNotice } from '../chat/remoteControl';
 import type { TaskProcs } from '../chat/protocol';
 import { createOrphansView } from './orphansUi';
 import { createLiveBubbles, typingDots } from './liveBubbles';
 import { agentNow } from './liveLogic';
+import { advisorName } from '../chat/advisor';
 import { LiveTexts } from './liveText';
 import { createThreadUi } from './threadUi';
+import { createResourcePill } from './resourcePill';
 import { authorOf, createSlackLog, showsInChat } from './slackLog';
+import { decorateCodeBlocks, restoreSelection, saveSelection } from './copyUi';
 import { freshSurge, step as refireStep, type SurgeState } from './refireFold';
 import { claudeThreadId, excerpt, parseThreadMessage, splitBlocks, userThreadId, type AgentPost, type ThreadBlock } from '../chat/threadModel';
 import { FoldGroup, actionOwners, detailsLabel, isAgentSpawn, isFoldable, type TurnPart } from './toolFold';
 import { closeImageViewer, imageGrid, openImageViewer, setImageViewerActions, type ViewerItem } from './imageViewer';
 import { SHOW_IMAGE_TOOL, baseName, parseShowImage } from '../chat/imageShare';
+import { bgRefresh, bgSig, bgSummary, bgTaskList } from './bgTasks';
 import type { BoxInfo } from '../chat/protocol';
-import type { AccountUsage, AgentInfo, Attachment, ExternalProviderName, HistoryItem, HostMessage, ModelOption, NoticeAction, ProfileOption, FileResult, SessionOption, SlashCommandOption, TaskProposal, UsageInfo, WebviewMessage } from '../chat/protocol';
+import type { AccountUsage, AgentInfo, JevAccountInfo, Attachment, ExternalProviderName, HistoryItem, HostMessage, ModelOption, NoticeAction, ProfileOption, FileResult, SessionOption, SlashCommandOption, TaskProposal, UsageInfo, WebviewMessage } from '../chat/protocol';
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: WebviewMessage): void;
@@ -49,6 +54,8 @@ interface SavedState {
   boxFold?: Record<string, boolean>;
   /** O grafo mostra os agentes concluídos em vez de recolhê-los em quem os criou. */
   showDone?: boolean;
+  /** Largura do painel de thread, em px, arrastada pelo usuário. */
+  threadWidth?: number;
 }
 const saved = (vscode.getState() ?? {}) as SavedState;
 
@@ -61,8 +68,20 @@ const marked = new Marked({ gfm: true, breaks: false });
 // HTML cru vindo do modelo vira texto: nada de tags injetadas na página.
 marked.use({ renderer: { html: ({ text }) => escapeHtml(text) } });
 
+/** Último texto que cada elemento recebeu, com o primeiro nó que o Markdown criou (se mudou, alguém mexeu no conteúdo). */
+const mdSeen = new WeakMap<HTMLElement, { text: string; first: ChildNode | null }>();
+
 function md(el: HTMLElement, text: string): void {
+  // Mesmo texto, mesmo conteúdo: não recria os nós. Repintar apaga a seleção que o usuário fez com o mouse.
+  const seen = mdSeen.get(el);
+  if (seen && seen.text === text && seen.first === el.firstChild && el.firstChild) {
+    return;
+  }
+  const kept = saveSelection(el);
   el.innerHTML = marked.parse(text, { async: false }) as string;
+  decorateCodeBlocks(el);
+  restoreSelection(el, kept);
+  mdSeen.set(el, { text, first: el.firstChild });
 }
 
 // ---------- DOM ----------
@@ -160,6 +179,8 @@ const codexModelWaiters: (() => void)[] = [];
 
 const agents = new Map<string, AgentInfo>();
 const agentItems = new Map<string, HistoryItem[]>();
+/** Itens antigos de cada agente que o teto tirou da memória (o transcrito completo está no disco do CLI). */
+const agentDropped = new Map<string, number>();
 /**
  * Lugar ao vivo de cada agente no log principal (digitando e o que faz agora), guardado para atualizar no lugar.
  * Quando ele entrega o relatório, o mesmo nó vira o post e sai daqui; se ele volta a rodar, ganha um lugar novo.
@@ -244,6 +265,10 @@ const slackLog = createSlackLog({
   brand,
   rawText: (el) => rawTexts.get(el) ?? el.querySelector('.plain')?.textContent ?? el.textContent ?? '',
   onReply: (el) => el.dataset.thread && threadUi.open(el.dataset.thread),
+  onOpenMain: (anchor) => {
+    popAnchor = anchor;
+    popup.open('main', anchor.getBoundingClientRect(), { focus: false });
+  },
 });
 
 // ---------- Dobra de re-disparos vazios do Claude ----------
@@ -464,6 +489,11 @@ const usageBar = h('div', {
   },
 });
 
+/** Pílula de memória no rodapé. O clique dentro dela não pode abrir o menu de contas da barra. */
+const resourcePill = createResourcePill((msg) => send(msg));
+resourcePill.el.addEventListener('click', (e) => e.stopPropagation());
+usageBar.append(resourcePill.el);
+
 const composer = h(
   'footer',
   { class: 'composer sc-anchor' },
@@ -497,6 +527,11 @@ const threadUi = createThreadUi({
   onPost: placePost,
   onPosts: placeAllPosts,
   onThread: (id) => (id ? paintThreadFoot(threadEls.get(id)) : threadEls.forEach((el) => paintThreadFoot(el))),
+  width: saved.threadWidth,
+  onWidth: (w) => {
+    const prev = (vscode.getState() ?? {}) as SavedState;
+    vscode.setState({ ...prev, threadWidth: w });
+  },
 });
 document.getElementById('app')!.append(threadUi.drawer);
 // Botões do visualizador de imagens que precisam do host. "Abrir" só com caminho absoluto; salvar copia o arquivo ou grava o data URL.
@@ -1017,6 +1052,16 @@ function autosize(el: HTMLTextAreaElement): void {
   el.style.height = `${Math.min(el.scrollHeight, 260)}px`;
 }
 
+/** Manda um texto pronto como mensagem do usuário, com bolha e thread, sem mexer no que está no composer. */
+function sendText(text: string): void {
+  const bubble = addUser(text, undefined, log, []);
+  const clientId = `m${++clientSeq}`;
+  if (bubble) {
+    awaitingIds.set(clientId, bubble);
+  }
+  send({ type: 'send', text, clientId });
+}
+
 function submit(): void {
   const text = input.value.trim();
   if (!text && !pending.length) {
@@ -1081,6 +1126,16 @@ async function addFiles(files: readonly File[]): Promise<void> {
 }
 
 function attChip(a: Attachment, onRemove?: () => void): HTMLElement {
+  // Imagem: só a miniatura, com o tamanho pequeno no canto. O nome fica no tooltip e no aria-label.
+  if (a.kind === 'image' && a.dataUrl && !a.error) {
+    return h(
+      'div',
+      { class: 'att att-img', title: a.path ?? a.name, role: 'img', 'aria-label': `Imagem ${a.name}${a.size ? `, ${fmtBytes(a.size)}` : ''}` },
+      h('img', { class: 'att-thumb', src: a.dataUrl, alt: '' }),
+      a.size ? h('span', { class: 'att-size' }, fmtBytes(a.size)) : null,
+      onRemove ? h('button', { class: 'att-x', title: 'Remover', 'aria-label': `Remover ${a.name}`, onclick: onRemove }, icon('close')) : null,
+    );
+  }
   const face =
     a.kind === 'image' && a.dataUrl
       ? h('img', { class: 'att-thumb', src: a.dataUrl, alt: a.name })
@@ -1222,7 +1277,7 @@ function compareVersions(a: number[], b: number[]): number {
 }
 
 /** Só o mais novo de cada família, mais o item `default` e o modelo selecionado agora, mesmo que antigo. */
-function newestModels(models: ModelOption[]): Set<ModelOption> {
+function newestModels(models: ModelOption[], current = state.model): Set<ModelOption> {
   const byFamily = new Map<string, ModelOption[]>();
   for (const m of models) {
     const { family } = modelVersionKey(m.resolvedModel ?? m.value);
@@ -1247,7 +1302,7 @@ function newestModels(models: ModelOption[]): Set<ModelOption> {
   if (def) {
     result.add(def);
   }
-  const cur = models.find((m) => m.value === state.model);
+  const cur = models.find((m) => m.value === current);
   if (cur) {
     result.add(cur);
   }
@@ -1269,6 +1324,8 @@ interface MenuItem {
   keepOpen?: boolean;
   /** Codicon à esquerda, no lugar do check. */
   icon?: string;
+  /** Anéis de uso à direita do texto (um por janela). */
+  rings?: { label: string; pct: number }[];
   title?: string;
 }
 
@@ -1277,6 +1334,41 @@ interface MenuSection {
   items: MenuItem[];
   /** Rodapé cinza da seção. */
   note?: string;
+}
+
+/** Anel de uso: trilho cinza e arco do já usado, do topo no sentido horário, na cor do nível. */
+function usageRing(label: string, pct: number): SVGSVGElement {
+  const ns = 'http://www.w3.org/2000/svg';
+  const p = Math.max(0, Math.min(100, pct));
+  const text = `${label}: ${Math.round(p)}% usado`;
+  const r = 5.5;
+  const circ = 2 * Math.PI * r;
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('class', `ring ${level(p)}`.trim());
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', text);
+  const tip = document.createElementNS(ns, 'title');
+  tip.textContent = text;
+  svg.append(tip);
+  const arc = (cls: string) => {
+    const c = document.createElementNS(ns, 'circle');
+    c.setAttribute('class', cls);
+    c.setAttribute('cx', '8');
+    c.setAttribute('cy', '8');
+    c.setAttribute('r', String(r));
+    c.setAttribute('fill', 'none');
+    return c;
+  };
+  svg.append(arc('ring-track'));
+  // Em 0% não desenha o arco: a ponta redonda apareceria como um pontinho.
+  if (p > 0) {
+    const fillArc = arc('ring-fill');
+    fillArc.setAttribute('stroke-dasharray', `${((circ * p) / 100).toFixed(2)} ${circ.toFixed(2)}`);
+    fillArc.setAttribute('transform', 'rotate(-90 8 8)');
+    svg.append(fillArc);
+  }
+  return svg;
 }
 
 /** Só um menu por vez. Guarda em quem ele está ancorado para poder redesenhar sem reabrir. */
@@ -1338,6 +1430,7 @@ function paintMenu(sections: MenuSection[]): void {
         h('span', { class: 'menu-mark' }, item.selected ? icon('check') : item.icon ? icon(item.icon) : null),
         h('span', { class: 'menu-text' }, h('span', { class: 'menu-label' }, item.label), item.detail ? h('span', { class: 'menu-detail' }, item.detail) : null),
         item.hint ? h('span', { class: 'menu-hint' }, item.hint) : null,
+        item.rings?.length ? h('span', { class: 'menu-rings' }, ...item.rings.map((r) => usageRing(r.label, r.pct))) : null,
       );
       if (item.disabled || !item.onPick) {
         btn.disabled = true;
@@ -1455,17 +1548,31 @@ const EFFORT_SHORT: Record<string, string> = {
 /** Enquanto o menu de modelo estiver aberto: lembra se o usuário pediu a lista completa. */
 let modelMenuShowAll = false;
 
-function modelMenuSections(anchor: HTMLElement): MenuSection[] {
-  const all = state.models.length ? state.models : [{ value: '', displayName: 'Modelo padrão', description: '' }];
-  // O Codex lista poucos modelos e sem família-versão para comparar: mostra todos.
-  const newest = state.provider === 'codex' ? new Set(all) : newestModels(all);
-  const reduced = all.filter((m) => newest.has(m));
-  const list = modelMenuShowAll ? all : reduced;
-  const modelItems: MenuItem[] = list.map((m) => ({
-    label: m.displayName,
-    detail: m.description || undefined,
-    selected: m.value === state.model || (state.provider === 'codex' && !state.model && m.resolvedModel === state.resolvedModel),
-    onPick: () => {
+/**
+ * De onde o menu de modelo lê e para onde manda a escolha. O chat principal usa {@link chatModelChoice};
+ * o composer de um agente monta o seu, com agentSetModel/agentSetEffort ou a escolha local da continuação.
+ */
+interface ModelChoice {
+  models: ModelOption[];
+  /** Codex lista poucos modelos e sem família-versão para comparar: mostra todos, sem reduzir aos mais novos. */
+  showAll: boolean;
+  /** Valor escolhido agora, para continuar na lista reduzida mesmo se for antigo. */
+  current: string;
+  isSelected(m: ModelOption): boolean;
+  pickModel(m: ModelOption): void;
+  /** Níveis do slider para o modelo escolhido agora. */
+  efforts(): string[];
+  effort(): string;
+  pickEffort(v: string): void;
+}
+
+function chatModelChoice(): ModelChoice {
+  return {
+    models: state.models.length ? state.models : [{ value: '', displayName: 'Modelo padrão', description: '' }],
+    showAll: state.provider === 'codex',
+    current: state.model,
+    isSelected: (m) => m.value === state.model || (state.provider === 'codex' && !state.model && m.resolvedModel === state.resolvedModel),
+    pickModel: (m) => {
       state.model = m.value;
       if (m.resolvedModel) {
         state.resolvedModel = m.resolvedModel;
@@ -1473,6 +1580,26 @@ function modelMenuSections(anchor: HTMLElement): MenuSection[] {
       renderControls();
       send({ type: 'setModel', value: m.value });
     },
+    efforts: () => effortsFor(currentModel()),
+    effort: () => state.effort,
+    pickEffort: (v) => {
+      state.effort = v;
+      renderControls();
+      send({ type: 'setEffort', value: v });
+    },
+  };
+}
+
+function modelMenuSections(anchor: HTMLElement, c: ModelChoice): MenuSection[] {
+  const all = c.models;
+  const newest = c.showAll ? new Set(all) : newestModels(all, c.current);
+  const reduced = all.filter((m) => newest.has(m));
+  const list = modelMenuShowAll ? all : reduced;
+  const modelItems: MenuItem[] = list.map((m) => ({
+    label: m.displayName,
+    detail: m.description || undefined,
+    selected: c.isSelected(m),
+    onPick: () => c.pickModel(m),
   }));
   if (reduced.length < all.length) {
     modelItems.push({
@@ -1480,7 +1607,7 @@ function modelMenuSections(anchor: HTMLElement): MenuSection[] {
       keepOpen: true,
       onPick: () => {
         modelMenuShowAll = !modelMenuShowAll;
-        paintModelMenu(anchor, false);
+        paintModelMenu(anchor, false, c);
       },
     });
   }
@@ -1515,8 +1642,8 @@ function currentModel(): ModelOption | undefined {
  * Rodapé do menu de modelo: "Raciocínio (Médio)" e uma trilha com um ponto por nível.
  * Clique num ponto ou setas com a trilha em foco trocam o nível; nada é enviado enquanto o usuário não escolhe.
  */
-function effortSlider(): HTMLElement {
-  const steps = effortsFor(currentModel());
+function effortSlider(c: ModelChoice): HTMLElement {
+  const steps = c.efforts();
   // Posição mostrada quando não há escolha: "medium" se o modelo tiver, senão o meio da trilha.
   const unsetAt = steps.includes('medium') ? steps.indexOf('medium') : Math.floor((steps.length - 1) / 2);
   const level = h('span', { class: 'mm-effort-level' });
@@ -1531,21 +1658,20 @@ function effortSlider(): HTMLElement {
   });
   track.style.setProperty('--steps', String(Math.max(1, steps.length - 1)));
   const paint = (): void => {
-    const idx = steps.indexOf(state.effort);
+    const effort = c.effort();
+    const idx = steps.indexOf(effort);
     const shown = idx < 0 ? unsetAt : idx;
     track.style.setProperty('--i', String(shown));
     track.classList.toggle('mm-unset', idx < 0);
     track.setAttribute('aria-valuenow', String(shown));
-    track.setAttribute('aria-valuetext', idx < 0 ? 'padrão' : (EFFORT_SHORT[state.effort] ?? state.effort));
-    level.textContent = `(${idx < 0 ? 'padrão' : (EFFORT_SHORT[state.effort] ?? state.effort)})`;
+    track.setAttribute('aria-valuetext', idx < 0 ? 'padrão' : (EFFORT_SHORT[effort] ?? effort));
+    level.textContent = `(${idx < 0 ? 'padrão' : (EFFORT_SHORT[effort] ?? effort)})`;
   };
   const pick = (v: string): void => {
-    if (v === state.effort) {
+    if (v === c.effort()) {
       return;
     }
-    state.effort = v;
-    renderControls();
-    send({ type: 'setEffort', value: v });
+    c.pickEffort(v);
     paint();
   };
   steps.forEach((v, i) => {
@@ -1570,7 +1696,7 @@ function effortSlider(): HTMLElement {
     }
     e.preventDefault();
     e.stopPropagation();
-    const idx = steps.indexOf(state.effort);
+    const idx = steps.indexOf(c.effort());
     const from = idx < 0 ? unsetAt : idx;
     const to = Math.min(steps.length - 1, Math.max(0, from + (e.key === 'ArrowRight' ? 1 : -1)));
     pick(steps[to]);
@@ -1580,8 +1706,8 @@ function effortSlider(): HTMLElement {
 }
 
 /** Desenha o menu genérico e o veste de menu de modelo: classe `mm`, item "Mostrar todos" discreto e o slider no rodapé. */
-function paintModelMenu(anchor: HTMLElement, fresh: boolean): void {
-  const sections = modelMenuSections(anchor);
+function paintModelMenu(anchor: HTMLElement, fresh: boolean, c: ModelChoice): void {
+  const sections = modelMenuSections(anchor, c);
   if (fresh) {
     openMenu(anchor, sections);
   } else {
@@ -1597,13 +1723,14 @@ function paintModelMenu(anchor: HTMLElement, fresh: boolean): void {
     const buttons = panel.querySelectorAll('.menu-item');
     buttons[buttons.length - 1]?.classList.add('mm-more');
   }
-  panel.append(effortSlider());
+  panel.append(effortSlider(c));
   placeMenu(panel, anchor, false);
 }
 
-function openModelMenu(anchor: HTMLElement): void {
+/** Menu de modelo do chat principal ou, com `c`, de um agente. */
+function openModelMenu(anchor: HTMLElement, c: ModelChoice = chatModelChoice()): void {
   modelMenuShowAll = false;
-  paintModelMenu(anchor, true);
+  paintModelMenu(anchor, true, c);
 }
 
 function openModeMenu(anchor: HTMLElement): void {
@@ -1684,7 +1811,31 @@ function usageSummary(u?: AccountUsage['usage']): string {
     .join(' · ');
 }
 
-function showAccountsUsage(list: AccountUsage[]): void {
+/** "12k tokens · US$ 0,0004 em 31 consultas desde 15/10": gasto da conta Jev desde que foi adicionada. */
+function jevSpendText(a: JevAccountInfo): string {
+  const usd = a.spent.usd <= 0 ? 'US$ 0' : a.spent.usd < 0.01 ? `US$ ${a.spent.usd.toFixed(4).replace('.', ',')}` : `US$ ${a.spent.usd.toFixed(2).replace('.', ',')}`;
+  const since = new Date(a.addedAt).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+  return `${shortTokens(a.spent.tokens)} tokens · ${usd} em ${a.spent.calls} ${a.spent.calls === 1 ? 'consulta' : 'consultas'} desde ${since}`;
+}
+
+function jevMenuItems(jev: JevAccountInfo[]): MenuItem[] {
+  const items: MenuItem[] = jev.map((a) => {
+    const state = a.status === 'invalid' ? 'chave inválida' : a.disabled ? 'desligado (agentGraphMaster.jev.enabled)' : a.inUse ? 'ok, em uso pela jev_decide' : 'ok';
+    return {
+      label: `${a.name} · Jev`,
+      detail: `${state} · ${jevSpendText(a)}`,
+      hint: a.provider,
+      icon: a.status === 'invalid' ? 'error' : a.disabled ? 'circle-slash' : 'pass',
+      title: [`Provedor: ${a.provider}`, a.error ? `Último erro: ${a.error}` : '', 'A chave fica no cofre de segredos do VS Code.'].filter(Boolean).join('\n'),
+      onPick: () => undefined,
+      keepOpen: true,
+    };
+  });
+  items.push({ label: jev.length ? 'Adicionar outra conta Jev' : 'Adicionar conta Jev', icon: 'add', onPick: () => send({ type: 'addJevAccount' }) });
+  return items;
+}
+
+function showAccountsUsage(list: AccountUsage[], jev: JevAccountInfo[] = []): void {
   if (!accountsAnchor || openAt?.anchor !== accountsAnchor.el) {
     return;
   }
@@ -1692,14 +1843,24 @@ function showAccountsUsage(list: AccountUsage[]): void {
   const canMove = state.provider !== 'codex' && !state.forkOf && !state.companion && !!state.sessionId;
   const items: MenuItem[] = list.map((a) => {
     const target = canMove && !a.current && a.provider === 'claude';
-    const worst = a.usage?.available ? Math.max(0, ...a.usage.windows.map((w) => w.utilization)) : 0;
+    // Mesmas duas janelas da barra do rodapé: 5h e semana no Claude, as duas primeiras que o Codex informar.
+    const wins = a.usage?.available ? a.usage.windows : [];
+    const claudeWins = [
+      { key: 'five_hour', short: '5h' },
+      { key: 'seven_day', short: 'semana' },
+    ].flatMap(({ key, short }) => {
+      const w = wins.find((x) => x.key === key);
+      return w ? [{ label: short, pct: w.utilization }] : [];
+    });
+    const rings = claudeWins.length ? claudeWins : wins.slice(0, 2).map((w) => ({ label: w.label === 'Sessão (5h)' ? '5h' : w.label.toLowerCase(), pct: w.utilization }));
     const lines = (a.usage?.windows ?? []).map((w) => `${w.label}: ${Math.round(w.utilization)}% usado${w.resetsAt ? ` · zera ${fmtReset(w.resetsAt)}` : ''}`);
     return {
       label: `${a.name}${a.provider === 'codex' ? ' · Codex' : ''}${a.current ? ' · esta conversa' : ''}`,
       detail: usageSummary(a.usage),
       hint: a.account || undefined,
       selected: a.current,
-      icon: a.usage?.available ? (worst >= 90 ? 'error' : worst >= 75 ? 'warning' : 'pass') : a.usage ? 'circle-slash' : 'loading',
+      rings,
+      icon: rings.length ? undefined : a.usage ? 'circle-slash' : 'loading',
       title: [a.usage?.subscription ? `Plano ${a.usage.subscription}` : '', ...lines, target ? 'Clique para continuar esta conversa nesta conta.' : ''].filter(Boolean).join('\n'),
       onPick: target ? () => send({ type: 'transferSession', profileId: a.id }) : () => undefined,
       keepOpen: !target,
@@ -1714,6 +1875,7 @@ function showAccountsUsage(list: AccountUsage[]): void {
         : undefined;
   refillMenu(accountsAnchor.el, [
     { title: 'Limites por conta', items, note },
+    { title: 'Jev (decisões)', items: jevMenuItems(jev), note: jev.length ? undefined : 'Com uma conta Jev, o Claude ganha a ferramenta jev_decide para decidir com probabilidades.' },
     { items: [{ label: 'Atualizar todas', icon: 'refresh', keepOpen: true, onPick: () => send({ type: 'accountsUsage', force: true }) }] },
   ]);
 }
@@ -1730,13 +1892,13 @@ function showSessions(list: SessionOption[], error?: string): void {
   const items: MenuItem[] = error
     ? [{ label: 'Não foi possível ler as conversas', detail: error }]
     : !list.length
-      ? [{ label: 'Nenhuma conversa salva nesta conta ainda' }]
+      ? [{ label: 'Nenhuma conversa salva neste projeto ainda' }]
       : list.map((sn) => ({
           label: sn.title || 'Sem título',
-          hint: sn.agents ? `${sn.agents} agente${sn.agents === 1 ? '' : 's'} · ${fmtWhen(sn.lastModified)}` : fmtWhen(sn.lastModified),
+          hint: [sn.profileName ? `conta ${sn.profileName}` : '', sn.agents ? `${sn.agents} agente${sn.agents === 1 ? '' : 's'}` : '', fmtWhen(sn.lastModified)].filter(Boolean).join(' · '),
           selected: sn.current,
           disabled: sn.current,
-          onPick: () => send({ type: 'resumeSession', id: sn.id }),
+          onPick: () => send({ type: 'resumeSession', id: sn.id, profileId: sn.profileId }),
         }));
   refillMenu(histBtn, [{ title: 'Conversas anteriores', items }]);
 }
@@ -1925,9 +2087,7 @@ function renderUsageBar(): void {
     h('span', { class: 'usage-spacer' }),
     ...shown.map(({ w, short }) => {
       const pct = Math.max(0, Math.min(100, w.utilization));
-      const fillEl = h('span', { class: `usage-fill ${level(pct)}` });
-      fillEl.style.width = `${pct}%`;
-      return h('span', { class: 'usage-win' }, h('span', {}, short), h('span', { class: 'usage-track' }, fillEl), h('span', {}, `${Math.round(pct)}%`));
+      return h('span', { class: 'usage-win' }, h('span', {}, short), usageRing(short, pct), h('span', {}, `${Math.round(pct)}%`));
     }),
   );
   if (u.subscription) {
@@ -2384,7 +2544,7 @@ function bindTurn(end: Element | null, turnOver: boolean): void {
 log.addEventListener('click', (e) => {
   const target = e.target as Element;
   const msg = target.closest<HTMLElement>('.msg.assistant.has-details');
-  if (!foldsTurns() || !msg || msg.parentElement !== log || target.closest('a, button, pre, code, summary, input, textarea, img, .sl-actions')) {
+  if (!foldsTurns() || !msg || msg.parentElement !== log || target.closest('a, button, pre, code, summary, input, textarea, img, .sl-actions, .code-block')) {
     return;
   }
   const sel = window.getSelection();
@@ -2875,6 +3035,12 @@ const COMPANION_TOOL_LABEL: Record<string, string> = {
 };
 
 function toolLabel(name: string): string {
+  if (name === ADVISOR_TOOL) {
+    return 'Consultou o advisor';
+  }
+  if (name === JEV_TOOL) {
+    return 'Consultou o Jev';
+  }
   if (name === RESEARCH_TOOL) {
     return 'Pesquisa na web';
   }
@@ -2893,6 +3059,25 @@ function toolLabel(name: string): string {
   }
   const m = /^mcp__(.+?)__(.+)$/.exec(name);
   return m ? `${m[1]} · ${m[2]}` : name;
+}
+
+/** Entrada da jev_decide legível: o estado e cada pergunta com o tipo e as opções ou níveis. */
+function jevDetail(i: Record<string, unknown>): HTMLElement {
+  const TYPE: Record<string, string> = { noul: 'sim ou não', choice: 'escolha', score: 'escala' };
+  const qs = i.questions && typeof i.questions === 'object' ? Object.entries(i.questions as Record<string, { type?: unknown; instructions?: unknown; criteria?: unknown }>) : [];
+  const lines = qs.map(([key, q]) => {
+    const c = q?.criteria;
+    const opts = Array.isArray(c) ? c.map(String) : c && typeof c === 'object' ? Object.keys(c) : [];
+    return `${key} (${TYPE[String(q?.type)] ?? String(q?.type)}): ${String(q?.instructions ?? '')}${opts.length ? `\n  ${opts.join(' | ')}` : ''}`;
+  });
+  return h(
+    'div',
+    {},
+    h('div', { class: 'tlabel' }, 'Perguntas'),
+    h('pre', { class: 'code' }, lines.join('\n')),
+    h('div', { class: 'tlabel' }, 'Estado'),
+    h('pre', { class: 'code' }, typeof i.state === 'string' ? i.state : ''),
+  );
 }
 
 function shortPath(p: string): string {
@@ -2940,6 +3125,13 @@ function summarize(name: string, input: unknown): string {
       const paths = Array.isArray(i.paths) ? i.paths.filter((p): p is string => typeof p === 'string') : [];
       return str(i.caption) || paths.map((p) => baseName(p)).join(', ');
     }
+    case ADVISOR_TOOL:
+      return str(i.model) ? `(${advisorName(str(i.model))})` : '';
+    case JEV_TOOL: {
+      // As perguntas, não o estado: é o que o Claude quis decidir.
+      const qs = i.questions && typeof i.questions === 'object' ? Object.values(i.questions as Record<string, { instructions?: unknown }>) : [];
+      return qs.map((q) => str(q?.instructions)).filter(Boolean).join(' · ');
+    }
   }
   if (isBrowserTool(name)) {
     return describeBrowserAction(name, input);
@@ -2950,6 +3142,13 @@ function summarize(name: string, input: unknown): string {
 
 function toolDetail(name: string, input: unknown): HTMLElement {
   const i = (input ?? {}) as Record<string, unknown>;
+  if (name === ADVISOR_TOOL) {
+    // A chamada não tem entrada: o advisor lê a conversa inteira. O que importa é a orientação, que vem no resultado.
+    return h('div', { class: 'tlabel' }, typeof i.model === 'string' ? `Modelo do advisor: ${i.model}` : 'Advisor');
+  }
+  if (name === JEV_TOOL) {
+    return jevDetail(i);
+  }
   if ((name === 'Bash' || name === 'PowerShell') && typeof i.command === 'string') {
     return h('pre', { class: 'code' }, i.command);
   }
@@ -3058,10 +3257,15 @@ function onToolResult(id: string, text: string, isError: boolean, container: HTM
     paintGroup(view.group);
   }
   const clipped = text.length > 6000 ? `${text.slice(0, 6000)}\n… (${text.length - 6000} caracteres omitidos)` : text;
-  if (clipped.trim()) {
-    view.body.append(h('div', { class: 'tlabel' }, isError ? 'Erro' : 'Resultado'), h('pre', { class: `code out ${isError ? 'err' : ''}` }, clipped));
-  }
   const tool = view.el.dataset.tool;
+  if (clipped.trim()) {
+    view.body.append(h('div', { class: 'tlabel' }, isError ? 'Erro' : tool === ADVISOR_TOOL ? 'Orientação' : tool === JEV_TOOL ? 'Probabilidades' : 'Resultado'), h('pre', { class: `code out ${isError ? 'err' : ''}` }, clipped));
+  }
+  if (tool === ADVISOR_TOOL && (text === ADVISOR_REDACTED || isError)) {
+    // Orientação cifrada ou falha: a linha recolhida já diz, sem precisar abrir.
+    const sum = view.head.querySelector('.tsum') as HTMLElement;
+    sum.textContent = `${sum.textContent ? `${sum.textContent} · ` : ''}${isError ? text : ADVISOR_REDACTED}`;
+  }
   if (isError || (tool !== RESEARCH_TOOL && tool !== IMAGE_TOOL && tool !== SHOW_IMAGE_TOOL) || view.el.nextElementSibling?.matches('.ext-block, .img-bubble')) {
     return;
   }
@@ -3077,7 +3281,7 @@ function onToolResult(id: string, text: string, isError: boolean, container: HTM
 /** Miniaturas das imagens de um resultado (capturas do navegador). O clique abre o visualizador com todas. */
 function shotRow(images: string[]): HTMLElement {
   const items: ViewerItem[] = images.map((src, i) => ({ src, name: `Captura ${i + 1}` }));
-  return h(
+  const row = h(
     'div',
     { class: 'shots' },
     ...images.map((src, i) =>
@@ -3088,6 +3292,22 @@ function shotRow(images: string[]): HTMLElement {
       ),
     ),
   );
+  releaseOldShots(row);
+  return row;
+}
+
+/** Linhas de captura ainda com as imagens carregadas, da mais antiga para a mais nova. */
+const liveShotRows: HTMLElement[] = [];
+/** Cada captura decodificada pesa milhões de bytes no navegador: só as mais recentes ficam carregadas. */
+const MAX_LIVE_SHOT_ROWS = 6;
+
+function releaseOldShots(fresh: HTMLElement): void {
+  liveShotRows.push(fresh);
+  while (liveShotRows.length > MAX_LIVE_SHOT_ROWS) {
+    const old = liveShotRows.shift()!;
+    // Linha que saiu do DOM (conversa limpa) ou já liberada não precisa de aviso, só de soltar as imagens.
+    old.replaceChildren(h('span', { class: 'tlabel' }, 'Capturas antigas liberadas da memória.'));
+  }
 }
 
 /** Pedidos resolveImages esperando o host: id → quem preenche a bolha. */
@@ -3236,6 +3456,17 @@ function addNotice(text: string, level: 'info' | 'error', action?: NoticeAction)
   if (action?.kind === 'orphans') {
     el.append(h('button', { class: 'notice-action', type: 'button', onclick: () => orphansView.open() }, icon('debug-disconnect'), action.label));
   }
+  if (action?.kind === 'resumeInterrupted') {
+    const btn = h('button', { class: 'notice-action', type: 'button', onclick: () => { btn.disabled = true; send({ type: 'resumeInterrupted' }); } }, icon('debug-continue'), action.label);
+    el.append(btn);
+  }
+  if (action?.kind === 'continueMain') {
+    const btn = h('button', { class: 'notice-action', type: 'button', onclick: () => { btn.disabled = true; sendText(action.text); } }, icon('debug-continue'), action.label);
+    el.append(btn);
+  }
+  if (action?.kind === 'addJevAccount') {
+    el.append(h('button', { class: 'notice-action', type: 'button', onclick: () => send({ type: 'addJevAccount' }) }, icon('key'), action.label));
+  }
   append(el);
 }
 
@@ -3297,6 +3528,10 @@ function renderItem(item: HistoryItem, container: HTMLElement): void {
       companionUi?.markRaw(el, shown);
     } else {
       md(el, item.text);
+      if (BG_NOTE.test(item.text)) {
+        // Lugar da barra resumida dos processos; paintBgNote preenche só o último.
+        el.append(h('div', { class: 'bg-note-slot' }));
+      }
     }
     append(el, container);
     // No replay o transcrito não traz hora: a fala dobra sem hora. Só no log principal.
@@ -3328,6 +3563,8 @@ function clearLog(): void {
   agents.clear();
   boxes = [];
   agentItems.clear();
+  agentDropped.clear();
+  liveShotRows.length = 0;
   taskProcs.clear();
   agentCards.clear();
   slackLog.reset();
@@ -3524,6 +3761,8 @@ function closePermission(requestId: string): void {
 
 let detailId: string | undefined;
 let detailLog: HTMLElement | undefined;
+/** Composer do agente aberto no painel, para o cabeçalho repintar as pílulas quando o agente muda (conta, modelo, status). */
+let detailComposer: { refresh(): void } | undefined;
 
 /*
  * O mapa tem duas vistas que se alternam no cabeçalho. O grafo é a principal e ocupa toda a altura;
@@ -3717,6 +3956,7 @@ const popup = createNodePopup({
     openAgent(id);
   },
   stop: (id) => send({ type: 'stopAgent', id }),
+  stopBackgroundTask: (agentId, taskId) => send({ type: 'stopBackgroundTask', agentId, taskId }),
   resume: (id) => send({ type: 'resumeAgent', id }),
   accountsFor: claudeAccountsFor,
   switchAccount: (id, profileId) => send({ type: 'agentSwitchAccount', id, profileId }),
@@ -3843,6 +4083,7 @@ function openMap(): void {
   const back = detailId;
   detailId = undefined;
   detailLog = undefined;
+  detailComposer = undefined;
   overlay.classList.remove('hidden');
   popup.close();
   // Abrindo o mapa (ou voltando do painel de um agente), as caixas concluídas recolhem pela regra automática.
@@ -3873,6 +4114,7 @@ function closeMap(): void {
   overlay.classList.add('hidden');
   detailId = undefined;
   detailLog = undefined;
+  detailComposer = undefined;
 }
 
 /** Abre o painel de um agente a partir de qualquer lugar, inclusive de um cartão no chat principal. */
@@ -4636,6 +4878,8 @@ function openDetail(id: string): void {
   const header = h('div', { class: 'detail-head' });
   const body = h('div', { class: 'detail-log' });
   detailLog = body;
+  const composerEl = agentComposer(a);
+  detailComposer = composerEl;
 
   overlay.replaceChildren(
     h(
@@ -4647,13 +4891,74 @@ function openDetail(id: string): void {
     ),
     header,
     body,
-    agentComposer(a),
+    composerEl.el,
   );
   renderDetailHeader();
+  const dropped = agentDropped.get(id);
+  if (dropped) {
+    body.append(h('div', { class: 'tlabel' }, `${dropped} ${dropped === 1 ? 'item antigo' : 'itens antigos'} fora desta lista para poupar memória. O transcrito completo está no disco do Claude Code.`));
+  }
   for (const item of agentItems.get(id) ?? []) {
     renderItem(item, body);
   }
+  paintBgNote();
   body.scrollTop = body.scrollHeight;
+}
+
+/** Nota do hub "> aguardando 2 processos em segundo plano; ..." no log do agente: ganha a barra resumida embaixo. */
+const BG_NOTE = /^>\s*aguardando\b[^\n]*\bprocessos? em segundo plano/;
+
+/**
+ * Só a última nota de espera do log do agente mostra a barra, e só enquanto ele aguarda processo; as antigas ficam
+ * como texto. Mesma lista de processos: só as estimativas entram, sem repintar.
+ */
+function paintBgNote(): void {
+  const slots = detailLog ? [...detailLog.querySelectorAll<HTMLElement>('.bg-note-slot')] : [];
+  const last = slots.pop();
+  for (const s of slots) {
+    if (s.firstChild) {
+      s.replaceChildren();
+      delete s.dataset.sig;
+    }
+  }
+  if (!last) {
+    return;
+  }
+  const a = detailId ? agents.get(detailId) : undefined;
+  const bg = a?.status === 'waiting' ? (a.pending?.background ?? []) : [];
+  const sig = bgSig(bg);
+  if (last.dataset.sig === sig) {
+    bgRefresh(last, bg);
+    return;
+  }
+  last.dataset.sig = sig;
+  const sum = bgSummary(bg);
+  last.replaceChildren(...(sum ? [sum] : []));
+}
+
+/** Lista de processos do "aguardando" no chat do agente, guardada entre repinturas do cabeçalho pela assinatura. */
+let detailBg: { id: string; sig: string; el: HTMLElement } | undefined;
+
+/** Processos em segundo plano que seguram o relatório: frase, uma linha por processo e o Parar de cada um. */
+function detailBgBlock(a: AgentInfo): HTMLElement | null {
+  const bg = a.status === 'waiting' ? (a.pending?.background ?? []) : [];
+  if (!bg.length) {
+    detailBg = undefined;
+    return null;
+  }
+  const sig = bgSig(bg);
+  if (detailBg?.id === a.id && detailBg.sig === sig) {
+    bgRefresh(detailBg.el, bg);
+    return detailBg.el;
+  }
+  const el = h(
+    'div',
+    { class: 'detail-bg' },
+    h('div', { class: 'ag-label' }, bg.length === 1 ? 'Aguardando processo em segundo plano' : `Aguardando ${bg.length} processos em segundo plano`),
+    bgTaskList(bg, { onStop: (taskId) => send({ type: 'stopBackgroundTask', agentId: a.id, taskId }) }),
+  );
+  detailBg = { id: a.id, sig, el };
+  return el;
 }
 
 /** Só o cabeçalho muda; o log do agente fica intocado, com o scroll onde o usuário deixou. */
@@ -4664,6 +4969,8 @@ function renderDetailHeader(): void {
     return;
   }
   paintAgent(header, a);
+  detailComposer?.refresh();
+  paintBgNote();
   header.classList.add('tinted');
   header.classList.toggle('restored', !!a.restored);
   const canStop = (a.status === 'running' && (a.kind === 'routed' || (a.kind === 'subagent' && !!a.taskId))) || watching(a);
@@ -4700,6 +5007,7 @@ function renderDetailHeader(): void {
           })(),
         )
       : null,
+    detailBgBlock(a),
     fold ? h('div', { class: 'ag-label' }, 'Relatório final') : null,
     fold,
     h(
@@ -4712,131 +5020,255 @@ function renderDetailHeader(): void {
   );
 }
 
+/** Por que este nó não recebe mensagem, ou '' quando recebe. Busca, job e tarefa de shell não têm sessão de agente. */
+function noMessageReason(a: AgentInfo): string {
+  if (a.search) {
+    return 'Nó de busca: quem roda é o hub, não há agente para receber mensagem.';
+  }
+  if (a.infra) {
+    return 'Job ou vigia de treino: não há agente para receber mensagem.';
+  }
+  if (a.taskType === 'local_bash') {
+    return 'Tarefa de shell: não recebe mensagem.';
+  }
+  return '';
+}
+
 /**
- * Caixa de mensagem do agente. Roteado na mesma conta: fala direto com ele e troca modelo/raciocínio na hora.
- * Outra conta, ou subagente embutido: abre uma continuação num chat próprio com a conta, o modelo e o raciocínio escolhidos.
+ * Caixa de mensagem do agente, no mesmo formato do composer principal: textarea que cresce e, dentro da moldura,
+ * pílulas de modelo e raciocínio, de conta e o botão enviar, que vira parar enquanto o agente roda.
+ * Roteado: fala direto com ele e troca modelo e raciocínio na hora; a pílula de conta passa o agente para outra
+ * conta Claude (agentSwitchAccount). Escolher "continuar em chat próprio", ou ser subagente embutido, abre uma
+ * continuação num chat próprio com a conta, o modelo e o raciocínio escolhidos.
  */
-function agentComposer(a: AgentInfo): HTMLElement {
-  const text = h('textarea', { class: 'input', rows: '2', placeholder: a.kind === 'routed' ? `Mensagem para ${a.id}` : 'Mensagem para continuar este agente' });
+function agentComposer(a: AgentInfo): { el: HTMLElement; refresh(): void } {
+  const current = () => agents.get(a.id) ?? a;
+  const routed = () => current().kind === 'routed';
   // Agente roteado numa conta Codex mora nessa conta: é ela que vem marcada e que conta como "mesma conta".
-  const home = a.kind === 'routed' && a.accountId ? a.accountId : state.profileId;
-  const profileSel = h(
-    'select',
-    { title: 'Conta' },
-    ...state.profiles.map((p) =>
-      option(p.id, `${p.name}${p.provider === 'codex' ? ' · Codex' : ''}${p.account ? ` · ${p.account}` : ''}`, p.id === home),
-    ),
-  );
-  const modelSel2 = h('select', { title: 'Modelo' });
-  const effortSel2 = h('select', { title: 'Raciocínio' });
-  const targetIsCodex = () => state.profiles.find((p) => p.id === profileSel.value)?.provider === 'codex';
+  const home = () => (routed() && current().accountId ? current().accountId! : state.profileId);
+  /** Conta da continuação em chat próprio. Ausente num roteado: fala direto com o agente. */
+  let forkTo: string | undefined = routed() ? undefined : state.profileId;
+  const direct = () => routed() && !forkTo;
+  const restored = () => direct() && !!current().restored && !!current().sessionId;
+  const target = () => forkTo ?? home();
+  const targetIsCodex = () => state.profiles.find((p) => p.id === target())?.provider === 'codex';
   /** Chat Codex tem os modelos do Codex em state.models; chat Claude só os conhece pela lista que o host manda à parte. */
   const modelsFor = (codex: boolean) => (codex === (state.provider === 'codex') ? state.models : codex ? state.codexModels : []);
-  /** Refaz modelo e raciocínio conforme o fornecedor da conta escolhida: nomes do Claude não valem no Codex e vice-versa. */
-  const fillModels = () => {
+
+  // Modelo e raciocínio mostrados. Falando direto, seguem o agente; na continuação, são a escolha local.
+  let model = a.model ?? '';
+  let effort = a.effort ?? '';
+  let seen = { model, effort };
+  const resetChoice = () => {
+    const keep = targetIsCodex() === (current().provider === 'codex');
+    model = keep ? (current().model ?? '') : '';
+    effort = keep ? (current().effort ?? '') : '';
+  };
+
+  const text = h('textarea', { class: 'input', rows: '1' });
+  const modelBtn = pill('cap', 'Modelo e nível de raciocínio do agente', (e) => openModelMenu(e.currentTarget as HTMLElement, choice()));
+  const accountBtn = pill('cap acc', 'Conta do agente', (e) => openAccountMenu(e.currentTarget as HTMLElement));
+  const go = h('button', { class: 'go', onclick: () => (busy() ? stop() : submit()) });
+  const stopOriginal = h('input', { type: 'checkbox' });
+  const stopLabel = h('label', { class: 'check', title: 'Para o agente original quando a continuação começar' }, stopOriginal, ' parar o original');
+  const note = h('span', { class: 'ag-foot-note' });
+  const tokens = h('span', { class: 'usage-ctx' });
+  const foot = h('div', { class: 'ag-foot' }, tokens, h('span', { class: 'usage-spacer' }), note, stopLabel);
+
+  const modelList = (): ModelOption[] => {
     const codex = targetIsCodex();
     const list = modelsFor(codex).filter((m) => m.value);
-    const keep = codex === (a.provider === 'codex') ? a.model : undefined;
-    modelSel2.replaceChildren(
-      option('', codex ? 'Modelo padrão da conta' : 'Modelo padrão', !keep),
-      ...list.map((m) => option(m.value, m.displayName, m.value === keep)),
-    );
-    if (keep && !list.some((m) => m.value === keep)) {
-      modelSel2.append(option(keep, prettyModel(keep), true));
-    }
-    fillEfforts();
+    const def: ModelOption = { value: '', displayName: codex ? 'Modelo padrão da conta' : 'Modelo padrão', description: '' };
+    const extra: ModelOption[] = model && !list.some((m) => m.value === model) ? [{ value: model, displayName: prettyModel(model), description: '' }] : [];
+    return [def, ...list, ...extra];
   };
-  const fillEfforts = () => {
-    const codex = targetIsCodex();
-    const chosen = modelsFor(codex).find((m) => m.value === modelSel2.value);
-    const levels = codex ? effortsFor(chosen ?? modelsFor(codex).find((m) => /padrão da conta/.test(m.description))) : EFFORT_STEPS;
-    const was = effortSel2.value || (codex === (a.provider === 'codex') ? (a.effort ?? '') : '');
-    effortSel2.replaceChildren(
-      option('', 'Raciocínio padrão', !levels.includes(was)),
-      ...levels.map((v) => option(v, EFFORTS.find(([k]) => k === v)?.[1] ?? `Raciocínio ${(EFFORT_SHORT[v] ?? v).toLowerCase()}`, v === was)),
-    );
-  };
-  fillModels();
-  const stopOriginal = h('input', { type: 'checkbox' });
-  const hint = h('div', { class: 'hint' });
+  const chosenModel = () => modelsFor(targetIsCodex()).find((m) => m.value === model);
+  const choice = (): ModelChoice => ({
+    models: modelList(),
+    showAll: targetIsCodex(),
+    current: model,
+    isSelected: (m) => m.value === model,
+    pickModel: (m) => {
+      model = m.value;
+      if (direct()) {
+        seen.model = model;
+        send({ type: 'agentSetModel', id: a.id, value: model });
+      }
+      paint();
+    },
+    efforts: () => (targetIsCodex() ? effortsFor(chosenModel() ?? modelsFor(true).find((m) => /padrão da conta/.test(m.description))) : EFFORT_STEPS),
+    effort: () => effort,
+    pickEffort: (v) => {
+      effort = v;
+      if (direct()) {
+        seen.effort = effort;
+        send({ type: 'agentSetEffort', id: a.id, value: effort });
+      }
+      paint();
+    },
+  });
 
-  const current = () => agents.get(a.id) ?? a;
-  const sameAccount = () => profileSel.value === home;
-  const restored = () => !!current().restored && !!current().sessionId && sameAccount();
-  const direct = () => current().kind === 'routed' && sameAccount() && !restored();
-  const refreshHint = () => {
-    hint.textContent = restored()
-      ? 'Este agente está parado; enviar vai retomá-lo e entregar a mensagem na sequência.'
-      : direct()
-        ? 'Vai direto para o agente. Modelo e raciocínio mudam na hora.'
-        : 'Abre um chat próprio com a conta, o modelo e o raciocínio escolhidos, já com a tarefa e o que o agente fez até agora.';
-    stopLabel.classList.toggle('hidden', direct() || restored() || current().status !== 'running');
-    go.textContent = restored() ? 'Retomar e enviar' : direct() ? 'Enviar' : 'Continuar em chat próprio';
-    moveBtn.classList.toggle('hidden', !canMoveAgent());
-    hint.classList.toggle('warn-hint', restored());
-  };
-  modelSel2.addEventListener('change', () => {
-    fillEfforts();
-    if (direct()) {
-      send({ type: 'agentSetModel', id: a.id, value: modelSel2.value });
-    }
-  });
-  effortSel2.addEventListener('change', () => {
-    if (direct()) {
-      send({ type: 'agentSetEffort', id: a.id, value: effortSel2.value });
-    }
-  });
-  profileSel.addEventListener('change', () => {
+  /** Garante a lista de modelos do Codex quando a continuação vai para uma conta Codex num chat Claude. */
+  const needCodexModels = () => {
     if (targetIsCodex() && state.provider !== 'codex' && !state.codexModels.length) {
-      codexModelWaiters.push(fillModels);
+      codexModelWaiters.push(paint);
       send({ type: 'listCodexModels' });
     }
-    fillModels();
-    refreshHint();
-  });
+  };
 
-  // Agente roteado do Claude indo para outra conta Claude: dá para levar o próprio agente, em vez de abrir um chat à parte.
-  const canMoveAgent = () => current().kind === 'routed' && current().provider !== 'codex' && !sameAccount() && !targetIsCodex();
-  const moveBtn = h('button', {
-    class: 'hidden',
-    title: 'Passa este agente para a conta escolhida: mesmo nó no mapa, mesma sessão. A próxima mensagem já roda na conta nova.',
-    onclick: () => send({ type: 'agentSwitchAccount', id: a.id, profileId: profileSel.value }),
-  }, 'Trocar conta do agente');
-  const go = h('button', {
-    class: 'send',
-    onclick: () => {
-      const value = text.value.trim();
-      if (!value) {
-        return;
+  const profileLabel = (id: string) => {
+    const p = state.profiles.find((x) => x.id === id);
+    return p ? `${p.name}${p.provider === 'codex' ? ' · Codex' : ''}` : id === state.profileId ? state.profileName : 'Conta';
+  };
+
+  /**
+   * Menu da pílula de conta. Agente roteado do Claude: as contas Claude logadas, e escolher outra passa o agente para
+   * ela (mesmo nó, mesma sessão). Embaixo, a continuação em chat próprio, em qualquer conta. A troca é só por clique.
+   */
+  const openAccountMenu = (anchor: HTMLElement) => {
+    const c = current();
+    const sections: MenuSection[] = [];
+    const switchable = routed() && c.provider !== 'codex' && !c.search && !c.infra;
+    if (switchable) {
+      const running = c.status === 'running';
+      sections.push({
+        title: 'Conta do agente',
+        items: claudeAccountsFor(c).map((acc) => ({
+          label: acc.label,
+          selected: acc.current && direct(),
+          disabled: !acc.current && running,
+          title: acc.current ? 'O agente já roda nesta conta' : `Passar o agente para a conta ${acc.label}`,
+          onPick: () => {
+            forkTo = undefined;
+            if (!acc.current) {
+              send({ type: 'agentSwitchAccount', id: a.id, profileId: acc.id });
+            }
+            resetChoice();
+            paint();
+          },
+        })),
+        note: running ? 'Espere o turno do agente terminar (ou pare) para trocar a conta.' : 'Mesmo nó no mapa, mesma sessão. A próxima mensagem já roda na conta nova.',
+      });
+    }
+    const forkItems: MenuItem[] = state.profiles.map((p) => ({
+      label: profileLabel(p.id),
+      hint: p.account || undefined,
+      selected: forkTo === p.id,
+      onPick: () => {
+        // Num roteado, a conta dele mesmo é falar direto, não abrir uma continuação.
+        forkTo = routed() && p.id === home() ? undefined : p.id;
+        resetChoice();
+        needCodexModels();
+        paint();
+      },
+    }));
+    if (routed() && !switchable) {
+      forkItems.unshift({ label: 'Falar direto com o agente', selected: !forkTo, onPick: () => {
+        forkTo = undefined;
+        resetChoice();
+        paint();
+      } });
+    }
+    sections.push({
+      title: routed() ? 'Continuar em chat próprio' : 'Conta do chat próprio',
+      items: forkItems,
+      note: 'Abre um chat com a tarefa e o que o agente fez até agora.',
+    });
+    openMenu(anchor, sections);
+  };
+
+  /** Rodando e com como parar: o botão enviar vira parar, como no chat principal. Enter continua mandando. */
+  const busy = () => {
+    const c = current();
+    return c.status === 'running' && (c.kind === 'routed' || (c.kind === 'subagent' && !!c.taskId));
+  };
+  const blocked = () => {
+    const c = current();
+    const why = noMessageReason(c);
+    if (why) {
+      return why;
+    }
+    return direct() && c.restored && !c.sessionId ? NO_SESSION_HINT : '';
+  };
+  const stop = () => send({ type: 'stopAgent', id: a.id });
+  const submit = () => {
+    const value = text.value.trim();
+    if (!value || blocked()) {
+      return;
+    }
+    if (restored()) {
+      send({ type: 'resumeAgent', id: a.id, text: value });
+    } else if (direct()) {
+      send({ type: 'agentSend', id: a.id, text: value });
+    } else {
+      send({ type: 'forkAgent', id: a.id, profileId: target(), model, effort, text: value, stopOriginal: stopOriginal.checked });
+    }
+    text.value = '';
+    autosize(text);
+    paint();
+  };
+
+  const paint = () => {
+    const c = current();
+    // Falando direto, modelo e raciocínio acompanham o que o host manda do agente (outra aba pode ter trocado).
+    if (direct()) {
+      if ((c.model ?? '') !== seen.model) {
+        model = seen.model = c.model ?? '';
       }
-      if (restored()) {
-        send({ type: 'resumeAgent', id: a.id, text: value });
-      } else if (direct()) {
-        send({ type: 'agentSend', id: a.id, text: value });
-      } else {
-        send({
-          type: 'forkAgent',
-          id: a.id,
-          profileId: profileSel.value,
-          model: modelSel2.value,
-          effort: effortSel2.value,
-          text: value,
-          stopOriginal: stopOriginal.checked,
-        });
+      if ((c.effort ?? '') !== seen.effort) {
+        effort = seen.effort = c.effort ?? '';
       }
-      text.value = '';
-    },
+    }
+    const why = blocked();
+    text.disabled = !!why;
+    text.placeholder = why
+      ? why
+      : direct()
+        ? `Escreva para o agente ${a.id}. Enter envia, Shift+Enter quebra linha`
+        : 'Escreva para continuar este agente num chat próprio. Enter envia, Shift+Enter quebra linha';
+
+    const named = model ? (modelsFor(targetIsCodex()).find((m) => m.value === model)?.displayName ?? prettyModel(model)) : targetIsCodex() ? 'Modelo da conta' : 'Modelo padrão';
+    const eff = EFFORT_SHORT[effort] ?? effort;
+    fill(modelBtn, h('span', {}, named), eff ? h('span', { class: 'dim' }, eff) : null);
+    modelBtn.title = `Modelo: ${named}\nRaciocínio: ${eff || 'padrão'}\n${direct() ? 'Muda na hora, no próximo turno do agente.' : 'Vale para a continuação em chat próprio.'}`;
+    modelBtn.disabled = !!noMessageReason(c);
+
+    fill(accountBtn, icon('account'), h('span', {}, profileLabel(target())), direct() ? null : h('span', { class: 'dim' }, 'chat próprio'));
+    accountBtn.title = direct() ? `Conta do agente: ${profileLabel(target())}\nClique para trocar.` : `A mensagem abre um chat próprio na conta ${profileLabel(target())}.`;
+    accountBtn.classList.toggle('hidden', !!noMessageReason(c));
+
+    const stopping = busy();
+    fill(go, icon(stopping ? 'stop-circle' : 'arrow-up'));
+    go.classList.toggle('stopping', stopping);
+    go.disabled = !stopping && (!!why || !text.value.trim());
+    go.title = stopping ? `Parar o agente ${a.id}` : restored() ? 'Retomar o agente e enviar' : direct() ? 'Enviar' : 'Continuar em chat próprio';
+    go.setAttribute('aria-label', go.title);
+
+    tokens.textContent = c.totalTokens ? `${shortTokens(c.totalTokens)} tokens` : '';
+    tokens.title = c.totalTokens ? `${c.totalTokens.toLocaleString('pt-BR')} tokens processados por este agente` : '';
+    note.textContent = why ? '' : restored() ? 'parado: enviar retoma o agente' : direct() ? '' : 'enviar abre um chat próprio';
+    note.classList.toggle('warn-hint', restored());
+    stopLabel.classList.toggle('hidden', direct() || c.status !== 'running');
+  };
+
+  text.addEventListener('input', () => {
+    autosize(text);
+    paint();
   });
   text.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      go.click();
+      submit();
     }
   });
-  const stopLabel = h('label', { class: 'check' }, stopOriginal, ' parar o original');
-  const box = h('div', { class: 'composer agent' }, text, h('div', { class: 'row' }, profileSel, modelSel2, effortSel2, stopLabel, h('div', { class: 'spacer' }), moveBtn, go), hint);
-  refreshHint();
-  return box;
+  paint();
+  const el = h(
+    'div',
+    { class: 'composer agent' },
+    h('div', { class: 'box' }, text, h('div', { class: 'row' }, modelBtn, accountBtn, h('div', { class: 'spacer' }), go)),
+    foot,
+  );
+  return { el, refresh: paint };
 }
 
 function onAgent(agent: AgentInfo): void {
@@ -4885,7 +5317,11 @@ function onAgentItem(id: string, item: HistoryItem): void {
   if (!agentItems.has(id)) {
     agentItems.set(id, []);
   }
-  agentItems.get(id)!.push(item);
+  // Teto por agente (o host já cortou o item): os mais antigos saem e o detalhe avisa quantos.
+  const kept = appendCapped(agentItems.get(id)!, item);
+  if (kept.dropped) {
+    agentDropped.set(id, (agentDropped.get(id) ?? 0) + kept.dropped);
+  }
   if (item.kind === 'tool') {
     live.tool(id, item.name, item.input);
   } else if (item.kind === 'text') {
@@ -4894,6 +5330,7 @@ function onAgentItem(id: string, item: HistoryItem): void {
   if (detailId === id && detailLog) {
     const stick = detailLog.scrollHeight - detailLog.scrollTop - detailLog.clientHeight < 120;
     renderItem(item, detailLog);
+    paintBgNote();
     if (stick) {
       detailLog.scrollTop = detailLog.scrollHeight;
     }
@@ -5253,6 +5690,12 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
         live.thinking(msg.id, msg.text);
       }
       break;
+    case 'resources':
+      resourcePill.update(msg.report, 'main');
+      break;
+    case 'resourceKillResult':
+      resourcePill.killResult(msg);
+      break;
     case 'liveConfig':
       live.setEnabled(msg.enabled);
       repaintGroups();
@@ -5405,7 +5848,7 @@ window.addEventListener('message', (event: MessageEvent<HostMessage>) => {
       renderUsage(msg.usage);
       break;
     case 'accountsUsage':
-      showAccountsUsage(msg.list);
+      showAccountsUsage(msg.list, msg.jev ?? []);
       break;
     case 'sessions':
       showSessions(msg.list, msg.error);

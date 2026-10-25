@@ -1,4 +1,5 @@
 import { SHOW_IMAGE_TOOL } from '../chat/imageShare';
+import { ADVISOR_TOOL } from '../chat/protocol';
 
 /**
  * Lógica pura do recolhimento de ferramentas no chat. Uma sequência de chamadas entre duas falas vira um grupo
@@ -18,9 +19,9 @@ export interface FoldTool {
 }
 
 /** Ferramentas que ficam fora do grupo, com a linha própria: o resultado delas é o que o usuário quer ver. */
-const STANDALONE = new Set(['AskUserQuestion', 'ExitPlanMode', 'mcp__agents__web_research', 'mcp__agents__generate_image', SHOW_IMAGE_TOOL]);
+const STANDALONE = new Set(['AskUserQuestion', 'ExitPlanMode', 'mcp__agents__web_research', 'mcp__agents__generate_image', SHOW_IMAGE_TOOL, ADVISOR_TOOL]);
 
-/** Vale agrupar? Pergunta, plano, pesquisa e imagens não: ficam visíveis. */
+/** Vale agrupar? Pergunta, plano, pesquisa, imagens e o advisor não: ficam visíveis. */
 export function isFoldable(name: string): boolean {
   return !STANDALONE.has(name);
 }

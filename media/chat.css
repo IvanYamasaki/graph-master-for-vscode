@@ -451,6 +451,50 @@ details.msg.report[open] .fold-less {
   overflow-x: auto;
 }
 
+/* Bloco de código do Markdown: invólucro com a linguagem e o botão de copiar no canto (src/webview/copyUi.ts). */
+.code-block {
+  position: relative;
+  margin: 0.5em 0;
+}
+
+.code-block > pre {
+  margin: 0;
+}
+
+.code-tools {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+}
+
+.code-lang {
+  color: var(--muted);
+  font-size: 0.8em;
+  opacity: 0.8;
+}
+
+.code-copy {
+  padding: 2px 4px;
+  opacity: 0;
+  background: var(--vscode-editorWidget-background, var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.code-block:hover .code-copy,
+.code-copy:focus-visible,
+.code-tools:focus-within .code-copy {
+  opacity: 1;
+}
+
+.code-copy .codicon {
+  font-size: 13px;
+}
+
 .md code {
   font-family: var(--vscode-editor-font-family);
   font-size: 0.95em;
@@ -1364,6 +1408,49 @@ button.go:disabled {
 button.go .codicon {
   font-size: 15px;
   line-height: 15px;
+}
+
+/* ---------- Composer do agente: o mesmo do chat principal, com pílulas de modelo e conta ---------- */
+
+.composer.agent .box .row .pill.cap {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.composer.agent .input:disabled {
+  cursor: not-allowed;
+}
+
+.composer.agent .input:disabled::placeholder {
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+/* Rodapé fino, como a barra de limites: tokens do agente à esquerda, o que o enviar faz à direita. */
+.ag-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 14px;
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 0.78em;
+}
+
+.ag-foot-note {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ag-foot-note.warn-hint {
+  color: var(--warn);
+}
+
+.ag-foot .check {
+  flex: none;
+  font-size: 1em;
 }
 
 /* ---------- Faixa dos agentes em execução ---------- */
@@ -2552,26 +2639,46 @@ button.ag-stop:hover {
   white-space: nowrap;
 }
 
-.usage-track {
-  width: 46px;
-  height: 3px;
-  border-radius: 2px;
-  background: color-mix(in srgb, var(--muted) 25%, transparent);
-  overflow: hidden;
+/* Anel de uso: trilho cinza e arco na cor do nível (barra do rodapé e menu de limites por conta). */
+.ring {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  --ring-color: var(--ok);
 }
 
-.usage-fill {
-  display: block;
-  height: 100%;
-  background: var(--ok);
+.ring.warn {
+  --ring-color: var(--warn);
 }
 
-.usage-fill.warn {
-  background: var(--warn);
+.ring.crit {
+  --ring-color: var(--err);
 }
 
-.usage-fill.crit {
-  background: var(--err);
+.ring circle {
+  stroke-width: 2.4;
+}
+
+.ring-track {
+  stroke: color-mix(in srgb, var(--muted) 30%, transparent);
+}
+
+.ring-fill {
+  stroke: var(--ring-color);
+  stroke-linecap: round;
+}
+
+.menu-rings {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 1px;
+}
+
+.menu-rings .ring {
+  width: 18px;
+  height: 18px;
 }
 
 .usage-bar:hover {
@@ -3183,6 +3290,38 @@ details.ext-research[open] .fold-less {
   font-weight: 600;
 }
 
+/* Anexo de imagem: só a miniatura, com o tamanho pequeno no canto de baixo. O nome fica no tooltip. */
+.att.att-img {
+  position: relative;
+  padding: 0;
+  gap: 0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.att.att-img .att-size {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 0.7em;
+  line-height: 1.5;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+
+.att.att-img .att-x {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+}
+
 /* Anexo de imagem já enviado: o clique abre o visualizador. */
 .atts.sent .att.zoomable {
   cursor: zoom-in;
@@ -3649,6 +3788,36 @@ button.empty-ex:focus-visible {
   border-left: 1px solid var(--border);
   /* Filete no topo na cor do agente, como o painel de detalhe. */
   border-top: 3px solid var(--agm-color, var(--muted));
+}
+
+/* Alça de arrastar na borda esquerda do painel. */
+.resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 13;
+  touch-action: none;
+  background: transparent;
+  transition: background 0.1s;
+}
+
+.resize-handle:hover,
+.resize-handle.dragging {
+  background: var(--vscode-focusBorder);
+}
+
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+@media (max-width: 759px) {
+  .resize-handle {
+    display: none;
+  }
 }
 
 /* Largo: o chat encolhe e continua usável ao lado da thread. Estreito: a thread ocupa a tela, com "Voltar". */
@@ -4126,7 +4295,7 @@ button.empty-ex:focus-visible {
   cursor: pointer;
 }
 
-.log.slack > .msg.assistant.has-details :is(a, pre, code) {
+.log.slack > .msg.assistant.has-details :is(a, pre, code, .code-tools) {
   cursor: auto;
 }
 
@@ -4304,6 +4473,11 @@ button.empty-ex:focus-visible {
   font-size: 18px;
   color: #fff;
   background: var(--accent);
+}
+
+.log.slack .atts.sent .att.att-img {
+  padding: 0;
+  gap: 0;
 }
 
 .log.slack .atts.sent .att .att-thumb {
@@ -4746,3 +4920,201 @@ body.live-anim .ag-card {
     opacity: 0.8;
   }
 }
+.sl-name.sl-open, .sl-av.sl-open { cursor: pointer; }
+.sl-name.sl-open:hover { text-decoration: underline; }
+.sl-av.sl-open:hover { filter: brightness(1.1); }
+
+/* ---------- Processos em segundo plano que seguram o relatório (chat do agente e popup do nó) ---------- */
+.detail-bg {
+  margin: 8px 0 4px;
+}
+.bg-task-list {
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0;
+}
+.bg-task {
+  padding: 3px 0;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+}
+.bg-task:first-child {
+  border-top: none;
+}
+.bg-task-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.bg-task-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.bg-task-name:hover,
+.bg-task-name:focus-visible {
+  text-decoration: underline;
+  outline: none;
+}
+.bg-task-meta {
+  flex: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+}
+.bg-task-cmd {
+  display: block;
+  margin: 3px 0 2px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12));
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.92em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.bg-task-cmd[hidden] {
+  display: none;
+}
+.bg-task-stop {
+  flex: none;
+  padding: 0 8px;
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border, transparent));
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-errorForeground);
+  font: inherit;
+  font-size: 0.92em;
+  cursor: pointer;
+}
+.bg-task-stop.is-armed {
+  background: var(--vscode-inputValidation-errorBackground, rgba(255, 0, 0, 0.12));
+}
+.bg-task-stop:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.bg-task-more > summary {
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground);
+  font-size: 0.92em;
+  padding: 2px 0;
+}
+
+/* Barra fina de progresso de cada processo: % e "falta ~X min" ao lado; sem estimativa, indeterminada. */
+.bg-eta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 3px 0 1px;
+  min-width: 0;
+}
+.bg-bar {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 40px;
+  height: 3px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--vscode-progressBar-background, var(--vscode-focusBorder));
+  background: color-mix(in srgb, var(--vscode-progressBar-background, var(--vscode-focusBorder)) 18%, transparent);
+}
+.bg-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--vscode-progressBar-background, var(--vscode-focusBorder));
+  transition: width 0.9s linear;
+}
+.bg-eta.is-over .bg-bar-fill {
+  background: var(--vscode-editorWarning-foreground, var(--vscode-progressBar-background));
+}
+.bg-eta.is-indet .bg-bar-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 30%;
+  opacity: 0.7;
+  transition: none;
+  animation: bg-indet 1.8s ease-in-out infinite;
+}
+@keyframes bg-indet {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(340%); }
+}
+.bg-eta-text {
+  flex: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+}
+.bg-eta-text:empty {
+  display: none;
+}
+.bg-eta.is-over .bg-eta-text {
+  color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground));
+}
+@media (prefers-reduced-motion: reduce) {
+  .bg-bar-fill {
+    transition: none;
+  }
+  /* Sem animação: a barra indeterminada fica parada, em tom apagado, cobrindo a largura. */
+  .bg-eta.is-indet .bg-bar-fill {
+    animation: none;
+    width: 100%;
+    opacity: 0.3;
+  }
+}
+
+/* Barra resumida embaixo da nota "aguardando N processos em segundo plano" do log do agente. */
+.bg-note-slot:empty {
+  display: none;
+}
+.bg-sum {
+  margin: 4px 0 2px;
+  max-width: 420px;
+}
+.bg-sum-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.bg-sum-name {
+  flex: 0 1 auto;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.92em;
+}
+.bg-sum-line .bg-eta {
+  flex: 1 1 auto;
+  margin: 0;
+}
+.bg-sum-more {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.88em;
+}
+
+/* ---------- Pílula de memória no rodapé ---------- */
+
+.res-wrap { position: relative; display: inline-block; }
+.res-pill { font: inherit; font-size: 11px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; }
+.res-pill[data-level='alto'] { color: var(--warn); border-color: currentColor; }
+.res-pill[data-level='critico'] { color: var(--err); border-color: currentColor; }
+.res-pop { position: absolute; bottom: 130%; right: 0; width: 320px; max-height: 320px; overflow: auto; padding: 8px; z-index: 30; background: var(--card); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; box-shadow: var(--float-shadow); font-size: 12px; cursor: default; }
+.res-pop[hidden] { display: none; }
+.res-title { font-weight: 600; margin-bottom: 4px; }
+.res-sub { margin: 8px 0 2px; color: var(--muted); }
+.res-row { display: flex; gap: 8px; align-items: center; padding: 2px 0; }
+.res-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-mem { font-variant-numeric: tabular-nums; }
+.res-kill, .res-refresh { font: inherit; font-size: 11px; cursor: pointer; color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); border: 0; border-radius: 3px; padding: 1px 8px; }
+.res-refresh { margin-top: 8px; }
+.res-note, .res-none { margin-top: 6px; color: var(--muted); }

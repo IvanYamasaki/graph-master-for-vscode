@@ -36,6 +36,7 @@ export interface AttemptsArgs {
   select_by: { metric: string; direction: 'higher' | 'lower' };
   model?: string;
   effort?: string;
+  advisor?: string;
   color?: string;
   budget?: RawBudget;
   report_to?: string;
@@ -100,6 +101,7 @@ export class Attempts {
     };
     this.groups.set(group.id, group);
     const budget = splitBudget(args.budget, n);
+    const advice = this.host.advisorFor(args.model, args.advisor);
     let color = args.color;
     made.forEach((m, k) => {
       const i = k + 1;
@@ -112,6 +114,7 @@ export class Attempts {
         reportTo: destination,
         model: args.model,
         effort: args.effort,
+        advisor: advice.advisor,
         color,
         worktree: m.worktree,
         budget,
@@ -128,6 +131,8 @@ export class Attempts {
       `Seleção por ${metric} (${group.direction === 'higher' ? 'maior' : 'menor'} é melhor), lida do ${RESULT_FILE} de cada worktree ou do log_run de cada tentativa.`,
       `Quando todas terminarem, ${destination === callerId ? 'você recebe' : `${destination} recebe`} um relatório só, com o ranking e o relatório completo da vencedora. Não precisa esperar; siga com o seu trabalho. Mesclar a vencedora é decisão do usuário.`,
       budget ? `Orçamento por tentativa: ${budgetText(budget)}.` : '',
+      advice.advisor ? `Advisor de cada tentativa: ${advice.advisor}.` : '',
+      advice.note ?? '',
     ]
       .filter(Boolean)
       .join('\n');

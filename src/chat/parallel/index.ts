@@ -110,6 +110,10 @@ export class Parallel {
               .describe('Métrica e direção que escolhem a vencedora'),
             model: z.string().optional().describe('Modelo de cada tentativa ("haiku", "sonnet", "opus"...). Omitido: herda o do chat'),
             effort: z.enum(effortValues).optional(),
+            advisor: z
+              .string()
+              .optional()
+              .describe('Advisor tool de cada tentativa ("opus", "sonnet", "fable" ou id claude-*), do mesmo nível do model ou acima. Omitido: agentGraphMaster.defaultAdvisor'),
             color: z.enum([...AGENT_COLOR_NAMES] as [string, ...string[]]).optional().describe('Cor do grupo inteiro. Omita para o sistema escolher'),
             budget: z
               .object({

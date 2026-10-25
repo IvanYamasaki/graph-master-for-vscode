@@ -5,11 +5,38 @@ import { z } from 'zod';
 import { tool } from '@anthropic-ai/claude-agent-sdk';
 import type { HookCallbackMatcher, HookEvent } from '@anthropic-ai/claude-agent-sdk';
 import type { AgentBudget, AgentInfo, AgentSpent, BoxInfo, GuardAlert, HostMessage, PermissionDecision } from '../protocol';
+import { ADVISOR_TOOL } from '../protocol';
 import { BUDGET_WARN, budgetFraction, budgetLines, fmtMinutes, fmtTokensShort, fmtUsd, hasBudget } from './format';
 import { PathRules, checkToolCall, patternsWithoutFiles, protectHooks, readProjectGuard } from './protect';
 import { NO_HYPOTHESIS, finishEvaluation, findLockbox, hashText, lockboxPatterns, lockboxState, lockboxSummary, nextLockboxId, outputNumbers, readLockboxes, recordBlocked, reserveEvaluation, writeLockboxes, type Lockbox } from './lockbox';
 import { formatEvaluation, runEvaluation } from './evaluation';
 import { parallelLaunchHint } from './heavy';
+import { JevAccounts } from '../jevAccounts';
+import { StuckInput, readStuck, stuckQuestions, stuckState } from '../jevAuto';
+
+/** Resposta da checagem do Jev sobre um agente possivelmente preso. */
+export interface JevStuckResult {
+  verdict: 'progressing' | 'stuck' | 'unsure';
+  summary: string;
+}
+
+/**
+ * Consulta do stuckCheck. Devolve undefined de forma síncrona quando o uso está desligado (o cartão sai na hora, como
+ * antes) ou, na promessa, quando o Jev não respondeu a tempo ou deu erro (segue a regra antiga).
+ */
+export type JevStuckFn = (input: StuckInput) => Promise<JevStuckResult | undefined> | undefined;
+
+/** Padrão: usa a conta Jev ativa, se agentGraphMaster.jev.auto.stuckCheck estiver ligado. O custo já entra na conta Jev. */
+export const defaultJevStuck: JevStuckFn = (input) => {
+  const jev = JevAccounts.get();
+  if (!jev?.autoEnabled('stuckCheck')) {
+    return undefined;
+  }
+  return jev.autoDecide('stuckCheck', stuckState(input), stuckQuestions()).then((d) => (d ? readStuck(d.answers) : undefined));
+};
+
+/** Depois de um "ainda avança" do Jev, o agente só é reavaliado após estas chamadas novas ou stuckMinutes. */
+const JEV_HOLD_CALLS = 8;
 
 /** O que o guarda precisa do hub. Mantém a regra aqui e o ciclo de vida do agente lá. */
 export interface GuardHost {
@@ -78,6 +105,11 @@ export interface UsageReport {
   usdEstimate?: number;
   /** Processo novo do CLI: o turno que morreu sem result fica com a estimativa dele. */
   processStart?: boolean;
+  /**
+   * Relato do advisor tool (iterações "advisor_message", fora do usage de topo): entra no gasto como qualquer outro
+   * e também na parte separada `spent.advisor`. O total real do fim do turno já inclui o advisor.
+   */
+  advisor?: boolean;
 }
 
 /** Trecho do prompt do orquestrador sobre orçamento, avaliador congelado e agente preso. */
@@ -126,6 +158,15 @@ interface Track {
   needsContinue: boolean;
   budgetAlert?: string;
   calls: string[];
+  /** Mesmas chamadas da janela, em uma linha legível, para o Jev. */
+  callLines: string[];
+  /** Total de chamadas de ferramenta vistas (não cai com a janela). */
+  callTotal: number;
+  /** Consulta ao Jev em andamento: evita segunda consulta e segundo cartão. */
+  jevConsulting: boolean;
+  /** Depois de "avançando": só reconsulta passado este instante ou ao chegar neste total de chamadas. */
+  jevHoldUntil: number;
+  jevHoldCalls: number;
   lastProgress: number;
   seenFiles: Set<string>;
   seenTexts: Set<string>;
@@ -150,7 +191,10 @@ export class AgentGuard {
   /** Orçamento por caixa: aviso dos 80% já dado e cartão aberto de caixa esgotada. */
   private readonly boxStates = new Map<string, BoxState>();
 
-  constructor(private readonly host: GuardHost) {}
+  constructor(
+    private readonly host: GuardHost,
+    private readonly jevStuck: JevStuckFn = defaultJevStuck,
+  ) {}
 
   // ---------- Configuração ----------
 
@@ -314,6 +358,11 @@ export class AgentGuard {
         haltedTurn: false,
         needsContinue: false,
         calls: [],
+        callLines: [],
+        callTotal: 0,
+        jevConsulting: false,
+        jevHoldUntil: 0,
+        jevHoldCalls: 0,
         lastProgress: Date.now(),
         seenFiles: new Set(),
         seenTexts: new Set(),
@@ -339,6 +388,9 @@ export class AgentGuard {
       const delta = u.tokens - before;
       if (delta > 0) {
         spent.tokens += delta;
+        if (u.advisor) {
+          spent.advisor = { ...spent.advisor, tokens: (spent.advisor?.tokens ?? 0) + delta };
+        }
         changed = true;
         if (u.messageId) {
           t.seenMessages.set(u.messageId, u.tokens);
@@ -348,6 +400,9 @@ export class AgentGuard {
     // Estimativa a cada mensagem (o teto max_usd vale no meio de um turno longo); o fim do turno troca pelo real.
     const usd = applyUsd(t.usd, spent.usd, u);
     if (usd !== undefined) {
+      if (u.advisor && spent.advisor) {
+        spent.advisor = { ...spent.advisor, usd: (spent.advisor.usd ?? 0) + Math.max(0, usd - (spent.usd ?? 0)) };
+      }
       spent.usd = usd;
       changed = true;
     }
@@ -382,7 +437,10 @@ export class AgentGuard {
   onMessage(id: string, msg: HostMessage): void {
     switch (msg.type) {
       case 'toolUse':
-        this.onToolUse(id, msg.name, msg.input);
+        // Consulta ao advisor não é ação: a entrada é sempre a mesma e três seguidas não querem dizer laço.
+        if (msg.name !== ADVISOR_TOOL) {
+          this.onToolUse(id, msg.name, msg.input);
+        }
         return;
       case 'assistantText': {
         const key = msg.text.trim().slice(0, 400);
@@ -789,6 +847,11 @@ export class AgentGuard {
     if (t.calls.length > CALL_WINDOW) {
       t.calls.shift();
     }
+    t.callTotal++;
+    t.callLines.push(`${name}${describeInput(input)}`);
+    if (t.callLines.length > CALL_WINDOW) {
+      t.callLines.shift();
+    }
     const file = fileOf(input);
     const newFile = !!file && !t.seenFiles.has(file);
     if (file) {
@@ -813,6 +876,44 @@ export class AgentGuard {
   }
 
   private markStuck(id: string, reason: string): void {
+    const t = this.track(id);
+    const info = this.host.info(id);
+    if (!info || t.ignoreUntilProgress || info.stuck || t.jevConsulting) {
+      return;
+    }
+    // O Jev já disse que o agente avança: segura o cartão até passar o tempo ou chegarem chamadas novas.
+    if (Date.now() < t.jevHoldUntil && t.callTotal < t.jevHoldCalls) {
+      return;
+    }
+    const asked = this.jevStuck({ description: info.description, recentCalls: [...t.callLines], reason });
+    if (!asked) {
+      this.emitStuck(id, reason);
+      return;
+    }
+    t.jevConsulting = true;
+    const startedAt = Date.now();
+    const progressAt = t.lastProgress;
+    void Promise.resolve(asked)
+      .catch(() => undefined)
+      .then((r) => {
+        t.jevConsulting = false;
+        const now = this.host.info(id);
+        // Agente sumiu, já está marcado, o usuário mandou ignorar ou ele voltou a progredir durante a consulta.
+        if (!now || now.stuck || t.ignoreUntilProgress || t.lastProgress !== progressAt) {
+          return;
+        }
+        if (r?.verdict === 'progressing') {
+          const hold = (stuckMinutes() > 0 ? stuckMinutes() : 10) * 60_000;
+          t.jevHoldUntil = startedAt + hold;
+          t.jevHoldCalls = t.callTotal + JEV_HOLD_CALLS;
+          this.host.log(id, `> Guarda: ${r.summary}. Motivo do alerta: ${reason}.`);
+          return;
+        }
+        this.emitStuck(id, r ? `${reason}. ${r.summary}` : reason);
+      });
+  }
+
+  private emitStuck(id: string, reason: string): void {
     const t = this.track(id);
     const info = this.host.info(id);
     if (!info || t.ignoreUntilProgress || info.stuck) {

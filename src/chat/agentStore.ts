@@ -31,6 +31,8 @@ export interface StoredAgent {
   exchanges?: number;
   model?: string;
   effort?: string;
+  /** Advisor tool do agente (alias ou id); ao retomar, a sessão sobe com ele de novo. */
+  advisor?: string;
   report?: string;
   reportedTo?: string;
   reportedAt?: string;
@@ -239,7 +241,7 @@ function toStored(info: AgentInfo): StoredAgent {
       stored[field] = value as StoredAgent[K];
     }
   };
-  for (const field of ['prompt', 'creator', 'reportTo', 'exchanges', 'model', 'effort', 'reportedTo', 'reportedAt', 'summary', 'lastTool', 'profileName', 'color', 'sessionId', 'repeatEveryMinutes', 'lastCheckAt', 'checks', 'provider', 'accountId', 'browser', 'worktree', 'box'] as const) {
+  for (const field of ['prompt', 'creator', 'reportTo', 'exchanges', 'model', 'effort', 'advisor', 'reportedTo', 'reportedAt', 'summary', 'lastTool', 'profileName', 'color', 'sessionId', 'repeatEveryMinutes', 'lastCheckAt', 'checks', 'provider', 'accountId', 'browser', 'worktree', 'box'] as const) {
     copy(field);
   }
   if (info.budget) {
@@ -318,6 +320,7 @@ function toAgent(raw: unknown): StoredAgent | undefined {
     exchanges: num(raw.exchanges),
     model: str(raw.model),
     effort: str(raw.effort),
+    advisor: str(raw.advisor),
     report: str(raw.report),
     reportedTo: str(raw.reportedTo),
     reportedAt: str(raw.reportedAt),
@@ -369,7 +372,8 @@ function toSpent(raw: unknown): AgentSpent | undefined {
   if (!isRecord(raw)) {
     return undefined;
   }
-  return { tokens: num(raw.tokens) ?? 0, minutes: num(raw.minutes) ?? 0, usd: num(raw.usd) };
+  const adv = isRecord(raw.advisor) ? { tokens: num(raw.advisor.tokens) ?? 0, usd: num(raw.advisor.usd) } : undefined;
+  return { tokens: num(raw.tokens) ?? 0, minutes: num(raw.minutes) ?? 0, usd: num(raw.usd), ...(adv?.tokens ? { advisor: adv } : {}) };
 }
 
 const WORKTREE_STATUSES: readonly WorktreeInfo['status'][] = ['active', 'merged', 'discarded', 'missing'];

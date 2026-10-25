@@ -2,7 +2,7 @@
 
 Extensão local do VS Code que roda o Claude Code (e o Codex) num chat próprio, com várias contas, agentes em paralelo e um laboratório de experimentos de ML. O chat usa o Claude Code que você já tem instalado, com o mesmo CLAUDE.md, as mesmas skills e os mesmos servidores MCP. A extensão acrescenta um mapa dos agentes da conversa e ferramentas que registram, testam e verificam resultados de experimentos.
 
-Foi escrita para pesquisadores de ML e desenvolvedores que instalam a extensão na própria máquina. Versão atual: 1.2.3. Não há publicação no Marketplace.
+Foi escrita para pesquisadores de ML e desenvolvedores que instalam a extensão na própria máquina. Versão atual: 1.2.4. Não há publicação no Marketplace.
 
 ## Instalação
 
@@ -103,7 +103,7 @@ O chat principal recebe um servidor MCP embutido chamado `agents` (desligue com 
 
 | Ferramenta | O que faz |
 | --- | --- |
-| `spawn_agent` | Cria um agente em sessão separada e volta na hora. Aceita `report_to`, `model`, `effort`, `color`, `repeat_every_minutes`, `provider`/`account` (Codex), `browser`, `isolation`, `budget`, `protected_paths` e `box` |
+| `spawn_agent` | Cria um agente em sessão separada e volta na hora. Aceita `report_to`, `model`, `effort`, `advisor`, `color`, `repeat_every_minutes`, `provider`/`account` (Codex), `browser`, `isolation`, `budget`, `protected_paths` e `box` |
 | `send_to_agent` | Manda mensagem a um agente ou ao `main`; a resposta volta como mensagem nova |
 | `list_agents` | Lista agentes com status, modelo, raciocínio, cor, destino do relatório e tokens |
 | `stop_agent` | Interrompe um agente e encerra a recorrência de um vigia |
@@ -119,6 +119,7 @@ O chat principal recebe um servidor MCP embutido chamado `agents` (desligue com 
 - Vigias. `spawn_agent` com `repeat_every_minutes` (2 a 240) acorda o agente a cada N minutos, com o contexto mantido. Resposta que começa com `[SEM NOVIDADES]` não é entregue. O vigia só lê. Ele pode propor tarefas, mas nunca as executa.
 - Best-of-N. `spawn_attempts` cria de 2 a 8 agentes com a mesma tarefa, cada um em worktree próprio. Quando todos terminam, o hub escolhe a melhor por uma métrica declarada antes (arquivo `result.json` na raiz do worktree ou o último `log_run`) e entrega um relatório só, com o ranking e o texto completo da vencedora. Mesclar é decisão sua.
 - Agentes Codex. `provider: "codex"` roda o agente numa conta Codex. O prompt manda usar só com autorização do usuário.
+- Advisor. `spawn_agent` (e `spawn_attempts`) com `advisor: "opus"`, `"sonnet"`, `"fable"` ou um id `claude-*` liga o advisor tool do Claude Code no agente: o executor consulta o modelo mais forte nos pontos de decisão e recebe uma orientação curta. O prompt sugere Sonnet com advisor Opus para código difícil e depuração, em vez de Opus puro. O advisor precisa ser do mesmo nível do executor ou acima (Haiku 4.5 nunca aconselha); par inválido não impede o agente de subir, ele sobe sem advisor e o retorno do `spawn_agent` avisa. Sem `advisor`, vale `defaultAdvisor`. No log do agente cada consulta vira uma linha "Consultou o advisor" com a orientação recolhida, ou "orientação cifrada" quando o servidor manda cifrada. Os tokens do advisor entram no gasto e no orçamento do agente com o preço do modelo dele, e o popup mostra a parte do advisor separada. O chat principal e a consulta lateral não usam advisor.
 - Persistência. Os agentes são gravados no `workspaceState` e voltam depois de recarregar. Vigia volta parado e navegador volta desligado; "Retomar" reativa.
 - Limites de segurança. `maxRoutedAgents` (12) agentes rodando ao mesmo tempo, `maxAutoReports` (10) entregas automáticas por agente para cortar laços A → B → A, e detecção de agente preso (`stuckRepeatCount`, `stuckMinutes`).
 
@@ -195,6 +196,22 @@ O orquestrador registra a hipótese, pede sua aprovação para o comando do `run
 - Chaves. Comandos "Configurar chave do Gemini/da OpenAI" guardam a chave no SecretStorage do VS Code, nunca no `settings.json`. As variáveis `GEMINI_API_KEY`, `GOOGLE_API_KEY` e `OPENAI_API_KEY` também servem.
 - Token de assinatura nunca sai do CLI que o emitiu. Vigias e agentes Codex não têm estas duas ferramentas.
 
+## Decisões com o Jev
+
+O Jev (System One, da TypeSafe AI) não escreve texto. Ele lê um estado e devolve probabilidades calibradas para perguntas tipadas: `noul` (probabilidade de sim), `choice` (probabilidade por opção e confiança) e `score` (distribuição numa escala de 2 a 10 níveis e confiança).
+
+- Conta. O comando "Adicionar conta Jev" pede o provedor (TypeSafe direto, ou Vercel AI Gateway com o modelo `typesafe-ai/jev`), um nome e a chave. A extensão confere a chave em `GET /v1/models` antes de salvar. A chave fica no SecretStorage do VS Code; a lista de contas, com estado e gasto acumulado, aparece no menu "Limites por conta" do chat. "Remover conta Jev" apaga a chave.
+- Ferramenta. Com uma conta válida, o chat principal e os agentes roteados ganham `jev_decide({ state, questions })`. O Claude decide quando chamar, como faz com o advisor: escolher entre abordagens ou modelos, checar se algo está pronto ou é seguro antes de se comprometer, triagem e roteamento. A resposta é tratada como sinal; abaixo de 0,7 de confiança o Claude decide sozinho ou consulta o advisor.
+- Log e custo. Cada chamada vira uma linha "Consultou o Jev" com as perguntas e as probabilidades. O custo (US$ 0,042 por milhão de tokens de entrada, saída grátis, ou o valor que o gateway da Vercel informa) entra no gasto do agente e no total da conta Jev.
+- `jev.enabled` desliga a ferramenta sem apagar a conta. Vigias e agentes Codex não recebem a ferramenta. Conta adicionada no meio de uma conversa vale para as sessões que começarem depois.
+- 401 ou 403 marca a chave como inválida e tira a ferramenta das sessões novas. 429, 529 e 5xx têm duas novas tentativas, com espera de 0,5 s dobrando (ou o `retry-after`).
+- Usos automáticos. Quatro consultas que o host faz sozinho, sem turno de modelo, cada uma ligada por uma configuração própria (todas desligadas). Sem resposta em 4 s, com erro ou com confiança baixa, vale a regra antiga. O texto consultado sai para a TypeSafe ou a Vercel, e o custo entra no gasto do agente. Cada decisão deixa uma linha no log.
+  - `jev.auto.spawnRouting`: quando o `spawn_agent` omite modelo ou effort, o Jev escolhe pela tarefa. Se o Claude pediu um modelo dois níveis acima do que o Jev acha suficiente, o retorno do spawn traz um aviso e a escolha do Claude fica. Não vale para vigias nem Codex.
+  - `jev.auto.stuckCheck`: antes do cartão de agente preso, o Jev olha as chamadas recentes e segura o cartão se o agente ainda avança.
+  - `jev.auto.reportCheck`: antes de entregar o relatório final, o Jev confere se ele responde à tarefa. Se não responde, o agente recebe o relatório de volta uma vez. Não vale para vigias.
+  - `jev.auto.proposalFilter`: proposta de vigia que não é tarefa sua, ou que repete outra, não vira cartão. Ela aparece como linha no log do vigia, e o vigia é avisado.
+  - O comando "Testar o Jev (latência)" faz algumas consultas e mostra média, p50, p95 e máximo, para você ver se o limite de 4 s serve.
+
 ## Navegador
 
 Com a extensão Claude in Chrome instalada e conectada, o item "Usar o navegador (Claude in Chrome)" do menu "+" liga o navegador no chat, ou `claudeInChrome` liga por padrão nas conversas novas. O Claude age no Chrome com as contas em que você já está logado. Para tarefa longa, o orquestrador cria um agente com `browser: true`.
@@ -220,6 +237,7 @@ Com a extensão Claude in Chrome instalada e conectada, o item "Usar o navegador
 | Agentes Codex, `web_research` e imagem via GPT pelo CLI | Cota do Codex no plano ChatGPT |
 | `web_research` via Antigravity | Assinatura Google AI |
 | Pesquisa ou imagem por chave de API | Crédito pago na OpenAI ou no Google. A extensão avisa o custo na primeira vez |
+| `jev_decide` | Conta da TypeSafe ou do AI Gateway da Vercel, US$ 0,042 por milhão de tokens de entrada |
 | Jobs de GPU (Slurm, Modal, RunPod) | Conta de cada provedor, limitada pelo teto `jobs.maxTotalUsd` e por sua aprovação |
 
 Agentes em paralelo multiplicam o consumo, e o contexto inteiro segue em cada chamada. Recomendações:
@@ -241,9 +259,15 @@ Todas começam com `agentGraphMaster.`. A lista completa está em Configuraçõe
 | `defaultPermissionMode` | `bypassPermissions` | Modo de permissão com que os chats começam |
 | `companion.model` / `companion.effort` | `sonnet` / `medium` | Modelo e raciocínio da consulta lateral |
 | `routedAgents` | `true` | Liga `spawn_agent` e companhia |
+| `jev.enabled` | `true` | Liga a `jev_decide` quando há conta Jev |
+| `jev.auto.spawnRouting` | `false` | O Jev escolhe modelo e effort quando o `spawn_agent` omite |
+| `jev.auto.stuckCheck` | `false` | O Jev segura o cartão de agente preso se ele ainda avança |
+| `jev.auto.reportCheck` | `false` | O Jev confere o relatório final e devolve uma vez se não responde à tarefa |
+| `jev.auto.proposalFilter` | `false` | O Jev segura proposta de vigia que não é tarefa ou repete outra |
 | `maxRoutedAgents` | `12` | Agentes rodando ao mesmo tempo por chat |
 | `maxAutoReports` | `10` | Entregas automáticas por agente |
 | `defaultAgentBudget` | `{}` (sem limite) | Orçamento dos agentes criados sem `budget` |
+| `defaultAdvisor` | vazio | Advisor dos agentes criados sem `advisor` |
 | `protectedPaths` | `[]` | Globs que agentes Claude não leem nem gravam |
 | `evaluationCommand` | vazio | Comando da avaliação oficial (`run_evaluation`) |
 | `evaluationTimeoutMinutes` | `30` | Tempo máximo da avaliação e de cada execução de `run_seeds` sem timeout próprio |

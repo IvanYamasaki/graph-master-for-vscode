@@ -26,6 +26,7 @@ import { fmtUsd } from '../chat/guard/format';
 import { createAttemptRow, paintAttemptRow } from './parallelUi';
 import { createProcRow, paintProcRow, type ProcRowDeps } from './procUi';
 import { agentNow, flatLine as flat, mcpToolLabel as toolLabel, openTool as currentTool } from './liveLogic';
+import { bgRefresh, bgSig, bgTaskList } from './bgTasks';
 
 export interface NodePopupDeps {
   getAgent(id: string): AgentInfo | undefined;
@@ -39,6 +40,8 @@ export interface NodePopupDeps {
   openChat(id: string): void;
   /** Para o agente. Num vigia, desliga a recorrência. */
   stop(id: string): void;
+  /** Para uma tarefa em segundo plano do agente (lista do "Aguardando"). Ausente: a lista sai sem botão Parar. */
+  stopBackgroundTask?(agentId: string, taskId: string): void;
   /** Sobe de novo um agente restaurado do disco, ou religa um vigia parado. */
   resume(id: string): void;
   /** Retângulo atual do nó na tela. Com ele o popup acompanha zoom, arrasto e relayout. */
@@ -171,6 +174,8 @@ const CSS = `
 .${P}-pend { color: var(--vscode-foreground, #ccc); line-height: 1.5; }
 .${P}-pend ul { margin: 4px 0 0 18px; padding: 0; }
 .${P}-pend li { margin: 1px 0; }
+.${P}-pend-bg { margin-top: 6px; }
+.${P}-pend ul.bg-task-list { margin: 2px 0 0; }
 .${P}-pend-note { font-style: italic; color: var(--vscode-descriptionForeground, #9aa0a6); margin-top: 6px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .${P}-time { font-variant-numeric: tabular-nums; }
 
@@ -574,22 +579,29 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
       const k = deps.getAgent(id);
       return k ? `${id} (${k.description}): ${k.status === 'waiting' ? pendingText(k) || 'aguardando' : STATUS_LABEL[k.status]}` : id;
     });
-    const sig = [p?.since ?? '', ...(p?.reasons ?? []), ...(p?.background?.map((t) => t.id + t.description) ?? []), ...kids, ...(p?.asked ?? []), p?.note ?? ''].join('|');
+    const sig = [p?.since ?? '', ...(p?.reasons ?? []), bgSig(p?.background), ...kids, ...(p?.asked ?? []), p?.note ?? ''].join('|');
     if (pendEl.dataset.sig === sig) {
+      // Mesma lista: só as estimativas novas entram nas barras.
+      bgRefresh(pendEl, p?.background);
       return;
     }
     pendEl.dataset.sig = sig;
     const lines: string[] = [];
-    for (const t of p?.background ?? []) {
-      lines.push(`processo em segundo plano: ${t.description}`);
-    }
     lines.push(...kids.map((k) => `subagente ${k}`));
     for (const who of p?.asked ?? []) {
       lines.push(`resposta de ${who === 'main' ? 'conversa principal' : who}`);
     }
     const head = 'O turno acabou, mas o relatório final só sai quando isto terminar. O sistema acorda o agente sozinho; não é um agente preso.';
+    const bg = p?.background ?? [];
+    const stop = deps.stopBackgroundTask;
     pendEl.replaceChildren(
       h('div', '', head),
+      ...(bg.length
+        ? [
+            h('div', `${P}-pend-bg`, bg.length === 1 ? 'Processo em segundo plano:' : `${bg.length} processos em segundo plano:`),
+            bgTaskList(bg, { onStop: stop ? (taskId) => stop(a.id, taskId) : undefined }),
+          ]
+        : []),
       ...(lines.length ? [h('ul', '', ...lines.map((l) => h('li', '', l)))] : []),
       ...(p?.note ? [h('div', `${P}-pend-note`, `Último texto do agente: ${p.note}`)] : []),
     );
@@ -699,6 +711,7 @@ export function createNodePopup(deps: NodePopupDeps): NodePopup {
       a.toolUses ? `${a.toolUses} ${a.toolUses === 1 ? 'ferramenta' : 'ferramentas'}` : '',
       a.model ? prettyModel(a.model) : '',
       a.effort ? `raciocínio ${a.effort}` : '',
+      a.advisor ? `advisor ${prettyModel(a.advisor)}` : '',
       a.provider === 'codex' ? `Codex · ${a.profileName ?? '?'}` : a.profileName ? `conta ${a.profileName}` : '',
       a.brainNews ? `${a.brainNews.count} ${a.brainNews.count === 1 ? 'novidade' : 'novidades'} do cérebro recebida${a.brainNews.count === 1 ? '' : 's'} às ${fmtClock(a.brainNews.at)}` : '',
     ].filter(Boolean);

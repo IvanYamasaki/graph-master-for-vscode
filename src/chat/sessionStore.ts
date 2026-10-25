@@ -61,6 +61,23 @@ export class SessionStore {
     return fs.existsSync(key ? this.keyFile(sessionId, key) : this.dir(sessionId));
   }
 
+  /** sessionId de todos os agentes salvos em qualquer conversa deste projeto (agents.json de cada pasta). */
+  agentSessionIds(parse: (raw: unknown) => string[]): Set<string> {
+    const out = new Set<string>();
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.base);
+    } catch {
+      return out;
+    }
+    for (const n of names) {
+      if (ID_RE.test(n)) {
+        parse(this.read(n, 'agents')).forEach((id) => out.add(id));
+      }
+    }
+    return out;
+  }
+
   /** Lê `<key>.json`. Arquivo ausente ou corrompido devolve undefined; quem chama valida o formato. */
   read<T = unknown>(sessionId: string, key: string): T | undefined {
     if (!ID_RE.test(sessionId)) {
