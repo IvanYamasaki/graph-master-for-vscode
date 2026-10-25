@@ -7,9 +7,12 @@
  * desenha. Onde cada post fica no log, e o rodapé das outras mensagens, é com o main.ts.
  */
 
+import { attachResizeHandle } from './resizeHandle';
 import type { AgentInfo, WebviewMessage } from '../chat/protocol';
 import { reportHeadline } from '../chat/headline';
 import { typingDots } from './liveBubbles';
+import { copyChoice, copyText, flashCopied } from './copyUi';
+import { copyLabel } from './copyLogic';
 import {
   authorInitials,
   authorName,
@@ -34,6 +37,10 @@ export interface ParentHint {
 }
 
 export interface ThreadUiDeps {
+  /** Largura salva do painel (px). */
+  width?: number;
+  /** Largura escolhida ao soltar a alça; undefined = voltou ao padrão. */
+  onWidth?: (width: number | undefined) => void;
   send: (msg: WebviewMessage) => void;
   agent: (id: string) => AgentInfo | undefined;
   /** Cor do agente mesmo quando ele já saiu da lista (conversa trocada, agente apagado). */
@@ -108,6 +115,8 @@ export function createThreadUi(deps: ThreadUiDeps) {
   const composer = el('div', { class: 'composer thread-composer' }, input, el('div', { class: 'row' }, hint, el('div', { class: 'spacer' }), sendBtn));
 
   const drawer = el('aside', { class: 'thread-drawer hidden', role: 'complementary', 'aria-label': 'Thread' }, head, scroller, composer);
+
+  attachResizeHandle({ panel: drawer, cssVar: '--thread-w', initial: deps.width, onCommit: (w) => deps.onWidth?.(w) });
 
   const postById = (id: string) => posts.find((p) => p.id === id);
   const nameOf = (agentId: string) => deps.agent(agentId)?.description || `Agente ${agentId}`;
@@ -223,16 +232,21 @@ export function createThreadUi(deps: ThreadUiDeps) {
       e.stopPropagation();
       open(p.id);
     });
-    const copy = el('button', { class: 'icon-btn sl-act', type: 'button', title: 'Copiar o texto do post', 'aria-label': 'Copiar o texto do post' }, codicon('copy'));
+    const copy = el('button', { class: 'icon-btn sl-act', type: 'button', title: copyLabel(false, 'o texto do post'), 'aria-label': copyLabel(false, 'o texto do post') }, codicon('copy'));
+    // Com trecho do post selecionado copia só ele; o rótulo avisa antes do clique.
+    const paintCopy = () => {
+      const label = copyLabel(copyChoice(text, '').partial, 'o texto do post');
+      if (copy.title !== label) {
+        copy.title = label;
+        copy.setAttribute('aria-label', label);
+      }
+    };
+    copy.addEventListener('mouseenter', paintCopy);
+    copy.addEventListener('focus', paintCopy);
+    copy.addEventListener('mousedown', (e) => e.preventDefault());
     copy.addEventListener('click', (e) => {
       e.stopPropagation();
-      void navigator.clipboard?.writeText(postText(p)).then(
-        () => {
-          copy.replaceChildren(codicon('check'));
-          window.setTimeout(() => copy.replaceChildren(codicon('copy')), 1500);
-        },
-        () => undefined,
-      );
+      void copyText(copyChoice(text, postText(p)).text).then((ok) => ok && flashCopied(copy));
     });
     card.replaceChildren(
       av,

@@ -14,3 +14,4 @@ projects/**
 mcp-needs-auth-cache.json
 *.tmp
 docs/**
+scripts/**

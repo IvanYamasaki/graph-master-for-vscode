@@ -2,6 +2,7 @@ import type { AgentInfo, HistoryItem, HostMessage } from './protocol';
 import { reportHeadline } from './headline';
 import {
   addReport,
+  claudeThreadId,
   appendMessage,
   applyHistorySummaries,
   applyPostSummary,
@@ -51,6 +52,8 @@ export class ChatThreads {
   private posts: AgentPost[] = [];
   /** Threads pelo id da mensagem-mãe ("a3#2", "c:...", "u:..."). */
   private threads = new Map<string, ChatThread>();
+  /** Blocos de texto já vistos por mensagem da API, para o id "c:<id>.k" do "self". */
+  private textOrdinals = new Map<string, number>();
   /** Conversa principal cujas threads estão carregadas. */
   private loadedFor?: string;
   /** Entre a troca de conversa e o load: relatório de agente restaurado não vira post aqui (o load refaz a conta). */
@@ -143,11 +146,18 @@ export class ChatThreads {
    * Texto completo de um bloco do orquestrador: os blocos <post> viram o texto do post de cada agente, e os blocos
    * <thread> viram mensagens na thread certa (do Claude, ou do agente com `as`).
    */
-  takeText(text: string): void {
+  takeText(text: string, msgId?: string): void {
     if (this.paused) {
       return;
     }
-    const { blocks, threads } = splitBlocks(text);
+    // Mesma contagem do webview (claudeIdFor): o k-ésimo bloco de texto não vazio da mensagem tem id "c:<id>.k".
+    let selfId: string | undefined;
+    if (msgId && text.trim()) {
+      const n = this.textOrdinals.get(msgId) ?? 0;
+      this.textOrdinals.set(msgId, n + 1);
+      selfId = claudeThreadId(msgId, n);
+    }
+    const { text: shown, blocks, threads } = splitBlocks(text);
     let changed = false;
     for (const b of blocks) {
       const r = applyPostSummary(this.posts, b.agentId, b.text);
@@ -158,9 +168,13 @@ export class ChatThreads {
       }
     }
     for (const b of threads) {
-      const id = resolveThreadId(b.id, this.posts, (x) => this.threads.has(x));
+      // "self": thread da própria fala que traz o bloco. Só existe se sobrou texto à vista para ser a mãe.
+      const own = b.id.trim() === 'self' ? (selfId && shown.trim() ? selfId : undefined) : undefined;
+      const id = own ?? resolveThreadId(b.id, this.posts, (x) => this.threads.has(x));
       const post = id ? this.posts.find((p) => p.id === id) : undefined;
-      const thread = id ? (this.threads.get(id) ?? (post ? emptyThread(post) : undefined)) : undefined;
+      const thread = id
+        ? (this.threads.get(id) ?? (post ? emptyThread(post) : own ? this.newThread(own, { text: shown, at: Date.now() }) : undefined))
+        : undefined;
       if (!thread) {
         // Thread que não existe (id inventado, mensagem de outra conversa): o texto não some, vai como aviso.
         this.deps.post({ type: 'notice', level: 'info', text: `O Claude respondeu numa thread que não existe aqui (${b.id}): ${b.text}` });

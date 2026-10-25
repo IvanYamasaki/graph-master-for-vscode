@@ -108,6 +108,8 @@ export function describeTool(name: string, input: unknown): string {
       return 'apresentando o plano';
     case 'ToolSearch':
       return 'procurando uma ferramenta';
+    case 'advisor':
+      return 'consultando o advisor';
   }
   if (name.startsWith('mcp__')) {
     switch (bare) {
@@ -131,6 +133,8 @@ export function describeTool(name: string, input: unknown): string {
         return 'pesquisando na web';
       case 'generate_image':
         return 'gerando uma imagem';
+      case 'jev_decide':
+        return 'consultando o Jev';
     }
     if (/browser|chrome|computer|navigate|screenshot|tabs_/i.test(name)) {
       return 'usando o navegador';

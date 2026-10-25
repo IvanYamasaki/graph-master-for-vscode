@@ -21,6 +21,8 @@ export interface SpawnRequest {
   reportTo: string;
   model?: string;
   effort?: string;
+  /** Advisor já conferido por advisorFor. */
+  advisor?: string;
   color?: string;
   worktree?: WorktreeInfo;
   budget?: RawBudget;
@@ -50,6 +52,8 @@ export interface ParallelHost {
   resolveAccount(raw: string | undefined): Promise<string | undefined | Error>;
   /** Cria o agente e devolve o id. */
   spawn(req: SpawnRequest): string;
+  /** Advisor pedido (ou o padrão da configuração) conferido contra o modelo; note explica par recusado. */
+  advisorFor(model: string | undefined, requested: string | undefined): { advisor?: string; note?: string };
   /** Entrega um relatório a "main" ou a um agente e marca a entrega em `from`. Destino "user": só grava. */
   deliverReport(target: string, text: string, from: string): void;
 }

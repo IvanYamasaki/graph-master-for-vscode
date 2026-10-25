@@ -2,7 +2,7 @@
   "name": "agent-graph-master",
   "displayName": "Agent Graph Master",
   "description": "Contas do Claude Code e do Codex, chat próprio por conta e mapa de agentes com roteamento de relatórios.",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -30,6 +30,24 @@
         "title": "Abrir chat com outra conta",
         "category": "Agent Graph Master",
         "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentGraphMaster.chatNew",
+        "title": "Novo chat",
+        "category": "Agent Graph Master",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentGraphMaster.chatNewWith",
+        "title": "Novo chat com outra conta",
+        "category": "Agent Graph Master",
+        "icon": "$(account)"
+      },
+      {
+        "command": "agentGraphMaster.chatRefresh",
+        "title": "Atualizar os chats",
+        "category": "Agent Graph Master",
+        "icon": "$(refresh)"
       },
       {
         "command": "agentGraphMaster.switch",
@@ -116,6 +134,24 @@
         "icon": "$(trash)"
       },
       {
+        "command": "agentGraphMaster.addJevAccount",
+        "title": "Adicionar conta Jev",
+        "category": "Agent Graph Master",
+        "icon": "$(key)"
+      },
+      {
+        "command": "agentGraphMaster.removeJevAccount",
+        "title": "Remover conta Jev",
+        "category": "Agent Graph Master",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentGraphMaster.testJev",
+        "title": "Testar o Jev (latência)",
+        "category": "Agent Graph Master",
+        "icon": "$(pulse)"
+      },
+      {
         "command": "agentGraphMaster.configureResearchPack",
         "title": "Configurar pacote de pesquisa",
         "category": "Agent Graph Master",
@@ -137,11 +173,35 @@
         {
           "id": "agentGraphMaster.view",
           "name": "Contas"
+        },
+        {
+          "id": "agentGraphMaster.jev",
+          "name": "Jev"
         }
       ]
     },
     "menus": {
       "view/title": [
+        {
+          "command": "agentGraphMaster.chatNew",
+          "when": "view == agentGraphMaster.chatLauncher",
+          "group": "navigation@0"
+        },
+        {
+          "command": "agentGraphMaster.chatNewWith",
+          "when": "view == agentGraphMaster.chatLauncher",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agentGraphMaster.chatRefresh",
+          "when": "view == agentGraphMaster.chatLauncher",
+          "group": "navigation@2"
+        },
+        {
+          "command": "agentGraphMaster.addJevAccount",
+          "when": "view == agentGraphMaster.jev",
+          "group": "navigation@0"
+        },
         {
           "command": "agentGraphMaster.openChat",
           "when": "view == agentGraphMaster.view",
@@ -193,6 +253,18 @@
       "commandPalette": [
         {
           "command": "agentGraphMaster.activate",
+          "when": "false"
+        },
+        {
+          "command": "agentGraphMaster.chatNew",
+          "when": "false"
+        },
+        {
+          "command": "agentGraphMaster.chatNewWith",
+          "when": "false"
+        },
+        {
+          "command": "agentGraphMaster.chatRefresh",
           "when": "false"
         }
       ],
@@ -367,6 +439,11 @@
           "minimum": 1,
           "description": "Quantos agentes roteados podem rodar ao mesmo tempo em um chat."
         },
+        "agentGraphMaster.defaultAdvisor": {
+          "type": "string",
+          "default": "",
+          "description": "Advisor tool dos agentes criados sem advisor no spawn_agent: opus, sonnet, fable ou um id claude-*. O agente consulta esse modelo nos pontos de decisão. Vazio: sem advisor. Não vale para o chat principal, a consulta lateral, vigias nem agentes Codex."
+        },
         "agentGraphMaster.defaultAgentBudget": {
           "type": "object",
           "default": {},
@@ -495,6 +572,36 @@
           "default": false,
           "markdownDescription": "No chat principal, as chamadas de ferramenta do Claude (Bash, Read, Edit...) não aparecem como mensagem: ficam escondidas nos detalhes da fala seguinte dele no mesmo turno (ou da anterior, se o turno acabou sem fala depois), junto com a estatística do turno. Clique no texto da fala, ou em \"N ações\" na barra que aparece no hover, para abrir. Ligado, os detalhes já aparecem abertos. Pedidos de permissão, perguntas, pesquisas, imagens e erros ficam sempre à vista. No log de um agente aberto o grupo já começa aberto."
         },
+        "agentGraphMaster.resources.intervalMinutes": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0.5,
+          "description": "Minutos entre as medições de memória e processos de cada chat."
+        },
+        "agentGraphMaster.resources.highMb": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 1,
+          "description": "Memória de um chat (CLI mais processos filhos), em MB, a partir da qual a pílula fica em alerta."
+        },
+        "agentGraphMaster.resources.criticalMb": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 1,
+          "description": "Memória de um chat, em MB, a partir da qual a pílula fica em estado crítico."
+        },
+        "agentGraphMaster.resources.idleMinutes": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "Minutos sem CPU para um processo filho contar como ocioso."
+        },
+        "agentGraphMaster.resources.autoKillIdleMinutes": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Encerra sozinho processo ocioso há tantos minutos. 0 só sugere. Servidores MCP nunca são encerrados sozinhos."
+        },
         "agentGraphMaster.browserActionsNeedApproval": {
           "type": "boolean",
           "default": true,
@@ -510,6 +617,31 @@
           "default": 1,
           "minimum": 0,
           "description": "De quantos em quantos minutos o rodapé do chat relê os limites do plano. 0 desliga a atualização automática (o clique no rodapé continua funcionando)."
+        },
+        "agentGraphMaster.jev.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Com uma conta Jev cadastrada (comando \"Adicionar conta Jev\"), o chat principal e os agentes ganham a ferramenta jev_decide, que consulta o Jev (TypeSafe AI) nas decisões. Desligue para tirar a ferramenta sem apagar a conta. Vale para as sessões que começarem depois da mudança."
+        },
+        "agentGraphMaster.jev.auto.spawnRouting": {
+          "type": "boolean",
+          "default": false,
+          "description": "Quando o spawn_agent não diz o modelo ou o effort, o Jev escolhe pela tarefa (haiku, sonnet, opus ou fable; low a xhigh). Sai texto do agente para a TypeSafe ou a Vercel. Sem resposta em 4 s, segue a regra antiga."
+        },
+        "agentGraphMaster.jev.auto.stuckCheck": {
+          "type": "boolean",
+          "default": false,
+          "description": "Antes do cartão de agente preso, o Jev avalia as chamadas recentes e segura o cartão se o agente ainda avança. Sai texto do agente para a TypeSafe ou a Vercel. Sem resposta em 4 s, segue a regra antiga."
+        },
+        "agentGraphMaster.jev.auto.reportCheck": {
+          "type": "boolean",
+          "default": false,
+          "description": "Antes de entregar o relatório final, o Jev confere se ele responde à tarefa. Se não responde, devolve ao agente uma vez. Sai texto do agente para a TypeSafe ou a Vercel. Sem resposta em 4 s, segue a regra antiga."
+        },
+        "agentGraphMaster.jev.auto.proposalFilter": {
+          "type": "boolean",
+          "default": false,
+          "description": "Propostas de vigia que não são tarefa do usuário ou repetem outra ficam no log do vigia, sem cartão. Sai texto do agente para a TypeSafe ou a Vercel. Sem resposta em 4 s, segue a regra antiga."
         },
         "agentGraphMaster.external.researchProvider": {
           "type": "string",
@@ -648,13 +780,7 @@
           "icon": "media/activity.svg"
         }
       ]
-    },
-    "viewsWelcome": [
-      {
-        "view": "agentGraphMaster.chatLauncher",
-        "contents": "[$(comment-discussion) Abrir chat](command:agentGraphMaster.openChat)\n[Abrir chat com outra conta](command:agentGraphMaster.openChatWith)\nAtalho: Ctrl+Shift+Alt+K"
-      }
-    ]
+    }
   },
   "scripts": {
     "compile": "tsc -p . --noEmit && tsc -p src/webview && node esbuild.mjs",

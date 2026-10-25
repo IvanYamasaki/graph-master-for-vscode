@@ -5,6 +5,7 @@ import * as path from 'path';
 import { execFile, spawn } from 'child_process';
 import type { AuthStatus, Profile } from './profiles';
 import { resolveCodexExecutable } from './codexPath';
+import { codexSessionExpired, jwtClaims, type AuthFile } from './codexExpiry';
 
 /**
  * Contas do Codex. Cada conta é uma pasta usada como CODEX_HOME: o Codex guarda nela o login (auth.json),
@@ -54,12 +55,6 @@ export async function codexCommandLine(): Promise<string> {
   return /\s/.test(exe) ? `"${exe}"` : exe;
 }
 
-interface AuthFile {
-  auth_mode?: string;
-  OPENAI_API_KEY?: string | null;
-  tokens?: { id_token?: string } | null;
-}
-
 /**
  * Descobre quem está logado na conta sem mostrar nem copiar token. Com login pelo ChatGPT, o e-mail e o plano
  * saem do id_token (a parte pública do JWT, só as claims). Com chave de API, só dá para dizer que há chave.
@@ -81,6 +76,9 @@ export async function readCodexAuthStatus(profile: Profile): Promise<AuthStatus>
   if (auth.OPENAI_API_KEY) {
     return { loggedIn: true, authMethod: 'apiKey', subscriptionType: 'chave de API' };
   }
+  if (codexSessionExpired(auth)) {
+    return { loggedIn: false, expired: true };
+  }
   const claims = jwtClaims(auth.tokens?.id_token);
   if (!claims) {
     return auth.tokens ? { loggedIn: true, authMethod: auth.auth_mode ?? 'chatgpt' } : { loggedIn: false };
@@ -93,18 +91,6 @@ export async function readCodexAuthStatus(profile: Profile): Promise<AuthStatus>
     subscriptionType: plan ? `ChatGPT ${planLabel(plan)}` : 'ChatGPT',
     authMethod: 'chatgpt',
   };
-}
-
-function jwtClaims(token: string | undefined): Record<string, unknown> | undefined {
-  const payload = token?.split('.')[1];
-  if (!payload) {
-    return undefined;
-  }
-  try {
-    return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
-  } catch {
-    return undefined;
-  }
 }
 
 function planLabel(plan: string): string {

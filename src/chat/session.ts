@@ -23,9 +23,11 @@ import { TaskProcsRead, killSnapshot, killSummary, readTaskProcs } from './taskP
 import type { ProcSnap } from './proc';
 import { spawn } from 'child_process';
 import { estimateUsd } from './usdEstimate';
+import { advisorResultText, advisorSpend } from './advisor';
+import { appendCapped, setCapped } from './itemCap';
 import { BridgeStateFrame, RemoteControl, isRemoteEcho, remoteControlApi, replayText } from './remoteControl';
 import { BROWSER_SERVER, BROWSER_TOOL_PREFIX, BrowserStatus, browserActionWrites, browserUnreachable, describeBrowserAction, isBrowserTool } from './browser';
-import { Attachment, AgentInfo, AgentStatus, HistoryItem, HostMessage, ModelOption, PermissionDecision, SlashCommandOption, UsageInfo, UsageWindow } from './protocol';
+import { ADVISOR_TOOL, Attachment, AgentInfo, AgentStatus, HistoryItem, HostMessage, ModelOption, PermissionDecision, SlashCommandOption, UsageInfo, UsageWindow } from './protocol';
 
 const AGENT_TOOLS = new Set(['Agent', 'Task']);
 type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -36,6 +38,9 @@ type UserContentBlock = Exclude<UserContent, string>[number];
 
 const IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'] as const;
 type ImageMediaType = (typeof IMAGE_MEDIA_TYPES)[number];
+
+/** Chamadas de Bash lembradas (comando e objetivo) para achar a tarefa de shell depois; as mais antigas saem. */
+const MAX_BASH_MEMO = 300;
 
 const PERMISSION_MODES: readonly PermissionMode[] = ['default', 'acceptEdits', 'plan', 'bypassPermissions'];
 
@@ -82,6 +87,11 @@ export interface SessionOptions {
    * extensão oficial: é pelo eco que a mensagem vinda do claude.ai aparece no painel. Agentes roteados ficam sem.
    */
   remoteControl?: boolean;
+  /**
+   * Advisor tool (`advisorModel` nas settings): o executor consulta este modelo nos pontos de decisão. Só agentes
+   * roteados; o hub já conferiu o par. Vale a cada início de processo.
+   */
+  advisorModel?: string;
 }
 
 /** Tarefa em segundo plano da sessão começou ou terminou; `open` é quantas continuam abertas. */
@@ -211,11 +221,13 @@ export class ChatSession {
    * Zera a cada processo novo: o CLI não reenvia o conjunto ao subir.
    */
   readonly backgroundTasks = new Map<string, { description: string; type?: string }>();
+  /** Arquivo de saída de cada tarefa de shell em segundo plano, pelo aviso do Bash ("Output is being written to: ..."). */
+  readonly bgOutputFiles = new Map<string, string>();
   onBackgroundTask?: (ev: BackgroundTaskEvent) => void;
   /** Modelos que este processo aceita (supportedModels), para o seletor e para o list_models dos agentes. */
   models: ModelOption[] = [];
   /** Consumo para o orçamento: tokens de cada mensagem do modelo (repetida por bloco, daí o id) e custo acumulado no fim do turno. */
-  onUsage?: (u: { messageId?: string; tokens?: number; costUsdTotal?: number; usdEstimate?: number; processStart?: boolean }) => void;
+  onUsage?: (u: { messageId?: string; tokens?: number; costUsdTotal?: number; usdEstimate?: number; processStart?: boolean; advisor?: boolean }) => void;
   /** Navegador desta sessão; muda ao subir o processo e quando uma chamada mostra que o Chrome sumiu. */
   browser: BrowserStatus = { enabled: false, status: 'off', tools: [] };
   onBrowserChange?: (status: BrowserStatus) => void;
@@ -265,6 +277,10 @@ export class ChatSession {
   private readonly stoppingByUser = new Set<string>();
   /** PID do processo do CLI desta sessão (capturado no spawn): a raiz de uma tarefa de shell só é procurada abaixo dele. */
   private cliPid?: number;
+  /** PID do CLI desta sessão, para o monitor de recursos. */
+  get processId(): number | undefined {
+    return this.cliPid;
+  }
   /** Fim do stderr do CLI, para explicar uma queda (o spawn próprio não entrega ao SDK o texto que ele juntaria). */
   private stderrTail = '';
   /** Foto da raiz de cada tarefa de shell (PID, nome, início), tirada na primeira leitura com a tarefa rodando. */
@@ -357,6 +373,24 @@ export class ChatSession {
     });
   }
 
+  /** Settings passadas ao CLI: servidores do .mcp.json sem aprovação desligados e, nos agentes com advisor, o modelo dele. */
+  private sessionSettings(): { disabledMcpjsonServers?: string[]; advisorModel?: string } | undefined {
+    const mcp = projectMcpSettings(this.cwd);
+    const advisorModel = this.options.advisorModel;
+    return advisorModel ? { ...mcp, advisorModel } : mcp;
+  }
+
+  /**
+   * Uso do advisor de uma mensagem do executor (`usage.iterations`), que o usage de topo não conta. Vai ao dono da
+   * sessão com id próprio: a mesma mensagem repete o uso a cada bloco e no message_delta, e o guarda só soma o que cresceu.
+   */
+  private reportAdvisorUsage(messageId: string, usage: unknown): void {
+    const spend = this.onUsage && messageId ? advisorSpend(usage) : undefined;
+    if (spend && spend.tokens > 0) {
+      this.onUsage?.({ messageId: `${messageId}#advisor`, tokens: spend.tokens, usdEstimate: spend.usd, advisor: true });
+    }
+  }
+
   private launch(prompts: PromptQueue, executable: string, resumeId?: string): void {
     const q = query({
       prompt: prompts,
@@ -379,7 +413,7 @@ export class ChatSession {
         disallowedTools: this.options.disallowedTools,
         settingSources: ['user', 'project', 'local'],
         // Servidor do .mcp.json sem aprovação do usuário para o conteúdo atual não sobe (guard/mcpApproval.ts).
-        settings: projectMcpSettings(this.cwd),
+        settings: this.sessionSettings(),
         extraArgs: { [this.chrome ? 'chrome' : 'no-chrome']: null, ...(this.options.remoteControl ? { 'replay-user-messages': null } : {}) },
         hooks: this.sessionHooks(),
         canUseTool: (toolName, input, opts) =>
@@ -1050,8 +1084,8 @@ export class ChatSession {
     if (!this.agents.has(id)) {
       this.registerAgent(id, {});
     }
-    this.agents.get(id)!.items.push(item);
-    this.post({ type: 'agentItem', id, item });
+    const { stored } = appendCapped(this.agents.get(id)!.items, item);
+    this.post({ type: 'agentItem', id, item: stored });
   }
 
   private agentIdByTask(taskId: string): string | undefined {
@@ -1129,6 +1163,25 @@ export class ChatSession {
   }
 
   /**
+   * Para uma tarefa em segundo plano só. Com item de tarefa rodando no log, vai pelo stopAgent (que encerra também a
+   * árvore de processos da shell); sem item, pede ao CLI e tira do registro.
+   */
+  async stopBackgroundTask(taskId: string): Promise<void> {
+    const item = [...this.agents.values()].find((r) => r.info.taskId === taskId && r.info.status === 'running');
+    if (item) {
+      await this.stopAgent(item.info.id);
+      return;
+    }
+    this.stoppingByUser.add(taskId);
+    try {
+      await this.q?.stopTask(taskId);
+    } catch {
+      // Tarefa já encerrada ou CLI antigo: o registro sai do mesmo jeito.
+    }
+    this.untrackBackground(taskId, { status: 'stopped', summary: 'parada pelo usuário' });
+  }
+
+  /**
    * O CLI abre um turno sozinho quando uma tarefa em segundo plano termina (o modelo recebe o aviso e responde).
    * Sem send() ninguém marcou a sessão como ocupada: marca aqui, senão o fim desse turno passa despercebido.
    */
@@ -1174,7 +1227,12 @@ export class ChatSession {
             this.post({ type: 'thinking', value: true });
           } else if (ev.content_block.type === 'tool_use') {
             this.post({ type: 'toolStart', id: ev.content_block.id, name: ev.content_block.name });
+          } else if (ev.content_block.type === 'server_tool_use' && ev.content_block.name === 'advisor') {
+            this.post({ type: 'toolStart', id: ev.content_block.id, name: ADVISOR_TOOL });
           }
+        } else if (ev.type === 'message_delta') {
+          // O uso final da mensagem (com as iterações do advisor) vem aqui; a mensagem por bloco pode trazer o parcial.
+          this.reportAdvisorUsage(stream.msgId, ev.usage);
         } else if (ev.type === 'content_block_delta') {
           if (ev.delta.type === 'text_delta') {
             this.post({ type: 'textDelta', msgId: stream.msgId, index: ev.index, text: ev.delta.text });
@@ -1214,6 +1272,9 @@ export class ChatSession {
           // Subagentes (parent_tool_use_id) também gastam: entram na conta do dono da sessão.
           const tokens = (used.input_tokens ?? 0) + (used.output_tokens ?? 0) + (used.cache_read_input_tokens ?? 0) + (used.cache_creation_input_tokens ?? 0);
           this.onUsage({ messageId: m.message.id, tokens, usdEstimate: estimateUsd(used, m.message.model || this.model) });
+          if (!m.parent_tool_use_id) {
+            this.reportAdvisorUsage(m.message.id, used);
+          }
         }
         for (const block of content) {
           if (block.type === 'tool_use' && AGENT_TOOLS.has(block.name)) {
@@ -1225,11 +1286,11 @@ export class ChatSession {
           if (block.type === 'tool_use' && block.name === 'Bash') {
             const command = (block.input as { command?: unknown }).command;
             if (typeof command === 'string') {
-              this.bashCommands.set(block.id, command);
+              setCapped(this.bashCommands, block.id, command, MAX_BASH_MEMO);
             }
             const goal = (block.input as { description?: unknown }).description;
             if (typeof goal === 'string' && goal.trim()) {
-              this.bashDescriptions.set(block.id, goal.trim());
+              setCapped(this.bashDescriptions, block.id, goal.trim(), MAX_BASH_MEMO);
             }
           }
         }
@@ -1257,6 +1318,13 @@ export class ChatSession {
             this.post({ type: 'toolUse', id: block.id, name: block.name, input: block.input });
             this.toolsRunning.add(block.id);
             this.onToolStart?.();
+          } else if (block.type === 'server_tool_use' && block.name === 'advisor') {
+            // O advisor roda no servidor, dentro da mesma mensagem: vira uma linha própria no log, com o modelo.
+            this.turnTexts = [];
+            this.post({ type: 'toolUse', id: block.id, name: ADVISOR_TOOL, input: this.options.advisorModel ? { model: this.options.advisorModel } : {} });
+          } else if (block.type === 'advisor_tool_result') {
+            const res = advisorResultText(block.content);
+            this.post({ type: 'toolResult', id: block.tool_use_id, text: res.text, isError: res.isError });
           }
         }
         const u = m.message.usage;
@@ -1302,6 +1370,7 @@ export class ChatSession {
           const text = toolResultText(block.content);
           const isError = !!block.is_error;
           const images = toolResultImages(block.content);
+          this.noteBgOutput(text);
           this.noteBrowserResult(block.tool_use_id, text, isError);
           if (m.parent_tool_use_id) {
             this.addAgentItem(m.parent_tool_use_id, { kind: 'toolResult', id: block.tool_use_id, text, isError, images });
@@ -1540,6 +1609,18 @@ export class ChatSession {
     }
   }
 
+  /** Guarda onde o CLI grava a saída de um comando posto em segundo plano; é o que a barra de progresso lê. */
+  private noteBgOutput(text: string): void {
+    const m = /in background with ID: (\S+?)\.? Output is being written to: (.+?\.output)/.exec(text);
+    if (!m) {
+      return;
+    }
+    this.bgOutputFiles.set(m[1], m[2]);
+    if (this.bgOutputFiles.size > 50) {
+      this.bgOutputFiles.delete(this.bgOutputFiles.keys().next().value!);
+    }
+  }
+
   private trackBackground(taskId: string, description: string, type?: string): void {
     if (this.backgroundTasks.has(taskId)) {
       return;
@@ -1554,6 +1635,7 @@ export class ChatSession {
       return;
     }
     this.backgroundTasks.delete(taskId);
+    this.bgOutputFiles.delete(taskId);
     this.onBackgroundTask?.({ kind: 'ended', taskId, description: task.description, ...end, open: this.backgroundTasks.size });
     if (!this.backgroundTasks.size && this.restartWhenIdle) {
       // O CLI costuma abrir um turno sozinho para contar o fim da tarefa: espera um pouco antes de trocar o processo.

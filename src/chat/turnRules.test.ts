@@ -32,6 +32,13 @@ test('processo em segundo plano vira pendência com nota curta', () => {
   assert.equal(pendingLabel(p), 'aguardando processo em segundo plano');
 });
 
+test('pendência leva o comando, o início e as portas de cada processo para o webview', () => {
+  const t = { id: 't1', description: 'servidor de dev', type: 'local_bash', command: 'npm run dev -- --port 5173', startedAt: '2026-09-29T11:58:00.000Z', status: 'running' as const, ports: [5173] };
+  const p = pendingInfo({ background: [t, { id: 't2', description: 'sleep 12' }], children: [], asked: [] }, { now });
+  assert.deepEqual(p?.background?.[0], t);
+  assert.equal(pendingLabel(p), 'aguardando 2 processos em segundo plano');
+});
+
 test('filhos e pergunta entram no rótulo, e since é preservado', () => {
   const p = pendingInfo({ background: [], children: ['a3', 'a4'], asked: ['main'] }, { since: '2026-09-29T11:00:00.000Z', now });
   assert.ok(p);

@@ -3,8 +3,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { randomBytes, randomUUID } from 'crypto';
 import type { PermissionMode, SessionMessage } from '@anthropic-ai/claude-agent-sdk';
-import { getSessionInfo, getSessionMessages, listSessions } from '@anthropic-ai/claude-agent-sdk';
-import { Profile, ProfileStore, configDirEnv, isCodex } from '../profiles';
+import { getSessionInfo, getSessionMessages } from '@anthropic-ai/claude-agent-sdk';
+import { Profile, ProfileStore, isCodex } from '../profiles';
 import { AgentRecord, ChatSession, probeClaudeUsage, profileEnv, toolResultImages, toolResultText } from './session';
 import { isClaudeUrl } from './remoteControl';
 import { CodexSession, codexModelOptions, knownCodexModels, prefetchCodexModels, probeCodexUsage } from './codexSession';
@@ -13,6 +13,9 @@ import { AgentHub, AnySession, MAIN_ID, browserApproval } from './hub';
 import type { LabReports } from './lab/reportHost';
 import { AgentStore } from './agentStore';
 import { SessionStore } from './sessionStore';
+import { windowHistory } from './itemCap';
+import { CONTINUE_MAIN_TEXT, endedMidTurn } from './sessionHistory';
+import { readHistory, withConfigDir } from './historySource';
 import { FileIndex, editorFiles } from './fileIndex';
 import { AccountUsage, Attachment, AgentInfo, COMPANION_MARK, ConnectedBrowser, HistoryItem, HostMessage, ProfileOption, WebviewMessage } from './protocol';
 import { ExternalProviders } from './external';
@@ -25,6 +28,8 @@ import { parseThreadMessage, splitBlocks } from './threadModel';
 import { FolderThreadStore } from './threadStore';
 import { RECONCILE_EVERY_MS } from './taskLiveness';
 import { StampedKill, killSnapshot, killSummary, orphanDetail, scanOrphans, snapFromView } from './taskProcs';
+import { JevAccounts } from './jevAccounts';
+import { ResourceMonitor, killSessionProcess, readResourceConfig, resourceNote } from './resourceMonitor';
 import type { CompanionAgent, CompanionSource, MainMessage } from './companion/types';
 import type { MapLayout, SessionOption, UsageInfo } from './protocol';
 
@@ -124,6 +129,28 @@ export class ChatPanel {
   private probing = false;
   /** Reconciliação periódica das tarefas "trabalhando" com o que o CLI ainda conhece. */
   private reconcileTimer?: ReturnType<typeof setInterval>;
+  /** Mede memória e processos do chat principal e dos agentes deste painel; só amostra, não gasta modelo. */
+  private readonly resources: ResourceMonitor;
+  /** Chave do último estado de recursos já avisado ao modelo (resourceNote). */
+  private resourceKey?: string;
+
+  /**
+   * Grupo de abas para um chat novo aberto de fora de um chat (barra lateral, status bar, paleta): o grupo dos chats
+   * que já existem, com a aba ativa na frente; sem chat aberto, o grupo ativo. Como o + do chat, abre aba nova ali.
+   */
+  static preferredColumn(): vscode.ViewColumn {
+    const panels = [...ChatPanel.all].map((p) => p.panel);
+    return (panels.find((p) => p.active) ?? panels.find((p) => p.visible) ?? panels[panels.length - 1])?.viewColumn ?? vscode.ViewColumn.Active;
+  }
+
+  private static readonly tabsChanged = new vscode.EventEmitter<void>();
+  /** Dispara quando uma aba de chat abre, fecha ou muda de título (a seção Chat da barra lateral se atualiza). */
+  static readonly onDidChangeTabs = ChatPanel.tabsChanged.event;
+
+  /** Abas de chat abertas, para a barra lateral listar e revelar. */
+  static openTabs(): { title: string; profileName: string; sessionId?: string; reveal(): void }[] {
+    return [...ChatPanel.all].map((p) => ({ title: p.panel.title, profileName: p.profile.name, sessionId: p.session.sessionId, reveal: () => p.panel.reveal() }));
+  }
 
   static open(env: ChatEnv, profile: Profile, options: ChatOptions = {}): ChatPanel {
     const panel = vscode.window.createWebviewPanel(
@@ -207,6 +234,7 @@ export class ChatPanel {
     private readonly options: ChatOptions,
   ) {
     ChatPanel.all.add(this);
+    ChatPanel.tabsChanged.fire();
     const cwd = workspaceCwd();
     this.hub = new AgentHub({
       profile,
@@ -266,6 +294,13 @@ export class ChatPanel {
     panel.webview.html = this.html();
 
     panel.webview.onDidReceiveMessage((msg: WebviewMessage) => void this.onMessage(msg));
+    this.resources = new ResourceMonitor({
+      config: () => readResourceConfig((key, fallback) => vscode.workspace.getConfiguration('agentGraphMaster.resources').get(key, fallback)),
+      chats: () => this.resourceChats(),
+      onReport: (report) => this.post({ type: 'resources', report }),
+    });
+    this.resources.start();
+    void this.resources.sample();
     // O menu do "+" só mostra "Mencionar arquivo aberto" quando há um arquivo aberto de fato.
     const editorWatch = [
       vscode.window.onDidChangeActiveTextEditor(() => this.postActiveFile()),
@@ -274,6 +309,9 @@ export class ChatPanel {
         if (e.affectsConfiguration('agentGraphMaster.liveBubbles')) {
           this.post({ type: 'liveConfig', enabled: vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('liveBubbles', true) });
         }
+        if (e.affectsConfiguration('agentGraphMaster.resources')) {
+          this.resources.restart();
+        }
         if (e.affectsConfiguration('agentGraphMaster.toolsExpanded')) {
           this.post({ type: 'toolsConfig', expanded: vscode.workspace.getConfiguration('agentGraphMaster').get<boolean>('toolsExpanded', false) });
         }
@@ -281,8 +319,10 @@ export class ChatPanel {
     ];
     panel.onDidDispose(() => {
       ChatPanel.all.delete(this);
+      ChatPanel.tabsChanged.fire();
       clearInterval(this.usageTimer);
       clearInterval(this.reconcileTimer);
+      this.resources.stop();
       this.files.release();
       editorWatch.forEach((d) => d?.dispose());
       this.hub.dispose();
@@ -318,6 +358,20 @@ export class ChatPanel {
 
   // ---------- Comunicação com o webview ----------
 
+  /** Chat principal e agentes Claude vivos, cada um com o PID do CLI. */
+  private resourceChats(): { chatId: string; cliPid?: number }[] {
+    const main = this.session instanceof ChatSession ? this.session.processId : undefined;
+    return [{ chatId: MAIN_ID, cliPid: main }, ...this.hub.resourceChats()];
+  }
+
+  /** Põe na frente da mensagem a linha de recursos quando o estado do chat principal mudou para pior (uma vez por mudança). */
+  private withResourceNote(text: string): string {
+    const last = this.resources.last;
+    const { note, key } = resourceNote(last?.chats.find((c) => c.chatId === MAIN_ID), this.resources.summaryFor(MAIN_ID), this.resourceKey);
+    this.resourceKey = key;
+    return note ? `${note}\n\n${text}` : text;
+  }
+
   private post(msg: HostMessage): void {
     // /rename pelo chat: a aba acompanha o nome novo da conversa.
     const renamed = msg.type === 'commandOutput' && !this.options.fork ? /^Session renamed to: (.+)$/.exec(msg.text) : null;
@@ -343,7 +397,7 @@ export class ChatPanel {
     if (msg.type === 'agent') {
       this.threads?.noteAgent(msg.agent);
     } else if (msg.type === 'assistantText') {
-      this.threads?.takeText(msg.text);
+      this.threads?.takeText(msg.text, msg.msgId);
     } else if (msg.type === 'busy' && !msg.value) {
       this.threads?.mainIdle();
     }
@@ -368,6 +422,15 @@ export class ChatPanel {
       case 'killTaskTree':
         await this.killTaskTree(msg.id);
         return;
+      case 'resourcesRefresh':
+        void this.resources.sample();
+        return;
+      case 'resourceKill': {
+        const cliPid = this.resourceChats().find((c) => c.chatId === msg.chatId)?.cliPid;
+        const res = await killSessionProcess(cliPid, msg.pid, { name: msg.name, startedMs: msg.startedMs });
+        this.post({ type: 'resourceKillResult', chatId: msg.chatId, pid: msg.pid, ok: res.ok, message: res.message });
+        return;
+      }
       case 'scanOrphans':
         await this.postOrphans(false);
         return;
@@ -386,7 +449,7 @@ export class ChatPanel {
         }
         {
           // Novidades do cérebro guardadas para o orquestrador vão na frente da mensagem (sem abrir turno à parte).
-          const uuid = this.session.send(this.hub.brain.withNews(MAIN_ID, msg.text), msg.attachments);
+          const uuid = this.session.send(this.withResourceNote(this.hub.brain.withNews(MAIN_ID, msg.text)), msg.attachments);
           // O uuid é o id da mensagem no transcrito: a bolha dela ganha thread que sobrevive ao recarregar.
           if (msg.clientId) {
             this.post({ type: 'userId', clientId: msg.clientId, id: typeof uuid === 'string' ? uuid : undefined });
@@ -431,7 +494,7 @@ export class ChatPanel {
         await this.sendSessionList();
         return;
       case 'resumeSession':
-        await this.resume(msg.id);
+        await this.resume(msg.id, msg.profileId);
         return;
       case 'mapLayout':
         if (this.session.sessionId) {
@@ -464,6 +527,9 @@ export class ChatPanel {
         } else {
           await this.session.stopAgent(msg.id);
         }
+        return;
+      case 'stopBackgroundTask':
+        await this.hub.stopBackgroundTask(msg.agentId, msg.taskId);
         return;
       case 'agentSend':
         this.hub.sendFromUser(msg.id, msg.text);
@@ -503,6 +569,12 @@ export class ChatPanel {
         return;
       case 'configureKey':
         await vscode.commands.executeCommand(msg.provider === 'gemini' ? 'agentGraphMaster.setGeminiKey' : 'agentGraphMaster.setOpenAIKey');
+        return;
+      case 'resumeInterrupted':
+        this.hub.resumeInterrupted();
+        return;
+      case 'addJevAccount':
+        await vscode.commands.executeCommand('agentGraphMaster.addJevAccount');
         return;
       case 'openFile':
         await this.openProjectFile(msg.path);
@@ -587,6 +659,7 @@ export class ChatPanel {
       return;
     }
     const history = this.options.resumeId ? await this.loadHistory(this.options.resumeId) : [];
+    this.offerContinue(history);
     this.session.start(this.options.resumeId);
     this.saveState();
     if (this.options.resumeId) {
@@ -861,6 +934,7 @@ export class ChatPanel {
     const send = () =>
       this.post({
         type: 'accountsUsage',
+        jev: JevAccounts.get()?.infos(),
         list: profiles.map(
           (p): AccountUsage => ({
             id: p.id,
@@ -1000,17 +1074,18 @@ export class ChatPanel {
       return;
     }
     try {
-      const sessions = await withConfigDir(this.profile, () =>
-        listSessions({ dir: this.session.cwd, limit: 40, includeProgrammatic: false }),
-      );
+      // Todas as contas Claude, com as sessões do SDK (todo chat desta extensão é uma), sem as dos agentes.
+      const history = await readHistory(this.env.store.all(), this.session.cwd, this.hub.agentSessionIds());
+      const own = this.session.sessionId;
       this.post({
         type: 'sessions',
         list: this.withAgentCounts(
-          sessions.map((s) => ({
-            id: s.sessionId,
-            title: shorten(s.customTitle || s.summary || s.firstPrompt || s.sessionId, 80),
-            lastModified: s.lastModified,
-            current: s.sessionId === this.session.sessionId,
+          history.map((e) => ({
+            id: e.id,
+            title: e.title,
+            lastModified: e.lastModified,
+            current: e.id === own,
+            ...(e.profileId !== this.profile.id ? { profileId: e.profileId, profileName: e.profileName } : {}),
           })),
         ),
       });
@@ -1036,7 +1111,7 @@ export class ChatPanel {
     });
   }
 
-  private async resume(sessionId: string): Promise<void> {
+  private async resume(sessionId: string, profileId?: string): Promise<void> {
     if (sessionId === this.session.sessionId) {
       return;
     }
@@ -1046,12 +1121,19 @@ export class ChatPanel {
       open.panel.reveal();
       return;
     }
+    // Conversa de outra conta: o arquivo dela está no diretório daquela conta, então abre numa aba dela.
+    const owner = profileId && profileId !== this.profile.id ? this.env.store.get(profileId) : undefined;
+    if (owner) {
+      ChatPanel.open(this.env, owner, { resumeId: sessionId, viewColumn: this.panel.viewColumn });
+      return;
+    }
     this.post({ type: 'clear' });
     this.session.agents.clear();
     // Trocar de conversa não apaga os agentes da anterior: eles continuam salvos e voltam se ela for reaberta.
     this.hub.detach();
     this.threads.detach();
     const history = await this.loadHistory(sessionId);
+    this.offerContinue(history);
     this.session.start(sessionId);
     this.saveState();
     this.hub.restore(sessionId);
@@ -1060,6 +1142,19 @@ export class ChatPanel {
     this.sessionTitle = '';
     this.applyTitle();
     void this.refreshTitle(sessionId);
+  }
+
+  /** Conversa reaberta que morreu no meio de um turno (aba fechada com ele rodando): oferece continuar de onde parou. */
+  private offerContinue(history: HistoryItem[]): void {
+    if (this.session instanceof CodexSession || !endedMidTurn(history)) {
+      return;
+    }
+    this.post({
+      type: 'notice',
+      level: 'info',
+      text: 'Esta conversa parou no meio de um turno, provavelmente porque a aba fechou com ele rodando. O que já foi feito está no histórico acima.',
+      action: { kind: 'continueMain', label: 'Continuar de onde parou', text: CONTINUE_MAIN_TEXT },
+    });
   }
 
   /** Manda o histórico ao webview e devolve os itens (os blocos <post> e <thread> deles completam posts e threads). */
@@ -1075,7 +1170,12 @@ export class ChatPanel {
       this.post({ type: 'notice', level: 'error', text: `Não consegui carregar ${what}: ${String(err)}` });
       return [];
     }
-    this.post({ type: 'history', items, title: '' });
+    // O DOM do log cresce com cada item: o webview recebe a cauda do transcrito; as threads leem o completo.
+    const shown = windowHistory(items);
+    this.post({ type: 'history', items: shown.items, title: '' });
+    if (shown.dropped) {
+      this.post({ type: 'notice', level: 'info', text: `Mostrando os últimos ${shown.items.length} itens desta conversa; ${shown.dropped} mais antigos continuam no transcrito do disco e no histórico do Claude Code.` });
+    }
     return items;
   }
 
@@ -1158,6 +1258,7 @@ export class ChatPanel {
   private applyTitle(): void {
     const fallback = this.options.fork ? `Continuação · ${this.options.fork.description}` : 'Nova conversa';
     this.panel.title = shorten(this.sessionTitle || fallback, 40);
+    ChatPanel.tabsChanged.fire();
   }
 
   private setSessionTitle(raw: string): void {
@@ -1405,36 +1506,6 @@ function shorten(text: string, max: number): string {
 const USAGE_CACHE_MS = 60_000;
 const usageCache = new Map<string, { usage: UsageInfo; at: number }>();
 const usageProbes = new Map<string, Promise<UsageInfo>>();
-
-let configDirLock: Promise<unknown> = Promise.resolve();
-
-/**
- * listSessions e getSessionMessages leem CLAUDE_CONFIG_DIR de process.env na hora da chamada. Trocamos a variável
- * só durante a chamada, uma de cada vez, para ler o histórico da conta certa.
- */
-function withConfigDir<T>(profile: Profile, fn: () => Promise<T>): Promise<T> {
-  const run = async () => {
-    const previous = process.env.CLAUDE_CONFIG_DIR;
-    const dir = configDirEnv(profile);
-    if (dir) {
-      process.env.CLAUDE_CONFIG_DIR = dir;
-    } else {
-      delete process.env.CLAUDE_CONFIG_DIR;
-    }
-    try {
-      return await fn();
-    } finally {
-      if (previous === undefined) {
-        delete process.env.CLAUDE_CONFIG_DIR;
-      } else {
-        process.env.CLAUDE_CONFIG_DIR = previous;
-      }
-    }
-  };
-  const result = configDirLock.then(run, run);
-  configDirLock = result.catch(() => undefined);
-  return result;
-}
 
 interface RawBlock {
   type: string;

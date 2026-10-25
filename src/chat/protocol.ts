@@ -3,6 +3,8 @@
 import type { BrowserStatus } from './browser';
 import type { CompanionInit } from './companion/types';
 import type { AgentPost, ChatThread } from './threadModel';
+import type { BgEstimate } from './bgEta';
+import type { ResourceKillResultMsg, ResourceMsgFromWebview, ResourceMsgToWebview } from './resourceMonitorTypes';
 
 /** Primeira linha do texto que o "Enviar ao principal" do chat lateral manda à conversa principal. */
 export const COMPANION_MARK = '[Da consulta lateral, enviado pelo usuário]';
@@ -45,6 +47,13 @@ export interface Attachment {
  * `id` dá a mensagem a que uma thread se pendura e sobrevive ao recarregar: na mensagem do usuário, o uuid dela no
  * transcrito; na fala do orquestrador, o id da mensagem da API (o mesmo do `assistantText` ao vivo).
  */
+/** Nome da linha do advisor no log: o bloco server_tool_use "advisor" vira um toolUse com este nome e input { model }. */
+export const ADVISOR_TOOL = 'advisor';
+/** Resultado do advisor quando a orientação vem cifrada (advisor_redacted_result): só o executor lê. */
+export const ADVISOR_REDACTED = 'orientação cifrada';
+/** Ferramenta do Jev no servidor "agents": linha "Consultou o Jev" no log. */
+export const JEV_TOOL = 'mcp__agents__jev_decide';
+
 export type HistoryItem =
   | { kind: 'user'; text: string; id?: string }
   | { kind: 'text'; text: string; id?: string }
@@ -77,6 +86,9 @@ export interface SessionOption {
   current: boolean;
   /** Agentes do mapa salvos na pasta da conversa (`.agm/sessions/<id>/meta.json`). Ausente: nenhum. */
   agents?: number;
+  /** Conta onde a conversa está, quando não é a do painel: escolher abre outra aba nessa conta. */
+  profileId?: string;
+  profileName?: string;
 }
 
 /** Arrumação do mapa de uma conversa (`.agm/sessions/<id>/layout.json`): posições fixadas por id e caixas recolhidas. */
@@ -94,6 +106,22 @@ export interface AccountUsage {
   /** Conta deste chat. */
   current: boolean;
   usage?: UsageInfo;
+}
+
+/** Conta Jev no menu de contas. A chave nunca vem aqui: fica no SecretStorage do host. */
+export interface JevAccountInfo {
+  id: string;
+  name: string;
+  /** "TypeSafe" ou "Vercel AI Gateway". */
+  provider: string;
+  status: 'ok' | 'invalid';
+  error?: string;
+  addedAt: string;
+  spent: { tokens: number; usd: number; calls: number };
+  /** Conta que a jev_decide usa agora. */
+  inUse: boolean;
+  /** agentGraphMaster.jev.enabled desligado. */
+  disabled: boolean;
 }
 
 export interface UsageInfo {
@@ -122,6 +150,26 @@ export function isWorking(a: Pick<AgentInfo, 'status' | 'restored'>): boolean {
 /** Por que um agente está "aguardando". */
 export type PendingReason = 'background' | 'children' | 'question';
 
+/** Uma tarefa em segundo plano que segura o relatório: o webview lista uma por linha, com o comando no hover. */
+export interface BackgroundTaskInfo {
+  /** task_id do SDK: é por ele que o Parar acha a tarefa. */
+  id: string;
+  /** Nome legível (description do Bash ou o comando sem cd/export). */
+  description: string;
+  /** local_bash, local_agent... */
+  type?: string;
+  /** Comando completo, só nas tarefas de shell. */
+  command?: string;
+  /** ISO de quando a tarefa começou. */
+  startedAt?: string;
+  /** Estado do item da tarefa no log da sessão; ausente quando o item não chegou. */
+  status?: AgentStatus;
+  /** Portas que o comando cita (--port, localhost:N). */
+  ports?: number[];
+  /** Estimativa de quanto falta (pela saída ou pelo histórico do comando); ausente: barra indeterminada. */
+  eta?: BgEstimate;
+}
+
 /**
  * O que falta para o agente poder entregar o relatório final. O hub recalcula a cada fim de turno e a cada
  * mudança nos filhos; some quando o agente conclui.
@@ -129,7 +177,7 @@ export type PendingReason = 'background' | 'children' | 'question';
 export interface PendingInfo {
   reasons: PendingReason[];
   /** Tarefas em segundo plano abertas na sessão (Bash run_in_background, subagente em background). */
-  background?: { id: string; description: string }[];
+  background?: BackgroundTaskInfo[];
   /** Ids dos agentes que ainda vão reportar a este. */
   children?: string[];
   /** A quem este agente perguntou (send_to_agent) e ainda espera resposta. */
@@ -227,6 +275,8 @@ export interface AgentInfo {
   creator?: string;
   reportTo?: string;
   effort?: string;
+  /** Advisor tool do agente roteado: modelo que ele consulta nos pontos de decisão (alias ou id), já conferido. */
+  advisor?: string;
   description: string;
   subagentType?: string;
   prompt?: string;
@@ -380,6 +430,10 @@ export interface AgentSpent {
   minutes: number;
   /** Ausente em agentes Codex: o app-server do Codex não informa custo. */
   usd?: number;
+  /** Parte do advisor, já somada em tokens e usd; usd é a estimativa pela tabela de preços do modelo dele. */
+  advisor?: { tokens: number; usd?: number };
+  /** Consultas ao Jev (jev_decide), já somadas em tokens e usd; o SDK do Claude não as vê. */
+  jev?: { tokens: number; usd: number; calls: number };
 }
 
 /**
@@ -565,6 +619,9 @@ export type HostMessage =
   | { type: 'live'; id: string; phase: 'typing' | 'thinking'; text?: string }
   /** A configuração agentGraphMaster.liveBubbles mudou com o chat aberto. */
   | { type: 'liveConfig'; enabled: boolean }
+  /** Relatório do monitor de recursos e resultado de um "Encerrar". */
+  | ResourceMsgToWebview
+  | ResourceKillResultMsg
   /** A configuração agentGraphMaster.toolsExpanded mudou com o chat aberto. */
   | { type: 'toolsConfig'; expanded: boolean }
   | { type: 'textDelta'; msgId: string; index: number; text: string }
@@ -628,7 +685,7 @@ export type HostMessage =
   /** Resposta a `resolveUris`: anexos prontos (com caminho relativo) para o webview mostrar no preview. */
   | { type: 'attachments'; list: Attachment[] }
   | { type: 'usage'; usage: UsageInfo }
-  | { type: 'accountsUsage'; list: AccountUsage[] }
+  | { type: 'accountsUsage'; list: AccountUsage[]; jev?: JevAccountInfo[] }
   | { type: 'sessions'; list: SessionOption[]; error?: string }
   /** Comandos de barra que funcionam fora do terminal, para o autocompletar do composer. */
   | { type: 'commands'; list: SlashCommandOption[] }
@@ -685,7 +742,13 @@ export type ExternalProviderName = 'gemini' | 'openai';
 export type NoticeAction =
   | { kind: 'configureKey'; provider: ExternalProviderName; label: string }
   /** Abre a lista de processos órfãos do projeto. */
-  | { kind: 'orphans'; label: string };
+  | { kind: 'orphans'; label: string }
+  /** Roda o comando "Adicionar conta Jev" (chave recusada ou sumida). */
+  | { kind: 'addJevAccount'; label: string }
+  /** Retoma os agentes que a aba fechada interrompeu no meio do trabalho. */
+  | { kind: 'resumeInterrupted'; label: string }
+  /** Manda ao chat principal o texto de continuar: o turno dele morreu com a aba. */
+  | { kind: 'continueMain'; label: string; text: string };
 
 /** Um processo como o popup e a lista de órfãos mostram. `startedAt` em ISO. */
 export interface ProcView {
@@ -746,6 +809,7 @@ export type PermissionDecision =
 
 export type WebviewMessage =
   | { type: 'ready' }
+  | ResourceMsgFromWebview
   /** `clientId`: marca da bolha no webview; o host responde com `userId` e o uuid da mensagem. */
   | { type: 'send'; text: string; attachments?: Attachment[]; clientId?: string }
   /** Arquivos arrastados do explorer do VS Code; o host resolve as URIs em caminhos. */
@@ -756,6 +820,8 @@ export type WebviewMessage =
   | { type: 'setMode'; value: string }
   | { type: 'setEffort'; value: string }
   | { type: 'stopAgent'; id: string }
+  /** Para uma tarefa em segundo plano de um agente roteado (botão Parar na lista do "aguardando"). */
+  | { type: 'stopBackgroundTask'; agentId: string; taskId: string }
   /** Lê a árvore de processos de uma tarefa de shell (popup do nó). */
   | { type: 'taskProcs'; id: string }
   /** Encerra a árvore inteira de uma tarefa de shell; o host confirma num diálogo. */
@@ -775,6 +841,9 @@ export type WebviewMessage =
   | { type: 'refreshUsage' }
   /** Limites de todas as contas. `force` relê mesmo o que ainda está no cache. */
   | { type: 'accountsUsage'; force?: boolean }
+  /** Roda o comando "Adicionar conta Jev" (nome, provedor e chave pedidos pelo VS Code, fora do webview). */
+  | { type: 'addJevAccount' }
+  | { type: 'resumeInterrupted' }
   /** Continua esta conversa em outra conta Claude: copia o transcrito e reabre o chat lá. */
   | { type: 'transferSession'; profileId: string }
   /** Passa um agente roteado do Claude para outra conta Claude, mantendo a sessão dele. */
@@ -782,7 +851,7 @@ export type WebviewMessage =
   | { type: 'newChat' }
   /** Pede a lista de conversas para o dropdown; o host responde com `sessions`. */
   | { type: 'listSessions' }
-  | { type: 'resumeSession'; id: string }
+  | { type: 'resumeSession'; id: string; profileId?: string }
   /** O usuário arrumou o mapa (arrastou um nó, recolheu uma caixa): o host grava na pasta da conversa. */
   | { type: 'mapLayout'; layout: MapLayout }
   | { type: 'mentionFile' }

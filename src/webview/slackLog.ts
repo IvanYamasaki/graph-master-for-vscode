@@ -7,6 +7,8 @@
 
 import type { AgentInfo } from '../chat/protocol';
 import { clockLabel } from '../chat/threadModel';
+import { copyChoice, copyText, flashCopied } from './copyUi';
+import { copyLabel } from './copyLogic';
 
 /** Quem fala: o usuário, o orquestrador, um agente (post e lugar ao vivo têm cabeçalho próprio) ou nota do sistema. */
 export type Author = 'user' | 'claude' | 'agent' | 'meta';
@@ -82,6 +84,8 @@ export interface SlackLogDeps {
   rawText: (el: HTMLElement) => string;
   /** "Responder em thread" na mensagem: só aparece na que tem id de thread (`data-thread`). */
   onReply: (el: HTMLElement) => void;
+  /** Clique no nome ou no avatar do Claude: abre a ficha da conversa principal, ancorada no elemento passado. */
+  onOpenMain?: (anchor: HTMLElement) => void;
 }
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, cls: string, text?: string): HTMLElementTagNameMap[K] {
@@ -117,9 +121,26 @@ export function createSlackLog(deps: SlackLogDeps) {
     } else {
       av.append(codicon('sparkle'));
     }
-    head.append(av, node('span', 'sl-name', author === 'user' ? 'Você' : deps.brand()));
+    const name = node('span', 'sl-name', author === 'user' ? 'Você' : deps.brand());
+    head.append(av, name);
     if (author === 'claude') {
       head.append(node('span', 'sl-badge', 'APP'));
+      // Clicar no nome ou no avatar do Claude abre a ficha da conversa principal, como no cartão de um agente.
+      if (deps.onOpenMain) {
+        for (const el of [av, name]) {
+          el.classList.add('sl-open');
+          el.setAttribute('role', 'button');
+          el.setAttribute('tabindex', '0');
+          el.setAttribute('title', 'Abrir a ficha do Claude');
+          el.addEventListener('click', () => deps.onOpenMain?.(name));
+          el.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              deps.onOpenMain?.(name);
+            }
+          });
+        }
+      }
     }
     if (at !== undefined) {
       const time = node('span', 'sl-time', clockLabel(at));
@@ -213,19 +234,25 @@ export function createSlackLog(deps: SlackLogDeps) {
   const bar = node('div', 'sl-actions');
   bar.append(copyBtn, replyBtn);
   let barFor: HTMLElement | undefined;
+  // Com trecho selecionado dentro da mensagem o botão copia só ele; o rótulo avisa antes do clique.
+  const paintCopyLabel = () => {
+    const partial = !!barFor && copyChoice(barFor, '').partial;
+    const label = copyLabel(partial);
+    if (copyBtn.title !== label) {
+      copyBtn.title = label;
+      copyBtn.setAttribute('aria-label', label);
+    }
+  };
+  document.addEventListener('selectionchange', paintCopyLabel);
+  // Não tira a seleção nem o foco de quem está lendo.
+  copyBtn.addEventListener('mousedown', (e) => e.preventDefault());
   copyBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (!barFor) {
       return;
     }
-    const text = deps.rawText(barFor);
-    void navigator.clipboard?.writeText(text).then(
-      () => {
-        copyBtn.replaceChildren(codicon('check'));
-        window.setTimeout(() => copyBtn.replaceChildren(codicon('copy')), 1500);
-      },
-      () => undefined,
-    );
+    const { text } = copyChoice(barFor, deps.rawText(barFor));
+    void copyText(text).then((ok) => ok && flashCopied(copyBtn));
   });
   log.addEventListener('mouseover', (e) => {
     if (!enabled) {
@@ -236,6 +263,7 @@ export function createSlackLog(deps: SlackLogDeps) {
       barFor = msg;
       replyBtn.hidden = !msg.dataset.thread;
       msg.append(bar);
+      paintCopyLabel();
     }
   });
 
